@@ -32,6 +32,22 @@ docker run --rm  \
 
 ```
 
+ # Apptainer run
+
+Note: **first build the Docker image above**
+
+```bash
+
+apptainer build ${IMAGE_NAME}.sif docker-daemon://${IMAGE_NAME}:latest
+
+apptainer run \
+   --env ORNL_STRAIN_JSON_PATH="/ORNL_strain/reduced_data.json" \
+   --env ORNL_STRAIN_SOURCE_ORDER="env_path,env_url,query_url" \
+   --bind ${PWD}/ORNL_strain:/ORNL_strain \
+   ${IMAGE_NAME}.sif
+
+```
+
 # Local run
 
 ```bash
