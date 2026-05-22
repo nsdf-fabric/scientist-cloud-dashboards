@@ -1,0 +1,8 @@
+# Apptainer / Singularity images
+*.sif
+*.simg
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
