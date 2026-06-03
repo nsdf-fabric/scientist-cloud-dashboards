@@ -1,49 +1,25 @@
 """
-ORNL / CHESS strain-field dashboard: sparse or dense JSON exports → three heatmaps
-(measurement mask, GP-style estimate, variance) per configurable row.
+ORNL / CHESS NSDF measurement dashboard.
 
-**Load order (where JSON comes from)**
-
-Controlled by ``scientistCloudLib/SCLib_Dashboards/ornl_chess_strain_lib.resolve_strain_paths_for_session``:
-
-- **ScientistCloud data portal** (``base_dir`` / ``save_dir`` under ``/mnt/visus_datasets``): upload dir →
-  converted dir → URL query args (``strain_json_path`` / ``strain_json_url``) →
-  ``ORNL_STRAIN_JSON_PATH`` / ``ORNL_STRAIN_JSON_URL``.
-
-- **Command line / local**: ``ORNL_STRAIN_JSON_PATH`` / ``ORNL_STRAIN_JSON_URL`` first, then query args,
-  then upload/converted dirs.
-
-**Overrides (no code changes)**
-
-- ``ORNL_STRAIN_RESOLVE_MODE`` — ``auto``, ``portal`` (always server-first), ``cli`` (always env-first).
-- ``ORNL_STRAIN_SOURCE_ORDER`` — comma tokens:
-  ``upload``, ``converted``, ``query_path``, ``query_url``, ``env_path``, ``env_url``
-  (e.g. ``env_path,env_url,query_url`` for CHESS).
-
-If both path and URL text fields are non-empty or partially filled, **Load / reload** uses those values
-as a manual override. Clear both fields to apply the automatic order again.
-
-URL query parameters (optional):
-    strain_json_path   — override local JSON path for this session
-    strain_json_url    — override remote JSON URL (full https://…) for this session
-    strain_rows        — initial number of plot rows (default 2 or ORNL_STRAIN_INITIAL_ROWS)
+Loads native NSDF ``data.json`` plus optional ``surrogate.json`` and renders three heatmaps:
+measurement locations, estimate, and variance. Legacy ``ORNL_STRAIN_JSON_*`` environment
+variables and ``strain_json_*`` query parameters remain aliases for NSDF ``data.json``.
 """
 from __future__ import annotations
 
 import os
 import sys
 import traceback
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Optional
 
 from bokeh.io import curdoc
 from bokeh.layouts import column, row
-from bokeh.models import Button, Div, Select, Spinner, TextInput
+from bokeh.models import Button, Div, Spinner, TextInput
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", ".."))
 SHARED_UTILS_DIR = os.path.join(PROJECT_ROOT, "scientistCloudLib", "SCLib_Dashboards")
 
-# Same layout as Docker ``shared_utilities``: modules live under ``scientistCloudLib/SCLib_Dashboards``.
 if SHARED_UTILS_DIR not in sys.path and os.path.isdir(SHARED_UTILS_DIR):
     sys.path.insert(0, SHARED_UTILS_DIR)
 
@@ -52,11 +28,6 @@ def _initialize_dashboard_standalone(
     request: Any = None,
     status_callback: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
-    """
-    Drop-in replacement for ``initialize_dashboard`` when ``utils_bokeh_dashboard``
-    is unavailable (CHESS-only checkout). No MongoDB or portal auth; use
-    ``ORNL_STRAIN_JSON_PATH`` / ``ORNL_STRAIN_JSON_URL`` or the path/URL fields in the UI.
-    """
     if status_callback:
         status_callback("Standalone mode: ScientistCloud dashboard utils not loaded; JSON/S3 only.")
 
@@ -73,7 +44,7 @@ def _initialize_dashboard_standalone(
         "params": {
             "uuid": "local",
             "server": "false",
-            "name": "ORNL_CHESS_strain (standalone)",
+            "name": "ORNL_CHESS_NSDF (standalone)",
             "base_dir": local_base_dir,
             "save_dir": local_base_dir,
             "has_args": False,
@@ -111,17 +82,62 @@ except Exception:
 
 
 from ornl_chess_strain_lib import (  # noqa: E402
+    NSDFLoadedBundle,
     StrainDashboardPaths,
     StrainFieldPlotConfig,
     build_strain_field_grids,
-    default_row_headers,
     enrich_strain_paths_from_dataset_doc,
     find_strain_json_under_dataset_dir,
-    list_strain_field_headers,
-    load_strain_json,
+    infer_nsdf_grid_size,
+    list_nsdf_field_headers,
+    load_simple_env_file,
+    load_nsdf_json_bundle,
     make_strain_triplet_figures,
     resolve_strain_paths_for_session,
+    validate_nsdf_measurement_doc,
+    validate_nsdf_surrogate_doc,
 )
+
+
+def _float_env(name: str, default: float) -> float:
+    env_file_values = load_simple_env_file(os.environ.get("ORNL_S3_ENV_FILE", "").strip())
+    raw = os.environ.get(name) or env_file_values.get(name) or str(default)
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _dashboard_env_value(name: str) -> str:
+    env_file_values = load_simple_env_file(os.environ.get("ORNL_S3_ENV_FILE", "").strip())
+    return (os.environ.get(name) or env_file_values.get(name) or "").strip()
+
+
+def _int_value(raw: str) -> Optional[int]:
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _fixed_grid_size_from_env() -> Optional[tuple[int, int]]:
+    compact = _dashboard_env_value("ORNL_NSDF_GRID_SIZE").lower().replace(" ", "")
+    if compact:
+        for sep in ("x", ",", ":"):
+            if sep not in compact:
+                continue
+            left, right = compact.split(sep, 1)
+            width = _int_value(left)
+            height = _int_value(right)
+            if width and height:
+                return width, height
+    width = _int_value(_dashboard_env_value("ORNL_NSDF_GRID_WIDTH"))
+    height = _int_value(_dashboard_env_value("ORNL_NSDF_GRID_HEIGHT"))
+    if width and height:
+        return width, height
+    return None
 
 
 doc = curdoc()
@@ -132,7 +148,7 @@ if not _init.get("success"):
         text=f"<pre>Dashboard init failed:\n{_init.get('error','')}</pre>",
         sizing_mode="stretch_width",
     )
-    doc.add_root(column(create_header_banner("", "ORNL CHESS Strain"), err))
+    doc.add_root(column(create_header_banner("", "ORNL CHESS NSDF"), err))
 else:
     _params: Dict[str, Any] = _init.get("params") or {}
 
@@ -143,25 +159,21 @@ else:
         v = raw[0]
         return v.decode("utf-8") if isinstance(v, (bytes, bytearray)) else str(v)
 
-    def _int_env(name: str, default: int) -> int:
-        try:
-            return int(os.environ.get(name, str(default)).strip())
-        except ValueError:
-            return default
-
-    initial_rows = _int_env("ORNL_STRAIN_INITIAL_ROWS", 2)
-    if _request and getattr(_request, "arguments", None):
-        sr = _first_arg("strain_rows")
-        if sr.isdigit():
-            initial_rows = max(1, min(12, int(sr)))
-
-    _query_path0 = _first_arg("strain_json_path") or _first_arg("strain_json")
-    _query_url0 = (
-        _first_arg("strain_json_url")
+    _query_data_path0 = (
+        _first_arg("nsdf_data_json_path")
+        or _first_arg("strain_json_path")
+        or _first_arg("strain_json")
+    )
+    _query_data_url0 = (
+        _first_arg("nsdf_data_json_url")
+        or _first_arg("strain_json_url")
         or _first_arg("json_url")
         or _first_arg("data_link")
         or ""
     ).strip()
+    _query_surrogate_path0 = _first_arg("surrogate_json_path")
+    _query_surrogate_url0 = _first_arg("surrogate_json_url")
+
     _bd = str(_params.get("base_dir") or "")
     _sd = str(_params.get("save_dir") or "")
     _mongo_pack = _init.get("mongodb") or {}
@@ -175,134 +187,175 @@ else:
         if uid.lower().startswith(("http://", "https://", "s3://", "pelican://")):
             return None
         try:
-            doc = coll.find_one({"uuid": uid})
-            return doc if isinstance(doc, dict) else None
+            found = coll.find_one({"uuid": uid})
+            return found if isinstance(found, dict) else None
         except Exception:
             return None
 
     _dataset_doc = _fetch_dataset_doc()
 
     def _dataset_s3_auth_override() -> Optional[Dict[str, str]]:
-        """Use S3 keys from Mongo when the iframe URL truncated query credentials."""
-        doc = _dataset_doc
-        if not doc:
+        dataset_doc = _dataset_doc
+        if not dataset_doc:
             return None
-        ak = str(doc.get("s3_access_key_id") or "").strip()
-        sk = str(doc.get("s3_secret_access_key") or "").strip()
+        ak = str(dataset_doc.get("s3_access_key_id") or "").strip()
+        sk = str(dataset_doc.get("s3_secret_access_key") or "").strip()
         if not ak or not sk:
             return None
         out: Dict[str, str] = {"access_key_id": ak, "secret_access_key": sk}
-        ep = str(doc.get("s3_endpoint_url") or "").strip()
+        ep = str(dataset_doc.get("s3_endpoint_url") or "").strip()
         if ep:
             out["endpoint_url"] = ep.rstrip("/")
-        reg = str(doc.get("s3_region_name") or "").strip()
+        reg = str(dataset_doc.get("s3_region_name") or "").strip()
         if reg:
             out["region_name"] = reg
         return out
 
     def _prefer_upload_mirror_when_url_only(p: StrainDashboardPaths) -> StrainDashboardPaths:
-        """
-        Portal often prefills only the HTTPS gateway URL. If a mirrored ``*.json`` exists under
-        ``base_dir`` / ``save_dir``, load from disk (avoids truncated or gateway-specific keys).
-        """
         loc = (p.local_json_path or "").strip()
         jurl = (p.json_url or "").strip()
-        if loc:
-            return p
-        if not jurl:
+        if loc or not jurl:
             return p
         mirror = find_strain_json_under_dataset_dir(_bd) or find_strain_json_under_dataset_dir(_sd)
         if mirror:
-            return StrainDashboardPaths(local_json_path=mirror, json_url=jurl)
+            return StrainDashboardPaths(
+                local_json_path=mirror,
+                json_url=jurl,
+                surrogate_json_path=p.surrogate_json_path,
+                surrogate_json_url=p.surrogate_json_url,
+                s3_env_file=p.s3_env_file,
+                s3_bucket=p.s3_bucket,
+                s3_data_key=p.s3_data_key,
+                s3_surrogate_key=p.s3_surrogate_key,
+                s3_endpoint_url=p.s3_endpoint_url,
+                s3_region=p.s3_region,
+            )
         return p
 
-    paths = enrich_strain_paths_from_dataset_doc(
-        _prefer_upload_mirror_when_url_only(
-            resolve_strain_paths_for_session(
-                base_dir=_bd,
-                save_dir=_sd,
-                query_strain_json_path=_query_path0,
-                query_strain_json_url=_query_url0,
-                env=StrainDashboardPaths.from_environ(),
-            )
-        ),
-        _dataset_doc,
-        base_dir=_bd,
-        save_dir=_sd,
-    )
+    def _resolve_paths() -> StrainDashboardPaths:
+        return enrich_strain_paths_from_dataset_doc(
+            _prefer_upload_mirror_when_url_only(
+                resolve_strain_paths_for_session(
+                    base_dir=_bd,
+                    save_dir=_sd,
+                    query_strain_json_path=_query_data_path0,
+                    query_strain_json_url=_query_data_url0,
+                    query_surrogate_json_path=_query_surrogate_path0,
+                    query_surrogate_json_url=_query_surrogate_url0,
+                    env=StrainDashboardPaths.from_environ(),
+                )
+            ),
+            _dataset_doc,
+            base_dir=_bd,
+            save_dir=_sd,
+        )
 
+    paths = _resolve_paths()
     plot_cfg = StrainFieldPlotConfig()
+    fixed_grid_size = _fixed_grid_size_from_env()
+    if fixed_grid_size:
+        plot_cfg.grid_size = fixed_grid_size
 
-    status_div = Div(text="", width_policy="max", height_policy="fixed", height=60)
-    json_path_input = TextInput(
-        title="Local JSON path (optional override)",
+    status_div = Div(text="", width_policy="max", height_policy="fixed", height=86)
+    data_path_input = TextInput(
+        title="NSDF data JSON path",
         value=paths.local_json_path or "",
         width=600,
     )
-    json_url_input = TextInput(
-        title="JSON https URL (optional — full URL you were given, e.g. presigned S3 or public object URL)",
+    data_url_input = TextInput(
+        title="NSDF data JSON URL",
         value=paths.json_url or "",
         width=900,
     )
-    grid_w = Spinner(title="Grid width", low=8, high=256, step=1, value=plot_cfg.grid_size[0], width=100)
-    grid_h = Spinner(title="Grid height", low=8, high=256, step=1, value=plot_cfg.grid_size[1], width=100)
+    surrogate_path_input = TextInput(
+        title="Optional surrogate JSON path",
+        value=paths.surrogate_json_path or "",
+        width=600,
+    )
+    surrogate_url_input = TextInput(
+        title="Optional surrogate JSON URL",
+        value=paths.surrogate_json_url or "",
+        width=900,
+    )
+    grid_w = Spinner(title="Grid width", low=1, high=512, step=1, value=plot_cfg.grid_size[0], width=100)
+    grid_h = Spinner(title="Grid height", low=1, high=512, step=1, value=plot_cfg.grid_size[1], width=100)
 
-    payload: Dict[str, Any] = {}
-    headers_list: List[str] = []
-    n_rows = max(1, min(12, initial_rows))
-    row_headers: List[str] = list(default_row_headers(n_rows))
+    loaded_bundle: Optional[NSDFLoadedBundle] = None
     figures_column = column(sizing_mode="stretch_width")
+    s3_refresh_seconds = _float_env("ORNL_NSDF_REFRESH_SECONDS", 10.0)
 
     def set_status(msg: str, ok: bool = True) -> None:
         color = "#0a0" if ok else "#a00"
-        status_div.text = f'<div style="color:{color};font-family:monospace;">{msg}</div>'
+        status_div.text = f'<div style="color:{color};font-family:monospace;white-space:pre-wrap;">{msg}</div>'
+
+    def _paths_from_inputs_or_auto() -> StrainDashboardPaths:
+        data_path = (data_path_input.value or "").strip()
+        data_url = (data_url_input.value or "").strip()
+        surrogate_path = (surrogate_path_input.value or "").strip()
+        surrogate_url = (surrogate_url_input.value or "").strip()
+        if data_path or data_url or surrogate_path or surrogate_url:
+            return _prefer_upload_mirror_when_url_only(
+                StrainDashboardPaths(
+                    local_json_path=data_path,
+                    json_url=data_url,
+                    surrogate_json_path=surrogate_path,
+                    surrogate_json_url=surrogate_url,
+                )
+            )
+        return _resolve_paths()
 
     def load_payload() -> None:
-        global payload, headers_list, row_headers  # noqa: PLW0603
+        global loaded_bundle  # noqa: PLW0603
 
-        loc_in = (json_path_input.value or "").strip()
-        url_in = (json_url_input.value or "").strip()
-        if loc_in or url_in:
-            p = _prefer_upload_mirror_when_url_only(
-                StrainDashboardPaths(local_json_path=loc_in, json_url=url_in)
-            )
-        else:
-            p = enrich_strain_paths_from_dataset_doc(
-                _prefer_upload_mirror_when_url_only(
-                    resolve_strain_paths_for_session(
-                        base_dir=_bd,
-                        save_dir=_sd,
-                        query_strain_json_path=_query_path0,
-                        query_strain_json_url=_query_url0,
-                        env=StrainDashboardPaths.from_environ(),
-                    )
-                ),
-                _dataset_doc,
-                base_dir=_bd,
-                save_dir=_sd,
-            )
+        p = _paths_from_inputs_or_auto()
         try:
-            payload = load_strain_json(p, mongo_s3_auth=_dataset_s3_auth_override())
+            bundle = load_nsdf_json_bundle(p, mongo_s3_auth=_dataset_s3_auth_override())
+            measurement = validate_nsdf_measurement_doc(bundle.data)
+            fields = list_nsdf_field_headers(bundle.data, bundle.surrogate)
+            inferred_grid_size = infer_nsdf_grid_size(bundle.data)
+            active_grid_size = fixed_grid_size or inferred_grid_size
+            surrogate_info = validate_nsdf_surrogate_doc(
+                bundle.surrogate,
+                measurement.observed_values.shape[0],
+            )
         except Exception as e:
-            payload = {}
-            headers_list = []
-            set_status(f"Load failed: {e}", ok=False)
+            loaded_bundle = None
+            set_status(f"NSDF load failed: {e}", ok=False)
             traceback.print_exc()
-            figures_column.children = [Div(text="<i>No data — load JSON first.</i>")]
+            figures_column.children = [Div(text="<i>No NSDF data loaded.</i>")]
             return
-        headers_list = list_strain_field_headers(payload, header_regex=plot_cfg.header_regex)
-        if not headers_list:
-            headers_list = list_strain_field_headers(payload, include_non_matching=True)
-        if not headers_list:
-            set_status("No plottable numeric keys found in JSON.", ok=False)
-            figures_column.children = [Div(text="<i>No data — load JSON first.</i>")]
-            return
-        for i in range(len(row_headers)):
-            if row_headers[i] not in headers_list:
-                row_headers[i] = headers_list[0]
-        if (p.local_json_path or "").strip():
-            json_path_input.value = (p.local_json_path or "").strip()
-        set_status(f"Loaded {len(headers_list)} field header(s).", ok=True)
+
+        loaded_bundle = bundle
+        if bundle.paths.local_json_path:
+            data_path_input.value = bundle.paths.local_json_path
+        if bundle.paths.json_url:
+            data_url_input.value = bundle.paths.json_url
+        if bundle.paths.surrogate_json_path:
+            surrogate_path_input.value = bundle.paths.surrogate_json_path
+        if bundle.paths.surrogate_json_url:
+            surrogate_url_input.value = bundle.paths.surrogate_json_url
+        plot_cfg.grid_size = active_grid_size
+        grid_w.value = active_grid_size[0]
+        grid_h.value = active_grid_size[1]
+
+        msg_parts = [
+            f"Loaded NSDF measurement data: {measurement.observed_values.shape[0]} points.",
+            f"Inferred grid size: {inferred_grid_size[0]} x {inferred_grid_size[1]}.",
+            f"Active grid size: {active_grid_size[0]} x {active_grid_size[1]}.",
+            f"Coordinate normalization: {measurement.bounds_source}.",
+            "Compatible fields: " + ", ".join(fields) + ".",
+        ]
+        if bundle.paths.has_s3_source():
+            msg_parts.insert(
+                0,
+                (
+                    f"S3 source: s3://{bundle.paths.s3_bucket}/{bundle.paths.s3_data_key}; "
+                    f"refresh every {s3_refresh_seconds:g}s."
+                ),
+            )
+        msg_parts.extend(bundle.messages)
+        msg_parts.extend(surrogate_info.warnings)
+        set_status("\n".join(msg_parts), ok=True)
 
     def apply_grid_size() -> None:
         try:
@@ -310,129 +363,56 @@ else:
             h = int(grid_h.value)
         except Exception:
             return
-        plot_cfg.grid_size = (max(8, min(256, w)), max(8, min(256, h)))
+        plot_cfg.grid_size = (max(1, min(512, w)), max(1, min(512, h)))
 
     def rebuild_figures() -> None:
         apply_grid_size()
         figures_column.children = []
-        if not payload or not headers_list:
-            figures_column.children = [Div(text="<i>No data — load JSON first.</i>")]
+        if loaded_bundle is None:
+            figures_column.children = [Div(text="<i>No NSDF data loaded.</i>")]
             return
-        rows_out: List[Any] = []
-        for i in range(n_rows):
-            h = row_headers[i] if i < len(row_headers) else headers_list[0]
-            try:
-                grids = build_strain_field_grids(payload, h, plot_cfg)
-                p0, p1, p2 = make_strain_triplet_figures(grids, plot_cfg, row_subtitle=h)
-            except Exception as e:
-                err = Div(text=f"<pre>Row {i + 1} ({h}): {e}</pre>", sizing_mode="stretch_width")
-                rows_out.append(err)
-                traceback.print_exc()
-                continue
-
-            sel = Select(title=f"Row {i + 1} field", value=h, options=headers_list, width=420)
-
-            def on_header_change(idx: int, attr: str, old: str, new: str) -> None:
-                row_headers[idx] = new
-                rebuild_figures()
-
-            def _bind_select(idx: int):
-                def _cb(attr: str, old: str, new: str) -> None:
-                    on_header_change(idx, attr, old, new)
-
-                return _cb
-
-            sel.on_change("value", _bind_select(i))
-            # Two rows per set: field selector (which JSON key to plot), then the three heatmaps.
-            rows_out.append(
-                column(
-                    row(sel, sizing_mode="scale_width"),
-                    row(p0, p1, p2, sizing_mode="scale_width"),
-                    sizing_mode="stretch_width",
-                )
-            )
-        figures_column.children = rows_out
+        try:
+            grids = build_strain_field_grids(loaded_bundle.data, plot_cfg, loaded_bundle.surrogate)
+            p0, p1, p2 = make_strain_triplet_figures(grids, plot_cfg, row_subtitle="dataset_y")
+            figures_column.children = [row(p0, p1, p2, sizing_mode="scale_width")]
+        except Exception as e:
+            figures_column.children = [Div(text=f"<pre>NSDF grid build failed: {e}</pre>")]
+            traceback.print_exc()
 
     def on_reload() -> None:
         load_payload()
         rebuild_figures()
 
-    def on_add_row() -> None:
-        global n_rows  # noqa: PLW0603
-
-        if n_rows >= 12:
-            return
-        n_rows += 1
-        row_headers.append(headers_list[0] if headers_list else "0/data/uniform_strain")
-        rebuild_figures()
-
-    def on_remove_row() -> None:
-        global n_rows  # noqa: PLW0603
-
-        if n_rows <= 1:
-            return
-        n_rows -= 1
-        if len(row_headers) > n_rows:
-            row_headers.pop()
-        rebuild_figures()
-
     btn_reload = Button(label="Load / reload JSON", button_type="primary", width=180)
-    btn_add = Button(label="Add row", width=100)
-    btn_remove = Button(label="Remove row", width=120)
     btn_reload.on_click(on_reload)
-    btn_add.on_click(on_add_row)
-    btn_remove.on_click(on_remove_row)
-
-    # _standalone_note = (
-    #     "<p><b>Standalone mode:</b> ScientistCloud <code>utils_bokeh_dashboard</code> was not loaded; "
-    #     "this session only loads JSON via env / https URL / the path field (no portal auth).</p>"
-    #     if initialize_dashboard is _initialize_dashboard_standalone
-    #     else ""
-    # )
-    # help_div = Div(
-    #     text=(
-    #         "<p><b>Automatic load order</b> (clear both fields below to use it): "
-    #         "<code>" + strain_resolve_order_summary(_bd, _sd) + "</code>. "
-    #         "See module docstring in <code>ornl_chess_strain_lib.py</code> for token meanings "
-    #         "(<code>upload</code>, <code>converted</code>, <code>query_*</code>, <code>env_*</code>). "
-    #         "On the ScientistCloud portal mount (<code>/mnt/visus_datasets/…</code>), server directories are tried "
-    #         "before gateway URLs; from the command line, <code>ORNL_STRAIN_JSON_PATH</code> / "
-    #         "<code>ORNL_STRAIN_JSON_URL</code> are tried first. "
-    #         "Override globally: <code>ORNL_STRAIN_RESOLVE_MODE</code> = <code>auto</code> | "
-    #         "<code>portal</code> | <code>cli</code>, or set <code>ORNL_STRAIN_SOURCE_ORDER</code> "
-    #         "(comma-separated tokens). "
-    #         "Rows: <code>ORNL_STRAIN_INITIAL_ROWS</code> (default 2).</p>"
-    #         f"{_standalone_note}"
-    #     ),
-    #     sizing_mode="stretch_width",
-    # )
 
     controls = column(
-        row(json_path_input, sizing_mode="scale_width"),
-        row(json_url_input, sizing_mode="scale_width"),
-        row(grid_w, grid_h, btn_reload, btn_add, btn_remove, sizing_mode="scale_width"),
+        row(data_path_input, sizing_mode="scale_width"),
+        row(data_url_input, sizing_mode="scale_width"),
+        row(surrogate_path_input, sizing_mode="scale_width"),
+        row(surrogate_url_input, sizing_mode="scale_width"),
+        row(grid_w, grid_h, btn_reload, sizing_mode="scale_width"),
         status_div,
         sizing_mode="stretch_width",
     )
 
-    header = create_header_banner("ORNL CHESS strain (JSON)", "ORNL CHESS Strain")
+    header = create_header_banner("ORNL CHESS NSDF measurements", "ORNL CHESS NSDF")
     root = column(header, controls, figures_column, sizing_mode="stretch_width")
     doc.add_root(root)
 
-    if paths.local_json_path or paths.json_url:
+    if paths.has_s3_source() or paths.local_json_path or paths.json_url:
         on_reload()
     else:
         figures_column.children = [
             Div(
                 text=(
-                    "<p>No JSON resolved yet. Set <code>ORNL_STRAIN_JSON_PATH</code> / "
-                    "<code>ORNL_STRAIN_JSON_URL</code>, clear both fields to use the automatic order, "
-                    "or enter a path or URL above and click <b>Load / reload JSON</b>.</p>"
+                    "<p>No NSDF data.json resolved yet. Set <code>ORNL_NSDF_DATA_JSON_PATH</code> / "
+                    "<code>ORNL_NSDF_DATA_JSON_URL</code>, use legacy <code>ORNL_STRAIN_JSON_*</code> "
+                    "aliases, configure <code>ORNL_NSDF_S3_BUCKET</code> / "
+                    "<code>ORNL_NSDF_S3_DATA_KEY</code>, or enter a path or URL above and click "
+                    "<b>Load / reload JSON</b>.</p>"
                 )
             )
         ]
-
-
-# cd /Users/amygooch/GIT/ScientistCloud2.0/scientistcloud/SC_Dashboards/dashboards
-#  ORNL_STRAIN_JSON_PATH=/Users/amygooch/Downloads/ORNL_strain/reduced_data.json \
-#  bokeh serve ORNL_CHESS_strain.py --port 50171 --allow-websocket-origin=localhost:50171
+    if paths.has_s3_source():
+        doc.add_periodic_callback(on_reload, int(s3_refresh_seconds * 1000))

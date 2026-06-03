@@ -1,7 +1,6 @@
 """
-ORNL / CHESS strain-field helpers: JSON parsing, header discovery, grid construction,
-and Bokeh heatmaps. Lives under ``scientistCloudLib/SCLib_Dashboards`` (listed in
-``ORNL_CHESS_strain.json`` ``shared_utilities``) so Docker and local runs match other dashboard utils.
+ORNL / CHESS NSDF measurement helpers: JSON parsing, NSDF validation, grid construction,
+and Bokeh heatmaps.
 
 **Where JSON is loaded from (deployment order)**
 
@@ -11,7 +10,9 @@ and Bokeh heatmaps. Lives under ``scientistCloudLib/SCLib_Dashboards`` (listed i
    - ``upload`` — first ``*.json`` under dataset ``base_dir`` (prefers ``reduced_data.json``)
    - ``converted`` — same under ``save_dir``
    - ``query_path`` / ``query_url`` — Bokeh URL args (portal may append gateway HTTPS)
-   - ``env_path`` / ``env_url`` — ``ORNL_STRAIN_JSON_PATH`` / ``ORNL_STRAIN_JSON_URL``
+   - ``env_path`` / ``env_url`` — preferred ``ORNL_NSDF_DATA_JSON_PATH`` /
+     ``ORNL_NSDF_DATA_JSON_URL``; legacy ``ORNL_STRAIN_JSON_PATH`` /
+     ``ORNL_STRAIN_JSON_URL`` remain aliases for NSDF ``data.json``.
 
 2. **Command line / local / CHESS checkout** (default when not on that mount): use
    **environment and URL args first**, then server dirs:
@@ -49,32 +50,93 @@ _LOG = logging.getLogger(__name__)
 # Configuration (edit here or override via StrainDashboardPaths)
 # ---------------------------------------------------------------------------
 
-DEFAULT_HEADER_REGEX = re.compile(
-    r"^\d+/data/(uniform_strain|unconstrained_strain)$",
-    re.IGNORECASE,
-)
-
 DEFAULT_GRID_SIZE: Tuple[int, int] = (26, 26)
 
-DEFAULT_ROW_HEADERS: Tuple[str, ...] = (
-    "0/data/uniform_strain",
-    "0/data/unconstrained_strain",
-)
+
+def _strip_env_quotes(value: str) -> str:
+    v = (value or "").strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+        return v[1:-1]
+    return v
+
+
+def load_simple_env_file(path: str) -> Dict[str, str]:
+    """Parse a small dotenv-style file without mutating ``os.environ``."""
+    p = (path or "").strip()
+    if not p:
+        return {}
+    out: Dict[str, str] = {}
+    try:
+        with open(p, "r", encoding="utf-8") as fh:
+            for raw_line in fh:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if not key:
+                    continue
+                out[key] = _strip_env_quotes(value)
+    except OSError as exc:
+        raise FileNotFoundError(f"Could not read ORNL_S3_ENV_FILE={p!r}: {exc}") from exc
+    return out
 
 
 @dataclass
 class StrainDashboardPaths:
-    """Where to load reduced JSON from (local path vs full http(s) URL you distribute)."""
+    """Where to load NSDF data and optional surrogate JSON."""
 
     local_json_path: str = ""
     json_url: str = ""
+    surrogate_json_path: str = ""
+    surrogate_json_url: str = ""
+    s3_env_file: str = ""
+    s3_bucket: str = ""
+    s3_data_key: str = ""
+    s3_surrogate_key: str = ""
+    s3_endpoint_url: str = ""
+    s3_region: str = "us-east-1"
 
     @classmethod
     def from_environ(cls) -> "StrainDashboardPaths":
+        env_file_values = load_simple_env_file(os.environ.get("ORNL_S3_ENV_FILE", "").strip())
+
+        def env_value(name: str, default: str = "") -> str:
+            return (os.environ.get(name) or env_file_values.get(name) or default).strip()
+
         return cls(
-            local_json_path=os.environ.get("ORNL_STRAIN_JSON_PATH", "").strip(),
-            json_url=os.environ.get("ORNL_STRAIN_JSON_URL", "").strip(),
+            local_json_path=(
+                os.environ.get("ORNL_NSDF_DATA_JSON_PATH")
+                or os.environ.get("ORNL_STRAIN_JSON_PATH")
+                or ""
+            ).strip(),
+            json_url=(
+                os.environ.get("ORNL_NSDF_DATA_JSON_URL")
+                or os.environ.get("ORNL_STRAIN_JSON_URL")
+                or ""
+            ).strip(),
+            surrogate_json_path=os.environ.get("ORNL_SURROGATE_JSON_PATH", "").strip(),
+            surrogate_json_url=os.environ.get("ORNL_SURROGATE_JSON_URL", "").strip(),
+            s3_env_file=os.environ.get("ORNL_S3_ENV_FILE", "").strip(),
+            s3_bucket=env_value("ORNL_NSDF_S3_BUCKET"),
+            s3_data_key=env_value("ORNL_NSDF_S3_DATA_KEY"),
+            s3_surrogate_key=env_value("ORNL_NSDF_S3_SURROGATE_KEY"),
+            s3_endpoint_url=env_value("ORNL_NSDF_S3_ENDPOINT_URL"),
+            s3_region=env_value("ORNL_NSDF_S3_REGION", "us-east-1") or "us-east-1",
         )
+
+    def has_s3_source(self) -> bool:
+        return bool((self.s3_bucket or "").strip() and (self.s3_data_key or "").strip())
+
+
+def _copy_s3_fields(src: StrainDashboardPaths, dst: StrainDashboardPaths) -> StrainDashboardPaths:
+    dst.s3_env_file = src.s3_env_file
+    dst.s3_bucket = src.s3_bucket
+    dst.s3_data_key = src.s3_data_key
+    dst.s3_surrogate_key = src.s3_surrogate_key
+    dst.s3_endpoint_url = src.s3_endpoint_url
+    dst.s3_region = src.s3_region
+    return dst
 
 
 # ---------------------------------------------------------------------------
@@ -110,16 +172,17 @@ def is_scientistcloud_portal_data_mount_context(base_dir: str, save_dir: str) ->
 
 def find_strain_json_under_dataset_dir(directory: str) -> str:
     """
-    Pick a strain JSON file under ``directory`` (upload or converted tree for one UUID).
+    Pick an NSDF JSON file under ``directory`` (upload or converted tree for one UUID).
 
-    Prefers ``reduced_data.json``; otherwise the first ``*.json`` (sorted by name).
+    Prefers ``data.json``; otherwise the first ``*.json`` (sorted by name).
     """
     d = (directory or "").strip()
     if not d or not os.path.isdir(d):
         return ""
-    preferred = os.path.join(d, "reduced_data.json")
-    if os.path.isfile(preferred):
-        return preferred
+    for preferred_name in ("data.json", "reduced_data.json"):
+        preferred = os.path.join(d, preferred_name)
+        if os.path.isfile(preferred):
+            return preferred
     try:
         names = sorted(os.listdir(d))
     except OSError:
@@ -176,6 +239,8 @@ def resolve_strain_paths_for_session(
     save_dir: str = "",
     query_strain_json_path: str = "",
     query_strain_json_url: str = "",
+    query_surrogate_json_path: str = "",
+    query_surrogate_json_url: str = "",
     env: Optional[StrainDashboardPaths] = None,
 ) -> StrainDashboardPaths:
     """
@@ -191,8 +256,21 @@ def resolve_strain_paths_for_session(
     q_url = (query_strain_json_url or "").strip()
     env_path = (env.local_json_path or "").strip()
     env_url = (env.json_url or "").strip()
+    surrogate_path = (query_surrogate_json_path or "").strip() or (env.surrogate_json_path or "").strip()
+    surrogate_url = (query_surrogate_json_url or "").strip() or (env.surrogate_json_url or "").strip()
     bd = (base_dir or "").strip()
     sd = (save_dir or "").strip()
+
+    def with_surrogate(p: StrainDashboardPaths) -> StrainDashboardPaths:
+        p.surrogate_json_path = surrogate_path
+        p.surrogate_json_url = surrogate_url
+        p.s3_env_file = env.s3_env_file
+        p.s3_bucket = env.s3_bucket
+        p.s3_data_key = env.s3_data_key
+        p.s3_surrogate_key = env.s3_surrogate_key
+        p.s3_endpoint_url = env.s3_endpoint_url
+        p.s3_region = env.s3_region
+        return p
 
     def display_url() -> str:
         return q_url or env_url
@@ -201,33 +279,33 @@ def resolve_strain_paths_for_session(
         if token == "upload":
             p = find_strain_json_under_dataset_dir(bd)
             if p:
-                return StrainDashboardPaths(local_json_path=p, json_url=display_url())
+                return with_surrogate(StrainDashboardPaths(local_json_path=p, json_url=display_url()))
         elif token == "converted":
             p = find_strain_json_under_dataset_dir(sd)
             if p:
-                return StrainDashboardPaths(local_json_path=p, json_url=display_url())
+                return with_surrogate(StrainDashboardPaths(local_json_path=p, json_url=display_url()))
         elif token == "query_path":
             if not q_path:
                 continue
             if _looks_like_http_url(q_path):
-                return StrainDashboardPaths(local_json_path="", json_url=q_path)
+                return with_surrogate(StrainDashboardPaths(local_json_path="", json_url=q_path))
             if os.path.isfile(q_path):
-                return StrainDashboardPaths(local_json_path=q_path, json_url=display_url())
+                return with_surrogate(StrainDashboardPaths(local_json_path=q_path, json_url=display_url()))
         elif token == "query_url":
             if q_url:
-                return StrainDashboardPaths(local_json_path="", json_url=q_url)
+                return with_surrogate(StrainDashboardPaths(local_json_path="", json_url=q_url))
         elif token == "env_path":
             if not env_path:
                 continue
             if _looks_like_http_url(env_path):
-                return StrainDashboardPaths(local_json_path="", json_url=env_path)
+                return with_surrogate(StrainDashboardPaths(local_json_path="", json_url=env_path))
             if os.path.isfile(env_path):
-                return StrainDashboardPaths(local_json_path=env_path, json_url=display_url())
+                return with_surrogate(StrainDashboardPaths(local_json_path=env_path, json_url=display_url()))
         elif token == "env_url":
             if env_url:
-                return StrainDashboardPaths(local_json_path="", json_url=env_url)
+                return with_surrogate(StrainDashboardPaths(local_json_path="", json_url=env_url))
 
-    return StrainDashboardPaths(local_json_path="", json_url="")
+    return with_surrogate(StrainDashboardPaths(local_json_path="", json_url=""))
 
 
 @dataclass
@@ -235,14 +313,11 @@ class StrainFieldPlotConfig:
     """Per-plot titles and axis labels (easy to change when scientists refine wording)."""
 
     grid_size: Tuple[int, int] = field(default_factory=lambda: DEFAULT_GRID_SIZE)
-    x_axis_label: str = "x index"
-    y_axis_label: str = "y index"
+    x_axis_label: str = "labx"
+    y_axis_label: str = "labz"
     title_measurements: str = "Measurement locations"
-    title_estimate: str = "GP estimate"
-    title_variance: str = "GP variance"
-    header_regex: re.Pattern = field(default_factory=lambda: DEFAULT_HEADER_REGEX)
-    labx_key: str = "labx"
-    labz_key: str = "labz"
+    title_estimate: str = "Estimate"
+    title_variance: str = "Variance"
     flip_y_for_display: bool = True
     colormap_estimate: str = "Viridis256"
     colormap_variance: str = "Viridis256"
@@ -257,6 +332,49 @@ class StrainFieldGrids:
     estimate: np.ndarray
     variance: np.ndarray
     meta: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class NSDFMeasurementData:
+    """Validated NSDF ``data.json`` arrays."""
+
+    coordinates: np.ndarray
+    observed_values: np.ndarray
+    bounds: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None
+    bounds_source: str = "observed_minmax"
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class NSDFSurrogateData:
+    """Validated length-compatible optional surrogate arrays."""
+
+    surrogate: Optional[np.ndarray] = None
+    uncertainty: Optional[np.ndarray] = None
+    raw_uncertainty: Optional[np.ndarray] = None
+    warnings: List[str] = field(default_factory=list)
+    source: str = ""
+
+    @property
+    def plottable_fields(self) -> List[str]:
+        fields = ["dataset_y"]
+        if self.surrogate is not None:
+            fields.append("surrogate")
+        if self.uncertainty is not None:
+            fields.append("uncertainty")
+        if self.raw_uncertainty is not None:
+            fields.append("raw_uncertainty")
+        return fields
+
+
+@dataclass
+class NSDFLoadedBundle:
+    """Loaded NSDF data and optional surrogate metadata for the UI."""
+
+    data: Dict[str, Any]
+    surrogate: Optional[Dict[str, Any]] = None
+    messages: List[str] = field(default_factory=list)
+    paths: StrainDashboardPaths = field(default_factory=StrainDashboardPaths)
 
 
 # ---------------------------------------------------------------------------
@@ -355,18 +473,50 @@ def enrich_strain_paths_from_dataset_doc(
     sd = (save_dir or "").strip()
     mirror = find_strain_json_under_dataset_dir(bd) or find_strain_json_under_dataset_dir(sd)
     if mirror:
-        return StrainDashboardPaths(local_json_path=mirror, json_url="")
+        return _copy_s3_fields(
+            paths,
+            StrainDashboardPaths(
+                local_json_path=mirror,
+                json_url="",
+                surrogate_json_path=paths.surrogate_json_path,
+                surrogate_json_url=paths.surrogate_json_url,
+            ),
+        )
     if not doc:
         return paths
     link = resolve_strain_json_remote_link_from_dataset(doc)
     if not link:
         return paths
     if _looks_like_http_url(link):
-        return StrainDashboardPaths(local_json_path="", json_url=link)
+        return _copy_s3_fields(
+            paths,
+            StrainDashboardPaths(
+                local_json_path="",
+                json_url=link,
+                surrogate_json_path=paths.surrogate_json_path,
+                surrogate_json_url=paths.surrogate_json_url,
+            ),
+        )
     if os.path.isfile(link):
-        return StrainDashboardPaths(local_json_path=link, json_url="")
+        return _copy_s3_fields(
+            paths,
+            StrainDashboardPaths(
+                local_json_path=link,
+                json_url="",
+                surrogate_json_path=paths.surrogate_json_path,
+                surrogate_json_url=paths.surrogate_json_url,
+            ),
+        )
     # s3:// and other schemes: pass as URL for downstream loaders
-    return StrainDashboardPaths(local_json_path="", json_url=link)
+    return _copy_s3_fields(
+        paths,
+        StrainDashboardPaths(
+            local_json_path="",
+            json_url=link,
+            surrogate_json_path=paths.surrogate_json_path,
+            surrogate_json_url=paths.surrogate_json_url,
+        ),
+    )
 
 
 def load_json_from_local_path(path: str) -> Dict[str, Any]:
@@ -652,109 +802,340 @@ def load_strain_json(
     if jurl:
         return load_json_from_url(jurl, s3_auth_override=mongo_s3_auth)
     raise FileNotFoundError(
-        "Set ORNL_STRAIN_JSON_PATH for a local file path, or ORNL_STRAIN_JSON_URL / "
-        "strain_json_url for a full https://… link."
+        "Set ORNL_NSDF_DATA_JSON_PATH for a local data.json path, or ORNL_NSDF_DATA_JSON_URL / "
+        "nsdf_data_json_url for a full https://... link. Legacy ORNL_STRAIN_JSON_* aliases "
+        "are still accepted for NSDF data.json."
     )
 
 
-# ---------------------------------------------------------------------------
-# Header discovery
-# ---------------------------------------------------------------------------
+def _sibling_surrogate_path(data_path: str) -> str:
+    p = (data_path or "").strip()
+    if not p or _looks_like_http_url(p):
+        return ""
+    if os.path.basename(p).lower() != "data.json":
+        return ""
+    return os.path.join(os.path.dirname(p), "surrogate.json")
 
 
-def _is_numeric_1d(value: Any) -> bool:
-    if not isinstance(value, list) or not value:
-        return False
-    first = value[0]
-    if isinstance(first, (list, dict)):
-        return False
-    return isinstance(first, (int, float)) or first is None
+def _sibling_surrogate_url(data_url: str) -> str:
+    from urllib.parse import urlparse, urlunparse
+
+    u = (data_url or "").strip()
+    if not _looks_like_http_url(u):
+        return ""
+    parts = urlparse(u)
+    if not parts.path.lower().endswith("/data.json"):
+        return ""
+    new_path = parts.path[: -len("data.json")] + "surrogate.json"
+    return urlunparse((parts.scheme, parts.netloc, new_path, parts.params, parts.query, parts.fragment))
 
 
-def _is_numeric_2d_nested(value: Any) -> bool:
-    if not isinstance(value, list) or not value:
-        return False
-    row0 = value[0]
-    if not isinstance(row0, list):
-        return False
-    return all(isinstance(x, (int, float)) or x is None for x in row0)
-
-
-def _to_float_array_2d(value: Any) -> np.ndarray:
-    arr = np.array(value, dtype=np.float64)
-    if arr.ndim != 2:
-        raise ValueError("Expected a 2D numeric array")
-    return arr
-
-
-def _to_float_array_1d(value: Any) -> np.ndarray:
-    arr = np.array(value, dtype=np.float64)
-    if arr.ndim != 1:
-        raise ValueError("Expected a 1D numeric array")
-    return arr
-
-
-def list_strain_field_headers(
-    doc: Mapping[str, Any],
+def load_optional_surrogate_json(
+    paths: StrainDashboardPaths,
     *,
-    header_regex: Optional[re.Pattern] = None,
-    include_non_matching: bool = False,
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+) -> Tuple[Optional[Dict[str, Any]], List[str], StrainDashboardPaths]:
+    """
+    Load optional ``surrogate.json`` from explicit path/URL or inferred sibling.
+
+    Missing inferred siblings are non-fatal. Malformed explicit surrogate locations are
+    reported as messages and skipped so the dashboard can still render measurements.
+    """
+    messages: List[str] = []
+    explicit_path = (paths.surrogate_json_path or "").strip()
+    explicit_url = (paths.surrogate_json_url or "").strip()
+    effective = StrainDashboardPaths(
+        local_json_path=paths.local_json_path,
+        json_url=paths.json_url,
+        surrogate_json_path=explicit_path,
+        surrogate_json_url=explicit_url,
+    )
+
+    candidates: List[Tuple[str, str, bool]] = []
+    if explicit_path:
+        candidates.append(("path", explicit_path, True))
+    if explicit_url:
+        candidates.append(("url", explicit_url, True))
+    if not candidates:
+        sib_path = _sibling_surrogate_path(paths.local_json_path)
+        if sib_path:
+            candidates.append(("path", sib_path, False))
+        else:
+            sib_url = _sibling_surrogate_url(paths.json_url)
+            if sib_url:
+                candidates.append(("url", sib_url, False))
+
+    for kind, value, explicit in candidates:
+        try:
+            if kind == "path":
+                doc = load_json_from_local_path(value)
+                effective.surrogate_json_path = value
+            else:
+                doc = load_json_from_url(value, s3_auth_override=mongo_s3_auth)
+                effective.surrogate_json_url = value
+            messages.append(f"Loaded surrogate JSON from {kind}: {value}")
+            return doc, messages, effective
+        except FileNotFoundError as exc:
+            level = "Configured" if explicit else "Inferred"
+            messages.append(f"{level} surrogate JSON not loaded: {exc}")
+        except Exception as exc:
+            level = "Configured" if explicit else "Inferred"
+            messages.append(f"{level} surrogate JSON skipped: {exc}")
+
+    return None, messages, effective
+
+
+def load_nsdf_json_bundle(
+    paths: StrainDashboardPaths,
+    *,
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+) -> NSDFLoadedBundle:
+    if paths.has_s3_source():
+        return load_nsdf_json_bundle_from_s3(paths)
+    data = load_strain_json(paths, mongo_s3_auth=mongo_s3_auth)
+    surrogate, messages, effective = load_optional_surrogate_json(
+        paths,
+        mongo_s3_auth=mongo_s3_auth,
+    )
+    return NSDFLoadedBundle(data=data, surrogate=surrogate, messages=messages, paths=effective)
+
+
+def _sibling_surrogate_s3_key(data_key: str) -> str:
+    key = (data_key or "").strip()
+    if not key.lower().endswith("data.json"):
+        return ""
+    return key[: -len("data.json")] + "surrogate.json"
+
+
+def _s3_env_values(paths: StrainDashboardPaths) -> Dict[str, str]:
+    file_values = load_simple_env_file(paths.s3_env_file)
+
+    def value(name: str, default: str = "") -> str:
+        return (os.environ.get(name) or file_values.get(name) or default).strip()
+
+    return {
+        "aws_access_key_id": value("AWS_ACCESS_KEY_ID"),
+        "aws_secret_access_key": value("AWS_SECRET_ACCESS_KEY"),
+        "aws_session_token": value("AWS_SESSION_TOKEN"),
+        "endpoint_url": paths.s3_endpoint_url or value("ORNL_NSDF_S3_ENDPOINT_URL"),
+        "region_name": paths.s3_region or value("ORNL_NSDF_S3_REGION", "us-east-1") or "us-east-1",
+    }
+
+
+def _make_nsdf_s3_client(paths: StrainDashboardPaths):
+    import boto3
+
+    cfg = _s3_env_values(paths)
+    kwargs: Dict[str, Any] = {
+        "region_name": cfg["region_name"],
+    }
+    if cfg["endpoint_url"]:
+        kwargs["endpoint_url"] = cfg["endpoint_url"]
+    if cfg["aws_access_key_id"] and cfg["aws_secret_access_key"]:
+        kwargs["aws_access_key_id"] = cfg["aws_access_key_id"]
+        kwargs["aws_secret_access_key"] = cfg["aws_secret_access_key"]
+    if cfg["aws_session_token"]:
+        kwargs["aws_session_token"] = cfg["aws_session_token"]
+    return boto3.client("s3", **kwargs)
+
+
+def _load_json_from_s3_key(client: Any, bucket: str, key: str) -> Dict[str, Any]:
+    resp = client.get_object(Bucket=bucket, Key=key)
+    raw = resp["Body"].read()
+    return json.loads(raw.decode("utf-8"))
+
+
+def _s3_missing_error(exc: Exception) -> bool:
+    try:
+        from botocore.exceptions import ClientError
+    except Exception:
+        return False
+    if not isinstance(exc, ClientError):
+        return False
+    code = str(((exc.response or {}).get("Error") or {}).get("Code") or "")
+    return code in ("NoSuchKey", "NoSuchBucket", "404", "NotFound")
+
+
+def load_nsdf_json_bundle_from_s3(paths: StrainDashboardPaths) -> NSDFLoadedBundle:
+    bucket = (paths.s3_bucket or "").strip()
+    data_key = (paths.s3_data_key or "").strip()
+    if not bucket or not data_key:
+        raise FileNotFoundError(
+            "Set ORNL_NSDF_S3_BUCKET and ORNL_NSDF_S3_DATA_KEY to load NSDF data from S3."
+        )
+
+    client = _make_nsdf_s3_client(paths)
+    data = _load_json_from_s3_key(client, bucket, data_key)
+    messages = [f"Loaded NSDF data JSON from s3://{bucket}/{data_key}"]
+
+    surrogate = None
+    surrogate_key = (paths.s3_surrogate_key or "").strip() or _sibling_surrogate_s3_key(data_key)
+    effective = StrainDashboardPaths(
+        s3_env_file=paths.s3_env_file,
+        s3_bucket=bucket,
+        s3_data_key=data_key,
+        s3_surrogate_key=surrogate_key,
+        s3_endpoint_url=paths.s3_endpoint_url,
+        s3_region=paths.s3_region,
+    )
+    if surrogate_key:
+        try:
+            surrogate = _load_json_from_s3_key(client, bucket, surrogate_key)
+            messages.append(f"Loaded surrogate JSON from s3://{bucket}/{surrogate_key}")
+        except Exception as exc:
+            if _s3_missing_error(exc):
+                messages.append(f"S3 surrogate JSON not found: s3://{bucket}/{surrogate_key}")
+            else:
+                messages.append(f"S3 surrogate JSON skipped: {exc}")
+
+    return NSDFLoadedBundle(data=data, surrogate=surrogate, messages=messages, paths=effective)
+
+
+# ---------------------------------------------------------------------------
+# NSDF field discovery
+# ---------------------------------------------------------------------------
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _numeric_1d_array_or_none(
+    doc: Optional[Mapping[str, Any]],
+    key: str,
+    expected_len: int,
+    warnings: List[str],
+) -> Optional[np.ndarray]:
+    if not doc or key not in doc:
+        return None
+    value = doc.get(key)
+    if not isinstance(value, list) or not value:
+        warnings.append(f"Skipping surrogate field {key!r}: expected a non-empty numeric 1D list.")
+        return None
+    if len(value) != expected_len:
+        warnings.append(
+            f"Skipping surrogate field {key!r}: length {len(value)} does not match "
+            f"dataset_y length {expected_len}."
+        )
+        return None
+    if any((not _is_number(x)) for x in value):
+        warnings.append(f"Skipping surrogate field {key!r}: all values must be numeric.")
+        return None
+    arr = np.asarray(value, dtype=np.float64)
+    if not np.all(np.isfinite(arr)):
+        warnings.append(f"Skipping surrogate field {key!r}: values must be finite.")
+        return None
+    return arr
+
+
+def _validate_bounds(value: Any) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
+    if not isinstance(value, list) or len(value) < 2:
+        return None
+    out: List[Tuple[float, float]] = []
+    for idx in range(2):
+        axis = value[idx]
+        if not isinstance(axis, list) or len(axis) < 2:
+            return None
+        lo, hi = axis[0], axis[1]
+        if not (_is_number(lo) and _is_number(hi)):
+            return None
+        flo, fhi = float(lo), float(hi)
+        if not (math.isfinite(flo) and math.isfinite(fhi)) or flo == fhi:
+            return None
+        out.append((flo, fhi))
+    return out[0], out[1]
+
+
+def validate_nsdf_measurement_doc(doc: Mapping[str, Any]) -> NSDFMeasurementData:
+    """Validate native NSDF ``data.json`` and return normalized arrays."""
+    if not isinstance(doc, Mapping):
+        raise ValueError("NSDF data.json must be a JSON object.")
+    if "dataset_x" not in doc:
+        raise ValueError("NSDF data.json is missing required key 'dataset_x'.")
+    if "dataset_y" not in doc:
+        raise ValueError("NSDF data.json is missing required key 'dataset_y'.")
+
+    dataset_x = doc.get("dataset_x")
+    dataset_y = doc.get("dataset_y")
+    if not isinstance(dataset_x, list) or not dataset_x:
+        raise ValueError("'dataset_x' must be a non-empty list of coordinate pairs.")
+    if not isinstance(dataset_y, list) or not dataset_y:
+        raise ValueError("'dataset_y' must be a non-empty numeric 1D list.")
+    if len(dataset_x) != len(dataset_y):
+        raise ValueError(
+            f"'dataset_x' length ({len(dataset_x)}) must match 'dataset_y' length ({len(dataset_y)})."
+        )
+
+    coords: List[Tuple[float, float]] = []
+    for i, row_value in enumerate(dataset_x):
+        if not isinstance(row_value, list) or len(row_value) < 2:
+            raise ValueError(f"'dataset_x[{i}]' must contain at least two numeric values.")
+        x, z = row_value[0], row_value[1]
+        if not (_is_number(x) and _is_number(z)):
+            raise ValueError(f"'dataset_x[{i}]' must contain numeric labx/labz values.")
+        fx, fz = float(x), float(z)
+        if not (math.isfinite(fx) and math.isfinite(fz)):
+            raise ValueError(f"'dataset_x[{i}]' labx/labz values must be finite.")
+        coords.append((fx, fz))
+
+    if any((not _is_number(v)) for v in dataset_y):
+        raise ValueError("'dataset_y' must contain only numeric values.")
+    observed = np.asarray(dataset_y, dtype=np.float64)
+    if observed.ndim != 1 or not np.all(np.isfinite(observed)):
+        raise ValueError("'dataset_y' must be a finite numeric 1D list.")
+
+    bounds = _validate_bounds(doc.get("bounds"))
+    metadata = {k: v for k, v in doc.items() if k not in ("dataset_x", "dataset_y")}
+    return NSDFMeasurementData(
+        coordinates=np.asarray(coords, dtype=np.float64),
+        observed_values=observed,
+        bounds=bounds,
+        bounds_source="bounds" if bounds else "observed_minmax",
+        metadata=metadata,
+    )
+
+
+def validate_nsdf_surrogate_doc(
+    surrogate_doc: Optional[Mapping[str, Any]],
+    expected_len: int,
+) -> NSDFSurrogateData:
+    warnings: List[str] = []
+    if surrogate_doc is None:
+        return NSDFSurrogateData(warnings=warnings)
+    if not isinstance(surrogate_doc, Mapping):
+        return NSDFSurrogateData(warnings=["Skipping surrogate JSON: expected a JSON object."])
+    return NSDFSurrogateData(
+        surrogate=_numeric_1d_array_or_none(surrogate_doc, "surrogate", expected_len, warnings),
+        uncertainty=_numeric_1d_array_or_none(surrogate_doc, "uncertainty", expected_len, warnings),
+        raw_uncertainty=_numeric_1d_array_or_none(
+            surrogate_doc,
+            "raw_uncertainty",
+            expected_len,
+            warnings,
+        ),
+        warnings=warnings,
+    )
+
+
+def list_nsdf_field_headers(
+    data_doc: Mapping[str, Any],
+    surrogate_doc: Optional[Mapping[str, Any]] = None,
 ) -> List[str]:
-    """
-    Return sorted JSON keys that look like strain *series* headers:
-    - Default: ``<scan>/data/uniform_strain`` or ``unconstrained_strain`` (regex).
-    - If ``include_non_matching``, also include any top-level 1D numeric array keys
-      (useful while exploring new exports).
-    """
-    rx = header_regex or DEFAULT_HEADER_REGEX
-    keys = []
-    extra: List[str] = []
-    for k, v in doc.items():
-        if not isinstance(k, str):
-            continue
-        if _is_numeric_2d_nested(v):
-            if rx.search(k):
-                keys.append(k)
-            elif include_non_matching:
-                extra.append(k)
-            continue
-        if _is_numeric_1d(v):
-            if rx.search(k):
-                keys.append(k)
-            elif include_non_matching:
-                extra.append(k)
-    keys.sort()
-    extra.sort()
-    return keys + (extra if include_non_matching else [])
+    measurement = validate_nsdf_measurement_doc(data_doc)
+    surrogate = validate_nsdf_surrogate_doc(surrogate_doc, measurement.observed_values.shape[0])
+    return surrogate.plottable_fields
 
 
-def guess_variance_key(header: str, doc: Mapping[str, Any]) -> Optional[str]:
-    """
-    Map ``…/unconstrained_strain`` → ``…/unconstrained_strain_stdev`` when present.
-    Uniform strain has no standard sidecar in current schema; returns None.
-    """
-    if header.endswith("/unconstrained_strain"):
-        candidate = header + "_stdev"
-        if candidate in doc:
-            return candidate
-    return None
-
-
-def guess_gp_estimate_key(header: str, doc: Mapping[str, Any]) -> Optional[str]:
-    """Optional explicit GP grid in JSON, e.g. ``0/data/uniform_strain_gp``."""
-    for suffix in ("_gp_estimate", "_gp", "/gp_estimate"):
-        k = f"{header}{suffix}" if suffix.startswith("_") else header + suffix
-        if k in doc:
-            return k
-    return None
-
-
-def guess_gp_variance_key(header: str, doc: Mapping[str, Any]) -> Optional[str]:
-    for suffix in ("_gp_variance", "_gp_var", "/gp_variance"):
-        k = header + suffix
-        if k in doc:
-            return k
-    return None
+def infer_nsdf_grid_size(data_doc: Mapping[str, Any]) -> Tuple[int, int]:
+    """Infer grid width/height from unique labx/labz coordinates in ``dataset_x``."""
+    measurement = validate_nsdf_measurement_doc(data_doc)
+    unique_x = np.unique(measurement.coordinates[:, 0])
+    unique_z = np.unique(measurement.coordinates[:, 1])
+    nx = int(unique_x.shape[0])
+    ny = int(unique_z.shape[0])
+    if nx <= 0 or ny <= 0:
+        return DEFAULT_GRID_SIZE
+    return nx, ny
 
 
 # ---------------------------------------------------------------------------
@@ -767,6 +1148,7 @@ def _norm_positions_to_grid(
     labz: Sequence[Number],
     nx: int,
     ny: int,
+    bounds: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     lx = np.asarray(labx, dtype=np.float64)
     lz = np.asarray(labz, dtype=np.float64)
@@ -775,15 +1157,31 @@ def _norm_positions_to_grid(
     if lx.size == 0:
         return np.zeros(0), np.zeros(0)
 
-    def scale_axis(a: np.ndarray, n: int) -> np.ndarray:
-        amin, amax = np.nanmin(a), np.nanmax(a)
+    def scale_axis(a: np.ndarray, n: int, axis_bounds: Optional[Tuple[float, float]]) -> np.ndarray:
+        if axis_bounds is None:
+            amin, amax = np.nanmin(a), np.nanmax(a)
+        else:
+            amin, amax = axis_bounds
         if not math.isfinite(amin) or not math.isfinite(amax) or amax == amin:
             return np.full_like(a, (n - 1) / 2.0)
         return (a - amin) / (amax - amin) * (n - 1)
 
-    gx = scale_axis(lx, nx)
-    gy = scale_axis(lz, ny)
+    x_bounds = bounds[0] if bounds else None
+    z_bounds = bounds[1] if bounds else None
+    gx = scale_axis(lx, nx, x_bounds)
+    gy = scale_axis(lz, ny, z_bounds)
     return gx, gy
+
+
+def _norm_coordinates_to_grid(
+    coordinates: np.ndarray,
+    nx: int,
+    ny: int,
+    bounds: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    if coordinates.ndim != 2 or coordinates.shape[1] < 2:
+        raise ValueError("coordinates must be a 2D array with at least two columns")
+    return _norm_positions_to_grid(coordinates[:, 0], coordinates[:, 1], nx, ny, bounds)
 
 
 def _idw_fill_grid(
@@ -850,58 +1248,15 @@ def _distance_weighted_variance_placeholder(
 
 def build_strain_field_grids(
     doc: Mapping[str, Any],
-    header: str,
     cfg: StrainFieldPlotConfig,
+    surrogate_doc: Optional[Mapping[str, Any]] = None,
 ) -> StrainFieldGrids:
-    """
-    Build (measurements mask, GP estimate, GP variance) for ``header``.
-
-    Resolution order:
-    1. If optional keys ``*_gp_estimate`` / ``*_gp_variance`` exist as 2D arrays, use them.
-    2. If ``header`` value is already 2D, use as estimate; variance from optional key or placeholder.
-    3. If 1D: use ``labx`` / ``labz`` to place sparse samples, IDW interpolation for estimate,
-       variance from ``unconstrained_strain_stdev`` when available else distance placeholder.
-    """
+    """Build measurement mask, estimate, and variance directly from native NSDF schema."""
     nx, ny = cfg.grid_size[0], cfg.grid_size[1]
-    raw = doc.get(header)
-    if raw is None:
-        raise KeyError(f"Missing JSON key: {header}")
-
-    meta: Dict[str, Any] = {"header": header, "mode": "unknown"}
-
-    gp_e_key = guess_gp_estimate_key(header, doc)
-    gp_v_key = guess_gp_variance_key(header, doc)
-    if gp_e_key and gp_v_key:
-        est = _to_float_array_2d(doc[gp_e_key])
-        var = _to_float_array_2d(doc[gp_v_key])
-        meas = np.isfinite(est).astype(np.float64)
-        meta["mode"] = "explicit_gp_keys"
-        meta["gp_estimate_key"] = gp_e_key
-        meta["gp_variance_key"] = gp_v_key
-        return StrainFieldGrids(meas, est, var, meta)
-
-    if _is_numeric_2d_nested(raw):
-        est = _to_float_array_2d(raw)
-        meas = np.isfinite(est).astype(np.float64)
-        if gp_v_key:
-            var = _to_float_array_2d(doc[gp_v_key])
-        else:
-            var = _distance_weighted_variance_placeholder(meas, float(np.nanstd(est) or 1.0))
-        meta["mode"] = "dense_header"
-        return StrainFieldGrids(meas, est, var, meta)
-
-    if not _is_numeric_1d(raw):
-        raise TypeError(f"Unsupported value type for {header!r}")
-
-    values = _to_float_array_1d(raw)
-    labx = doc.get(cfg.labx_key, [])
-    labz = doc.get(cfg.labz_key, [])
-    if not isinstance(labx, list) or not isinstance(labz, list):
-        raise ValueError(f"Need numeric lists {cfg.labx_key!r} and {cfg.labz_key!r} for sparse mode")
-
-    gx, gy = _norm_positions_to_grid(labx, labz, nx, ny)
-    m = min(int(gx.shape[0]), int(gy.shape[0]), int(values.shape[0]))
-    gx, gy, values = gx[:m], gy[:m], values[:m]
+    measurement = validate_nsdf_measurement_doc(doc)
+    surrogate = validate_nsdf_surrogate_doc(surrogate_doc, measurement.observed_values.shape[0])
+    values = measurement.observed_values
+    gx, gy = _norm_coordinates_to_grid(measurement.coordinates, nx, ny, measurement.bounds)
     mask = np.zeros((ny, nx), dtype=np.float64)
     for x, y in zip(gx, gy):
         if not (math.isfinite(x) and math.isfinite(y)):
@@ -910,21 +1265,31 @@ def build_strain_field_grids(
         iy = int(np.clip(round(float(y)), 0, ny - 1))
         mask[iy, ix] = 1.0
 
-    est = _idw_fill_grid(gx, gy, values, nx, ny)
-    v_key = guess_variance_key(header, doc)
-    if v_key and v_key in doc and _is_numeric_1d(doc[v_key]):
-        vvals = _to_float_array_1d(doc[v_key])[:m]
-        if vvals.shape[0] == values.shape[0]:
-            var = _idw_fill_grid(gx, gy, vvals, nx, ny)
-            var = np.square(np.maximum(var, 0.0))
-            meta["variance_key"] = v_key
-        else:
-            var = _distance_weighted_variance_placeholder(mask, float(np.nanmean(np.abs(values)) or 1e-6))
+    meta: Dict[str, Any] = {
+        "field": "dataset_y",
+        "mode": "nsdf_sparse",
+        "n_points": int(values.shape[0]),
+        "bounds_source": measurement.bounds_source,
+        "plottable_fields": surrogate.plottable_fields,
+        "warnings": list(surrogate.warnings),
+    }
+
+    if surrogate.surrogate is not None:
+        est = _idw_fill_grid(gx, gy, surrogate.surrogate, nx, ny)
+        meta["estimate_source"] = "surrogate"
+    else:
+        est = _idw_fill_grid(gx, gy, values, nx, ny)
+        meta["estimate_source"] = "dataset_y_idw"
+
+    if surrogate.uncertainty is not None:
+        var_samples = np.square(np.maximum(surrogate.uncertainty, 0.0))
+        var = _idw_fill_grid(gx, gy, var_samples, nx, ny)
+        meta["variance_source"] = "uncertainty_squared"
     else:
         scale = float(np.nanmean(np.abs(values)) or 1e-6) * 0.25
         var = _distance_weighted_variance_placeholder(mask, scale)
+        meta["variance_source"] = "distance_placeholder"
 
-    meta["mode"] = "sparse_idw"
     return StrainFieldGrids(mask, est, var, meta)
 
 
@@ -1036,14 +1401,3 @@ def make_strain_triplet_figures(
         low_high=(vlo, vhi),
     )
     return p0, p1, p2
-
-
-def default_row_headers(n_rows: int) -> List[str]:
-    base = list(DEFAULT_ROW_HEADERS)
-    if n_rows <= len(base):
-        return base[:n_rows]
-    out = base[:]
-    last = base[-1] if base else "0/data/uniform_strain"
-    while len(out) < n_rows:
-        out.append(last)
-    return out
