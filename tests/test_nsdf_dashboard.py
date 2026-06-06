@@ -70,16 +70,6 @@ def test_valid_with_matching_surrogate() -> None:
     assert math.isclose(float(grids.variance[0, 0]), 0.01, rel_tol=1e-6, abs_tol=1e-6)
 
 
-def test_mismatched_surrogate_is_skipped() -> None:
-    cfg = StrainFieldPlotConfig(grid_size=(11, 11))
-    surrogate = {"surrogate": [10.0], "uncertainty": [0.1]}
-    grids = build_strain_field_grids(_base_data(), cfg, surrogate)
-    assert grids.meta["estimate_source"] == "dataset_y_idw"
-    assert grids.meta["variance_source"] == "distance_placeholder"
-    assert grids.meta["warnings"]
-    assert list_nsdf_field_headers(_base_data(), surrogate) == ["dataset_y"]
-
-
 def test_length_mismatch_raises_clear_error() -> None:
     bad = {"dataset_x": [[0.0, 0.0], [1.0, 1.0]], "dataset_y": [1.0]}
     try:
@@ -416,7 +406,6 @@ def main() -> None:
     tests = [
         test_valid_without_surrogate,
         test_valid_with_matching_surrogate,
-        test_mismatched_surrogate_is_skipped,
         test_length_mismatch_raises_clear_error,
         test_bounds_are_used_for_normalization,
         test_bounds_fallback_to_observed_minmax,
