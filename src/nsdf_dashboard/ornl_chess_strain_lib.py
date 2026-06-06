@@ -1040,7 +1040,6 @@ def _is_number(value: Any) -> bool:
 def _numeric_1d_array_or_none(
     doc: Optional[Mapping[str, Any]],
     key: str,
-    expected_len: int,
     warnings: List[str],
 ) -> Optional[np.ndarray]:
     if not doc or key not in doc:
@@ -1048,12 +1047,6 @@ def _numeric_1d_array_or_none(
     value = doc.get(key)
     if not isinstance(value, list) or not value:
         warnings.append(f"Skipping surrogate field {key!r}: expected a non-empty numeric 1D list.")
-        return None
-    if len(value) != expected_len:
-        warnings.append(
-            f"Skipping surrogate field {key!r}: length {len(value)} does not match "
-            f"dataset_y length {expected_len}."
-        )
         return None
     if any((not _is_number(x)) for x in value):
         warnings.append(f"Skipping surrogate field {key!r}: all values must be numeric.")
@@ -1142,12 +1135,11 @@ def validate_nsdf_surrogate_doc(
     if not isinstance(surrogate_doc, Mapping):
         return NSDFSurrogateData(warnings=["Skipping surrogate JSON: expected a JSON object."])
     return NSDFSurrogateData(
-        surrogate=_numeric_1d_array_or_none(surrogate_doc, "surrogate", expected_len, warnings),
-        uncertainty=_numeric_1d_array_or_none(surrogate_doc, "uncertainty", expected_len, warnings),
+        surrogate=_numeric_1d_array_or_none(surrogate_doc, "surrogate", warnings),
+        uncertainty=_numeric_1d_array_or_none(surrogate_doc, "uncertainty", warnings),
         raw_uncertainty=_numeric_1d_array_or_none(
             surrogate_doc,
             "raw_uncertainty",
-            expected_len,
             warnings,
         ),
         warnings=warnings,
