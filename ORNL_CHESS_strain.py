@@ -249,10 +249,11 @@ else:
     if env_grid_size:
         plot_cfg.grid_size = env_grid_size
 
-    status_div = Div(text="", width_policy="max", height_policy="fixed", height=86)
+    status_div = Div(text="", sizing_mode="stretch_width", visible=False)
     grid_w = Spinner(title="Grid width", low=1, high=512, step=1, value=plot_cfg.grid_size[0], width=100)
     grid_h = Spinner(title="Grid height", low=1, high=512, step=1, value=plot_cfg.grid_size[1], width=100)
     btn_reset_grid = Button(label="Reset", button_type="default", width=80)
+    btn_toggle_status = Button(label="Show status", button_type="default", width=110)
 
     loaded_bundle: Optional[NSDFLoadedBundle] = None
     figures_column = column(sizing_mode="stretch_width")
@@ -265,7 +266,10 @@ else:
 
     def set_status(msg: str, ok: bool = True) -> None:
         color = "#0a0" if ok else "#a00"
-        status_div.text = f'<div style="color:{color};font-family:monospace;white-space:pre-wrap;">{msg}</div>'
+        status_div.text = (
+            f'<div style="color:{color};font-family:monospace;line-height:1.35;'
+            f'white-space:pre-wrap;">{msg}</div>'
+        )
 
     def _grid_size_from_controls() -> tuple[int, int]:
         try:
@@ -401,12 +405,17 @@ else:
         rebuild_figures()
         _set_loaded_status()
 
+    def on_toggle_status() -> None:
+        status_div.visible = not status_div.visible
+        btn_toggle_status.label = "Hide status" if status_div.visible else "Show status"
+
     grid_w.on_change("value", on_grid_control_change)
     grid_h.on_change("value", on_grid_control_change)
     btn_reset_grid.on_click(on_reset_grid)
+    btn_toggle_status.on_click(on_toggle_status)
 
     controls = column(
-        row(grid_w, grid_h, btn_reset_grid, sizing_mode="scale_width"),
+        row(grid_w, grid_h, btn_reset_grid, btn_toggle_status, sizing_mode="scale_width"),
         status_div,
         sizing_mode="stretch_width",
     )
