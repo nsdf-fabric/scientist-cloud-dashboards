@@ -33,9 +33,9 @@ def _int_env(name: str, default: int) -> int:
 def run_fastapi(stop_event: threading.Event) -> None:
     config = uvicorn.Config(
         refresh_app,
-        host=_env_value("ORNL_REFRESH_API_HOST", "0.0.0.0"),
-        port=_int_env("ORNL_REFRESH_API_PORT", 8060),
-        log_level=_env_value("ORNL_REFRESH_API_LOG_LEVEL", "info"),
+        host=_env_value("REFRESH_API_HOST", "0.0.0.0"),
+        port=_int_env("REFRESH_API_PORT", 8060),
+        log_level=_env_value("REFRESH_API_LOG_LEVEL", "info"),
     )
     server = uvicorn.Server(config)
 
@@ -53,9 +53,9 @@ def main() -> None:
     api_thread = threading.Thread(target=run_fastapi, args=(stop_event,), daemon=True)
     api_thread.start()
 
-    bokeh_port = _int_env("ORNL_BOKEH_PORT", 8059)
-    bokeh_host = _env_value("ORNL_BOKEH_HOST", "0.0.0.0")
-    websocket_origin = _env_value("ORNL_BOKEH_ALLOW_WEBSOCKET_ORIGIN", "*")
+    bokeh_port = _int_env("BOKEH_PORT", 8059)
+    bokeh_host = _env_value("BOKEH_HOST", "0.0.0.0")
+    websocket_origin = _env_value("BOKEH_ALLOW_WEBSOCKET_ORIGIN", "*")
     io_loop = IOLoop.current()
     dashboard_script = os.path.join(os.path.dirname(__file__), "ORNL_CHESS_strain.py")
     app = Application(ScriptHandler(filename=dashboard_script))
@@ -83,8 +83,8 @@ def main() -> None:
     )
     print(
         "FastAPI refresh endpoint: "
-        f"http://{_env_value('ORNL_REFRESH_API_HOST', '0.0.0.0')}:"
-        f"{_int_env('ORNL_REFRESH_API_PORT', 8060)}/refresh",
+        f"http://{_env_value('REFRESH_API_HOST', '0.0.0.0')}:"
+        f"{_int_env('REFRESH_API_PORT', 8060)}/refresh",
         flush=True,
     )
     io_loop.start()

@@ -24,14 +24,14 @@ to observed coordinate min/max.
 To force a fixed grid at dashboard startup, set either:
 
 ```bash
-ORNL_NSDF_GRID_SIZE=21x13
+GRID_SIZE=21x13
 ```
 
 or:
 
 ```bash
-ORNL_NSDF_GRID_WIDTH=21
-ORNL_NSDF_GRID_HEIGHT=13
+GRID_WIDTH=21
+GRID_HEIGHT=13
 ```
 
 These can be exported in the shell or placed in `ORNL_S3_ENV_FILE`. When set, the
@@ -55,37 +55,17 @@ Optional `surrogate.json`:
 
 Preferred environment variables:
 
-- `ORNL_NSDF_LOCAL_DATA_DIR`
-- `ORNL_NSDF_DATA_JSON_PATH`
-- `ORNL_NSDF_DATA_JSON_URL`
-- `ORNL_SURROGATE_JSON_PATH`
-- `ORNL_SURROGATE_JSON_URL`
+- `LOCAL_DATA_DIR`
+- `S3_BUCKET`
+- `S3_DATA_KEY`
+- `S3_SURROGATE_KEY`
+- `S3_ENDPOINT_URL`
+- `S3_REGION`
 
-Preferred URL query parameters:
-
-- `nsdf_data_json_path`
-- `nsdf_data_json_url`
-- `surrogate_json_path`
-- `surrogate_json_url`
-
-Compatibility aliases still work, but now point to NSDF `data.json`, not the old
-strain schema:
-
-- `ORNL_STRAIN_JSON_PATH`
-- `ORNL_STRAIN_JSON_URL`
-- `strain_json_path`
-- `strain_json_url`
-
-If the data source is a local path ending in `data.json`, the dashboard also tries
-`surrogate.json` in the same directory when no explicit surrogate path/URL is set.
-For data URLs ending in `data.json`, it tries the sibling `surrogate.json` URL.
-Missing inferred surrogate files are non-fatal.
-
-When `ORNL_NSDF_LOCAL_DATA_DIR` is set, each load or refresh first checks for
+When `LOCAL_DATA_DIR` is set, each load or refresh first checks for
 `data.json` in that directory and optionally `surrogate.json` beside it. If local
 `data.json` exists, the dashboard uses those local files and skips S3 for that refresh.
-If local `data.json` is missing, the dashboard falls back to the configured path, URL,
-or S3 source.
+If local `data.json` is missing, the dashboard falls back to the configured S3 source.
 
 ## S3 Event Refresh
 
@@ -97,16 +77,16 @@ AWS_ACCESS_KEY_ID=YOUR_ACCESS_KEY
 AWS_SECRET_ACCESS_KEY=YOUR_SECRET_KEY
 AWS_SESSION_TOKEN=
 
-ORNL_REFRESH_API_KEY=choose-a-secret-refresh-key
-ORNL_NSDF_LOCAL_DATA_DIR=/local/nsdf-output
-ORNL_NSDF_S3_BUCKET=your-bucket
-ORNL_NSDF_S3_DATA_KEY=path/to/data.json
-ORNL_NSDF_S3_SURROGATE_KEY=path/to/surrogate.json
-ORNL_NSDF_S3_ENDPOINT_URL=https://your-s3-compatible-endpoint.example.com
-ORNL_NSDF_S3_REGION=us-east-1
+REFRESH_API_KEY=choose-a-secret-refresh-key
+LOCAL_DATA_DIR=/local/nsdf-output
+S3_BUCKET=your-bucket
+S3_DATA_KEY=path/to/data.json
+S3_SURROGATE_KEY=path/to/surrogate.json
+S3_ENDPOINT_URL=https://your-s3-compatible-endpoint.example.com
+S3_REGION=us-east-1
 ```
 
-`ORNL_NSDF_S3_SURROGATE_KEY` is optional. If omitted and the data key ends in
+`S3_SURROGATE_KEY` is optional. If omitted and the data key ends in
 `data.json`, the dashboard tries the sibling `surrogate.json`. Missing surrogate
 objects are non-fatal.
 
@@ -135,7 +115,7 @@ curl -X POST http://localhost:8060/refresh \
 ```
 
 The endpoint is an alert only; it does not send data. Every open dashboard session
-reloads from `ORNL_NSDF_LOCAL_DATA_DIR` first when local `data.json` exists, otherwise
+reloads from `LOCAL_DATA_DIR` first when local `data.json` exists, otherwise
 from the configured S3 `data.json` and optional `surrogate.json`.
 
 ## Docker Run
@@ -181,9 +161,7 @@ First build the Docker image above.
 apptainer build scientist-cloud-dashboards.sif docker-daemon://scientist-cloud-dashboards:latest
 
 apptainer run \
-  --env ORNL_NSDF_DATA_JSON_PATH="/ORNL_strain/data.json" \
-  --env ORNL_SURROGATE_JSON_PATH="/ORNL_strain/surrogate.json" \
-  --env ORNL_STRAIN_SOURCE_ORDER="env_path,env_url,query_url" \
+  --env LOCAL_DATA_DIR="/ORNL_strain" \
   --bind ${PWD}/ORNL_strain:/ORNL_strain \
   scientist-cloud-dashboards.sif
 ```

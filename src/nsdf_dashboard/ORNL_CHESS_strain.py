@@ -102,9 +102,13 @@ from nsdf_dashboard.ornl_chess_strain_lib import (  # noqa: E402
 from nsdf_dashboard.refresh_bus import register_refresh_callback, unregister_refresh_callback  # noqa: E402
 
 
-def _dashboard_env_value(name: str) -> str:
+def _dashboard_env_value(*names: str) -> str:
     env_file_values = load_simple_env_file(os.environ.get("ORNL_S3_ENV_FILE", "").strip())
-    return (os.environ.get(name) or env_file_values.get(name) or "").strip()
+    for name in names:
+        value = (os.environ.get(name) or env_file_values.get(name) or "").strip()
+        if value:
+            return value
+    return ""
 
 
 def _int_value(raw: str) -> Optional[int]:
@@ -116,7 +120,7 @@ def _int_value(raw: str) -> Optional[int]:
 
 
 def _fixed_grid_size_from_env() -> Optional[tuple[int, int]]:
-    compact = _dashboard_env_value("ORNL_NSDF_GRID_SIZE").lower().replace(" ", "")
+    compact = _dashboard_env_value("GRID_SIZE").lower().replace(" ", "")
     if compact:
         for sep in ("x", ",", ":"):
             if sep not in compact:
@@ -126,8 +130,8 @@ def _fixed_grid_size_from_env() -> Optional[tuple[int, int]]:
             height = _int_value(right)
             if width and height:
                 return width, height
-    width = _int_value(_dashboard_env_value("ORNL_NSDF_GRID_WIDTH"))
-    height = _int_value(_dashboard_env_value("ORNL_NSDF_GRID_HEIGHT"))
+    width = _int_value(_dashboard_env_value("GRID_WIDTH"))
+    height = _int_value(_dashboard_env_value("GRID_HEIGHT"))
     if width and height:
         return width, height
     return None
@@ -433,11 +437,9 @@ else:
         figures_column.children = [
             Div(
                 text=(
-                    "<p>No NSDF data.json resolved yet. Set <code>ORNL_NSDF_DATA_JSON_PATH</code> / "
-                    "<code>ORNL_NSDF_DATA_JSON_URL</code>, use legacy <code>ORNL_STRAIN_JSON_*</code> "
-                    "aliases, configure <code>ORNL_NSDF_LOCAL_DATA_DIR</code>, configure "
-                    "<code>ORNL_NSDF_S3_BUCKET</code> / "
-                    "<code>ORNL_NSDF_S3_DATA_KEY</code>, or pass the matching query parameters.</p>"
+                    "<p>No NSDF data.json resolved yet. Configure <code>LOCAL_DATA_DIR</code> "
+                    "with a local <code>data.json</code>, or configure <code>S3_BUCKET</code> / "
+                    "<code>S3_DATA_KEY</code>.</p>"
                 )
             )
         ]

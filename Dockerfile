@@ -20,9 +20,11 @@ FROM python:3.11-slim AS runner
 
 WORKDIR /app
 COPY --from=builder /app/.venv /app/.venv
+COPY src /app/src
 COPY .env.example /app/.env.example
 
 ENV PATH="/app/.venv/bin:$PATH"
+ENV PYTHONPATH="/app/src"
 
 EXPOSE 8059
 EXPOSE 8060

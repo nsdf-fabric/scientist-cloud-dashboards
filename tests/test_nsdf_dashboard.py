@@ -216,16 +216,16 @@ def test_env_file_parser_and_s3_config_detection() -> None:
                             "# ignored",
                             "AWS_ACCESS_KEY_ID=file-ak",
                             "AWS_SECRET_ACCESS_KEY='file-sk'",
-                            "ORNL_NSDF_S3_BUCKET=my-bucket",
-                            'ORNL_NSDF_S3_DATA_KEY="prefix/data.json"',
-                            "ORNL_NSDF_S3_REGION=us-west-2",
-                            "ORNL_NSDF_LOCAL_DATA_DIR=/tmp/nsdf-local",
+                            "S3_BUCKET=my-bucket",
+                            'S3_DATA_KEY="prefix/data.json"',
+                            "S3_REGION=us-west-2",
+                            "LOCAL_DATA_DIR=/tmp/nsdf-local",
                         ]
                     )
                 )
             parsed = load_simple_env_file(env_path)
             assert parsed["AWS_SECRET_ACCESS_KEY"] == "file-sk"
-            assert parsed["ORNL_NSDF_S3_DATA_KEY"] == "prefix/data.json"
+            assert parsed["S3_DATA_KEY"] == "prefix/data.json"
 
             os.environ.clear()
             os.environ["ORNL_S3_ENV_FILE"] = env_path
@@ -344,7 +344,7 @@ def test_refresh_api_key_loads_from_env_file() -> None:
         with tempfile.TemporaryDirectory() as tmp:
             env_path = os.path.join(tmp, "s3.env")
             with open(env_path, "w", encoding="utf-8") as fh:
-                fh.write("ORNL_REFRESH_API_KEY=from-file\n")
+                fh.write("REFRESH_API_KEY=from-file\n")
 
             os.environ.clear()
             os.environ["ORNL_S3_ENV_FILE"] = env_path
@@ -371,7 +371,7 @@ def test_refresh_api_rejects_missing_or_bad_api_key() -> None:
     refresh_bus.clear_refresh_callbacks()
     try:
         os.environ.pop("ORNL_S3_ENV_FILE", None)
-        os.environ["ORNL_REFRESH_API_KEY"] = "secret"
+        os.environ["REFRESH_API_KEY"] = "secret"
         endpoint = next(
             route.endpoint
             for route in refresh_api.create_app().routes
@@ -396,7 +396,7 @@ def test_refresh_api_authorized_trigger() -> None:
     calls: list[str] = []
     try:
         os.environ.pop("ORNL_S3_ENV_FILE", None)
-        os.environ["ORNL_REFRESH_API_KEY"] = "secret"
+        os.environ["REFRESH_API_KEY"] = "secret"
         refresh_bus.register_refresh_callback(lambda: calls.append("refresh"))
         endpoint = next(
             route.endpoint

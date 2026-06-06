@@ -16,7 +16,7 @@ def _env_value(name: str) -> str:
 
 
 def expected_api_key() -> str:
-    return _env_value("ORNL_REFRESH_API_KEY")
+    return _env_value("REFRESH_API_KEY")
 
 
 def create_app() -> FastAPI:
@@ -32,7 +32,7 @@ def create_app() -> FastAPI:
         if not api_key:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="ORNL_REFRESH_API_KEY is not configured.",
+                detail="REFRESH_API_KEY is not configured.",
             )
         if x_api_key != api_key:
             raise HTTPException(

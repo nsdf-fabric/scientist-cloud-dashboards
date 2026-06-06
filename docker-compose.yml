@@ -14,3 +14,8 @@ services:
       retries: 5
       start_period: 20s
       timeout: 5s
+    volumes:
+      - local-data:/app/local/nsdf-output  
+volumes: 
+  local-data:
+    driver: local

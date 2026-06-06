@@ -118,13 +118,13 @@ class StrainDashboardPaths:
             ).strip(),
             surrogate_json_path=os.environ.get("ORNL_SURROGATE_JSON_PATH", "").strip(),
             surrogate_json_url=os.environ.get("ORNL_SURROGATE_JSON_URL", "").strip(),
-            local_data_dir=env_value("ORNL_NSDF_LOCAL_DATA_DIR"),
+            local_data_dir=env_value("LOCAL_DATA_DIR"),
             s3_env_file=os.environ.get("ORNL_S3_ENV_FILE", "").strip(),
-            s3_bucket=env_value("ORNL_NSDF_S3_BUCKET"),
-            s3_data_key=env_value("ORNL_NSDF_S3_DATA_KEY"),
-            s3_surrogate_key=env_value("ORNL_NSDF_S3_SURROGATE_KEY"),
-            s3_endpoint_url=env_value("ORNL_NSDF_S3_ENDPOINT_URL"),
-            s3_region=env_value("ORNL_NSDF_S3_REGION", "us-east-1") or "us-east-1",
+            s3_bucket=env_value("S3_BUCKET"),
+            s3_data_key=env_value("S3_DATA_KEY"),
+            s3_surrogate_key=env_value("S3_SURROGATE_KEY"),
+            s3_endpoint_url=env_value("S3_ENDPOINT_URL"),
+            s3_region=env_value("S3_REGION", "us-east-1") or "us-east-1",
         )
 
     def has_s3_source(self) -> bool:
@@ -891,7 +891,7 @@ def load_optional_surrogate_json(
 
 
 def load_nsdf_json_bundle_from_local_data_dir(paths: StrainDashboardPaths) -> Optional[NSDFLoadedBundle]:
-    """Load fixed-name data/surrogate JSON files from ORNL_NSDF_LOCAL_DATA_DIR when present."""
+    """Load fixed-name data/surrogate JSON files from LOCAL_DATA_DIR when present."""
     local_dir = (paths.local_data_dir or "").strip()
     if not local_dir:
         return None
@@ -953,8 +953,8 @@ def _s3_env_values(paths: StrainDashboardPaths) -> Dict[str, str]:
         "aws_access_key_id": value("AWS_ACCESS_KEY_ID"),
         "aws_secret_access_key": value("AWS_SECRET_ACCESS_KEY"),
         "aws_session_token": value("AWS_SESSION_TOKEN"),
-        "endpoint_url": paths.s3_endpoint_url or value("ORNL_NSDF_S3_ENDPOINT_URL"),
-        "region_name": paths.s3_region or value("ORNL_NSDF_S3_REGION", "us-east-1") or "us-east-1",
+        "endpoint_url": paths.s3_endpoint_url or value("S3_ENDPOINT_URL"),
+        "region_name": paths.s3_region or value("S3_REGION", "us-east-1") or "us-east-1",
     }
 
 
@@ -997,7 +997,7 @@ def load_nsdf_json_bundle_from_s3(paths: StrainDashboardPaths) -> NSDFLoadedBund
     data_key = (paths.s3_data_key or "").strip()
     if not bucket or not data_key:
         raise FileNotFoundError(
-            "Set ORNL_NSDF_S3_BUCKET and ORNL_NSDF_S3_DATA_KEY to load NSDF data from S3."
+            "Set S3_BUCKET and S3_DATA_KEY to load NSDF data from S3."
         )
 
     client = _make_nsdf_s3_client(paths)
