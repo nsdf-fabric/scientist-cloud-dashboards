@@ -219,6 +219,7 @@ def test_env_file_parser_and_s3_config_detection() -> None:
                             "ORNL_NSDF_S3_BUCKET=my-bucket",
                             'ORNL_NSDF_S3_DATA_KEY="prefix/data.json"',
                             "ORNL_NSDF_S3_REGION=us-west-2",
+                            "ORNL_NSDF_LOCAL_DATA_DIR=/tmp/nsdf-local",
                         ]
                     )
                 )
@@ -233,6 +234,7 @@ def test_env_file_parser_and_s3_config_detection() -> None:
             assert paths.s3_bucket == "my-bucket"
             assert paths.s3_data_key == "prefix/data.json"
             assert paths.s3_region == "us-west-2"
+            assert paths.local_data_dir == "/tmp/nsdf-local"
     finally:
         os.environ.clear()
         os.environ.update(old_env)
@@ -275,6 +277,63 @@ def test_s3_bundle_loads_and_infers_surrogate_key() -> None:
         assert bundle.surrogate == {"surrogate": [10.0, 20.0, 30.0]}
         assert bundle.paths.s3_surrogate_key == "prefix/surrogate.json"
         assert fake_client.keys_requested == ["prefix/data.json", "prefix/surrogate.json"]
+    finally:
+        lib._make_nsdf_s3_client = old_make_client
+
+
+def test_local_data_dir_takes_priority_over_s3() -> None:
+    fake_client = _FakeS3Client()
+    old_make_client = lib._make_nsdf_s3_client
+    try:
+        lib._make_nsdf_s3_client = lambda paths: fake_client
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "data.json"), "w", encoding="utf-8") as fh:
+                json.dump(_base_data(), fh)
+            paths = StrainDashboardPaths(
+                local_data_dir=tmp,
+                s3_bucket="my-bucket",
+                s3_data_key="prefix/data.json",
+            )
+            bundle = load_nsdf_json_bundle(paths)
+            assert bundle.data["dataset_y"] == [1.0, 2.0, 3.0]
+            assert bundle.surrogate is None
+            assert bundle.paths.local_json_path == os.path.join(tmp, "data.json")
+            assert bundle.paths.surrogate_json_path == ""
+            assert fake_client.keys_requested == []
+    finally:
+        lib._make_nsdf_s3_client = old_make_client
+
+
+def test_local_data_dir_loads_local_surrogate() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        data_path = os.path.join(tmp, "data.json")
+        surrogate_path = os.path.join(tmp, "surrogate.json")
+        with open(data_path, "w", encoding="utf-8") as fh:
+            json.dump(_base_data(), fh)
+        with open(surrogate_path, "w", encoding="utf-8") as fh:
+            json.dump({"surrogate": [10.0, 20.0, 30.0]}, fh)
+        bundle = load_nsdf_json_bundle(StrainDashboardPaths(local_data_dir=tmp))
+        assert bundle.data["dataset_y"] == [1.0, 2.0, 3.0]
+        assert bundle.surrogate == {"surrogate": [10.0, 20.0, 30.0]}
+        assert bundle.paths.local_json_path == data_path
+        assert bundle.paths.surrogate_json_path == surrogate_path
+
+
+def test_missing_local_data_dir_falls_back_to_s3() -> None:
+    fake_client = _FakeS3Client()
+    old_make_client = lib._make_nsdf_s3_client
+    try:
+        lib._make_nsdf_s3_client = lambda paths: fake_client
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = StrainDashboardPaths(
+                local_data_dir=tmp,
+                s3_bucket="my-bucket",
+                s3_data_key="prefix/data.json",
+            )
+            bundle = load_nsdf_json_bundle(paths)
+            assert bundle.data["dataset_y"] == [1.0, 2.0, 3.0]
+            assert bundle.surrogate == {"surrogate": [10.0, 20.0, 30.0]}
+            assert fake_client.keys_requested == ["prefix/data.json", "prefix/surrogate.json"]
     finally:
         lib._make_nsdf_s3_client = old_make_client
 
@@ -370,6 +429,9 @@ def main() -> None:
         test_local_surrogate_sibling_inference,
         test_env_file_parser_and_s3_config_detection,
         test_s3_bundle_loads_and_infers_surrogate_key,
+        test_local_data_dir_takes_priority_over_s3,
+        test_local_data_dir_loads_local_surrogate,
+        test_missing_local_data_dir_falls_back_to_s3,
         test_refresh_api_key_loads_from_env_file,
         test_refresh_bus_register_trigger_unregister,
         test_refresh_api_rejects_missing_or_bad_api_key,

@@ -55,6 +55,7 @@ Optional `surrogate.json`:
 
 Preferred environment variables:
 
+- `ORNL_NSDF_LOCAL_DATA_DIR`
 - `ORNL_NSDF_DATA_JSON_PATH`
 - `ORNL_NSDF_DATA_JSON_URL`
 - `ORNL_SURROGATE_JSON_PATH`
@@ -80,6 +81,12 @@ If the data source is a local path ending in `data.json`, the dashboard also tri
 For data URLs ending in `data.json`, it tries the sibling `surrogate.json` URL.
 Missing inferred surrogate files are non-fatal.
 
+When `ORNL_NSDF_LOCAL_DATA_DIR` is set, each load or refresh first checks for
+`data.json` in that directory and optionally `surrogate.json` beside it. If local
+`data.json` exists, the dashboard uses those local files and skips S3 for that refresh.
+If local `data.json` is missing, the dashboard falls back to the configured path, URL,
+or S3 source.
+
 ## S3 Event Refresh
 
 For S3-backed data, put credentials, object locations, and the refresh API key in an env file:
@@ -91,6 +98,7 @@ AWS_SECRET_ACCESS_KEY=YOUR_SECRET_KEY
 AWS_SESSION_TOKEN=
 
 ORNL_REFRESH_API_KEY=choose-a-secret-refresh-key
+ORNL_NSDF_LOCAL_DATA_DIR=/local/nsdf-output
 ORNL_NSDF_S3_BUCKET=your-bucket
 ORNL_NSDF_S3_DATA_KEY=path/to/data.json
 ORNL_NSDF_S3_SURROGATE_KEY=path/to/surrogate.json
@@ -127,7 +135,8 @@ curl -X POST http://localhost:8060/refresh \
 ```
 
 The endpoint is an alert only; it does not send data. Every open dashboard session
-reloads the configured S3 `data.json` and optional `surrogate.json`.
+reloads from `ORNL_NSDF_LOCAL_DATA_DIR` first when local `data.json` exists, otherwise
+from the configured S3 `data.json` and optional `surrogate.json`.
 
 ## Docker Run
 

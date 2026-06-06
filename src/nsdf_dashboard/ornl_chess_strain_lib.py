@@ -90,6 +90,7 @@ class StrainDashboardPaths:
     json_url: str = ""
     surrogate_json_path: str = ""
     surrogate_json_url: str = ""
+    local_data_dir: str = ""
     s3_env_file: str = ""
     s3_bucket: str = ""
     s3_data_key: str = ""
@@ -117,6 +118,7 @@ class StrainDashboardPaths:
             ).strip(),
             surrogate_json_path=os.environ.get("ORNL_SURROGATE_JSON_PATH", "").strip(),
             surrogate_json_url=os.environ.get("ORNL_SURROGATE_JSON_URL", "").strip(),
+            local_data_dir=env_value("ORNL_NSDF_LOCAL_DATA_DIR"),
             s3_env_file=os.environ.get("ORNL_S3_ENV_FILE", "").strip(),
             s3_bucket=env_value("ORNL_NSDF_S3_BUCKET"),
             s3_data_key=env_value("ORNL_NSDF_S3_DATA_KEY"),
@@ -130,6 +132,7 @@ class StrainDashboardPaths:
 
 
 def _copy_s3_fields(src: StrainDashboardPaths, dst: StrainDashboardPaths) -> StrainDashboardPaths:
+    dst.local_data_dir = src.local_data_dir
     dst.s3_env_file = src.s3_env_file
     dst.s3_bucket = src.s3_bucket
     dst.s3_data_key = src.s3_data_key
@@ -264,6 +267,7 @@ def resolve_strain_paths_for_session(
     def with_surrogate(p: StrainDashboardPaths) -> StrainDashboardPaths:
         p.surrogate_json_path = surrogate_path
         p.surrogate_json_url = surrogate_url
+        p.local_data_dir = env.local_data_dir
         p.s3_env_file = env.s3_env_file
         p.s3_bucket = env.s3_bucket
         p.s3_data_key = env.s3_data_key
@@ -849,6 +853,7 @@ def load_optional_surrogate_json(
         json_url=paths.json_url,
         surrogate_json_path=explicit_path,
         surrogate_json_url=explicit_url,
+        local_data_dir=paths.local_data_dir,
     )
 
     candidates: List[Tuple[str, str, bool]] = []
@@ -885,11 +890,42 @@ def load_optional_surrogate_json(
     return None, messages, effective
 
 
+def load_nsdf_json_bundle_from_local_data_dir(paths: StrainDashboardPaths) -> Optional[NSDFLoadedBundle]:
+    """Load fixed-name data/surrogate JSON files from ORNL_NSDF_LOCAL_DATA_DIR when present."""
+    local_dir = (paths.local_data_dir or "").strip()
+    if not local_dir:
+        return None
+    data_path = os.path.join(local_dir, "data.json")
+    if not os.path.isfile(data_path):
+        return None
+
+    data = load_json_from_local_path(data_path)
+    surrogate = None
+    messages = [f"Loaded NSDF data JSON from local path: {data_path}"]
+    surrogate_path = os.path.join(local_dir, "surrogate.json")
+    effective = StrainDashboardPaths(
+        local_json_path=data_path,
+        surrogate_json_path="",
+        local_data_dir=local_dir,
+    )
+    if os.path.isfile(surrogate_path):
+        try:
+            surrogate = load_json_from_local_path(surrogate_path)
+            effective.surrogate_json_path = surrogate_path
+            messages.append(f"Loaded surrogate JSON from local path: {surrogate_path}")
+        except Exception as exc:
+            messages.append(f"Local surrogate JSON skipped: {exc}")
+    return NSDFLoadedBundle(data=data, surrogate=surrogate, messages=messages, paths=effective)
+
+
 def load_nsdf_json_bundle(
     paths: StrainDashboardPaths,
     *,
     mongo_s3_auth: Optional[Dict[str, str]] = None,
 ) -> NSDFLoadedBundle:
+    local_bundle = load_nsdf_json_bundle_from_local_data_dir(paths)
+    if local_bundle is not None:
+        return local_bundle
     if paths.has_s3_source():
         return load_nsdf_json_bundle_from_s3(paths)
     data = load_strain_json(paths, mongo_s3_auth=mongo_s3_auth)
@@ -972,6 +1008,7 @@ def load_nsdf_json_bundle_from_s3(paths: StrainDashboardPaths) -> NSDFLoadedBund
     surrogate_key = (paths.s3_surrogate_key or "").strip() or _sibling_surrogate_s3_key(data_key)
     effective = StrainDashboardPaths(
         s3_env_file=paths.s3_env_file,
+        local_data_dir=paths.local_data_dir,
         s3_bucket=bucket,
         s3_data_key=data_key,
         s3_surrogate_key=surrogate_key,

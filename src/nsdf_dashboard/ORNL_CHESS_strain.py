@@ -216,6 +216,7 @@ else:
                 json_url=jurl,
                 surrogate_json_path=p.surrogate_json_path,
                 surrogate_json_url=p.surrogate_json_url,
+                local_data_dir=p.local_data_dir,
                 s3_env_file=p.s3_env_file,
                 s3_bucket=p.s3_bucket,
                 s3_data_key=p.s3_data_key,
@@ -300,8 +301,8 @@ else:
             f"Coordinate normalization: {last_status['bounds_source']}.",
             "Compatible fields: " + ", ".join(last_status["fields"]) + ".",
         ]
-        if last_status["s3_source"]:
-            msg_parts.insert(0, last_status["s3_source"])
+        if last_status["source_line"]:
+            msg_parts.insert(0, last_status["source_line"])
         msg_parts.extend(last_status["messages"])
         msg_parts.extend(last_status["warnings"])
         set_status("\n".join(msg_parts), ok=True)
@@ -337,9 +338,11 @@ else:
         plot_cfg.grid_size = active_grid_size
         grid_state["active_source"] = active_grid_source
         _set_grid_controls(active_grid_size)
-        s3_source = ""
-        if bundle.paths.has_s3_source():
-            s3_source = (
+        source_line = ""
+        if bundle.paths.local_data_dir and bundle.paths.local_json_path:
+            source_line = f"Local source: {bundle.paths.local_json_path}"
+        elif bundle.paths.has_s3_source():
+            source_line = (
                 f"S3 source: s3://{bundle.paths.s3_bucket}/{bundle.paths.s3_data_key}; "
                 "event-triggered refresh."
             )
@@ -348,7 +351,7 @@ else:
             "inferred_grid_size": inferred_grid_size,
             "bounds_source": measurement.bounds_source,
             "fields": fields,
-            "s3_source": s3_source,
+            "source_line": source_line,
             "messages": list(bundle.messages),
             "warnings": list(surrogate_info.warnings),
         }
@@ -424,7 +427,7 @@ else:
     root = column(header, controls, figures_column, sizing_mode="stretch_width")
     doc.add_root(root)
 
-    if paths.has_s3_source() or paths.local_json_path or paths.json_url:
+    if paths.local_data_dir or paths.has_s3_source() or paths.local_json_path or paths.json_url:
         on_reload()
     else:
         figures_column.children = [
@@ -432,12 +435,13 @@ else:
                 text=(
                     "<p>No NSDF data.json resolved yet. Set <code>ORNL_NSDF_DATA_JSON_PATH</code> / "
                     "<code>ORNL_NSDF_DATA_JSON_URL</code>, use legacy <code>ORNL_STRAIN_JSON_*</code> "
-                    "aliases, configure <code>ORNL_NSDF_S3_BUCKET</code> / "
+                    "aliases, configure <code>ORNL_NSDF_LOCAL_DATA_DIR</code>, configure "
+                    "<code>ORNL_NSDF_S3_BUCKET</code> / "
                     "<code>ORNL_NSDF_S3_DATA_KEY</code>, or pass the matching query parameters.</p>"
                 )
             )
         ]
-    if paths.has_s3_source():
+    if paths.local_data_dir or paths.has_s3_source():
         _refresh_token = register_refresh_callback(on_external_refresh)
 
         def _cleanup_refresh_callback(
