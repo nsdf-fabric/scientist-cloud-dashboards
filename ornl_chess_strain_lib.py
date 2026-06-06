@@ -1138,6 +1138,65 @@ def infer_nsdf_grid_size(data_doc: Mapping[str, Any]) -> Tuple[int, int]:
     return nx, ny
 
 
+def infer_nsdf_bounds_grid_size(data_doc: Mapping[str, Any]) -> Optional[Tuple[int, int]]:
+    """Read explicit grid width/height from ``bounds=[[0, width], [0, height]]``."""
+    if not isinstance(data_doc, Mapping):
+        return None
+    bounds = data_doc.get("bounds")
+    if not isinstance(bounds, list) or len(bounds) < 2:
+        return None
+
+    out: List[int] = []
+    for axis in bounds[:2]:
+        if not isinstance(axis, list) or len(axis) < 2:
+            return None
+        lo, hi = axis[0], axis[1]
+        if not (_is_number(lo) and _is_number(hi)):
+            return None
+        flo, fhi = float(lo), float(hi)
+        if not (math.isfinite(flo) and math.isfinite(fhi)):
+            return None
+        if abs(flo) > 1e-9 or fhi <= 0:
+            return None
+        rounded = int(round(fhi))
+        if abs(fhi - rounded) > 1e-9 or rounded <= 0:
+            return None
+        out.append(rounded)
+    return out[0], out[1]
+
+
+def _valid_grid_size(value: Optional[Tuple[int, int]]) -> Optional[Tuple[int, int]]:
+    if value is None or len(value) < 2:
+        return None
+    try:
+        width = int(value[0])
+        height = int(value[1])
+    except (TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
+def resolve_nsdf_grid_size(
+    data_doc: Mapping[str, Any],
+    *,
+    env_grid_size: Optional[Tuple[int, int]] = None,
+    manual_grid_size: Optional[Tuple[int, int]] = None,
+) -> Tuple[Tuple[int, int], str]:
+    """Resolve grid size and source using bounds, manual controls, env, then dataset_x."""
+    bounds_size = infer_nsdf_bounds_grid_size(data_doc)
+    if bounds_size:
+        return bounds_size, "bounds"
+    manual_size = _valid_grid_size(manual_grid_size)
+    if manual_size:
+        return manual_size, "manual controls"
+    env_size = _valid_grid_size(env_grid_size)
+    if env_size:
+        return env_size, "environment"
+    return infer_nsdf_grid_size(data_doc), "dataset_x"
+
+
 # ---------------------------------------------------------------------------
 # Grid construction (1D sparse → 2D, or direct 2D)
 # ---------------------------------------------------------------------------

@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, Optional
 
 from bokeh.io import curdoc
 from bokeh.layouts import column, row
-from bokeh.models import Div, Spinner
+from bokeh.models import Button, Div, Spinner
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", ".."))
@@ -93,7 +93,9 @@ from ornl_chess_strain_lib import (  # noqa: E402
     load_simple_env_file,
     load_nsdf_json_bundle,
     make_strain_triplet_figures,
+    infer_nsdf_bounds_grid_size,
     resolve_strain_paths_for_session,
+    resolve_nsdf_grid_size,
     validate_nsdf_measurement_doc,
     validate_nsdf_surrogate_doc,
 )
@@ -243,19 +245,62 @@ else:
 
     paths = _resolve_paths()
     plot_cfg = StrainFieldPlotConfig()
-    fixed_grid_size = _fixed_grid_size_from_env()
-    if fixed_grid_size:
-        plot_cfg.grid_size = fixed_grid_size
+    env_grid_size = _fixed_grid_size_from_env()
+    if env_grid_size:
+        plot_cfg.grid_size = env_grid_size
 
     status_div = Div(text="", width_policy="max", height_policy="fixed", height=86)
     grid_w = Spinner(title="Grid width", low=1, high=512, step=1, value=plot_cfg.grid_size[0], width=100)
     grid_h = Spinner(title="Grid height", low=1, high=512, step=1, value=plot_cfg.grid_size[1], width=100)
+    btn_reset_grid = Button(label="Reset", button_type="default", width=80)
 
     loaded_bundle: Optional[NSDFLoadedBundle] = None
     figures_column = column(sizing_mode="stretch_width")
+    grid_state: Dict[str, Any] = {
+        "manual_grid_size": None,
+        "active_source": "environment" if env_grid_size else "dataset_x",
+        "updating_controls": False,
+        "last_status": {},
+    }
+
     def set_status(msg: str, ok: bool = True) -> None:
         color = "#0a0" if ok else "#a00"
         status_div.text = f'<div style="color:{color};font-family:monospace;white-space:pre-wrap;">{msg}</div>'
+
+    def _grid_size_from_controls() -> tuple[int, int]:
+        try:
+            width = int(grid_w.value)
+            height = int(grid_h.value)
+        except Exception:
+            return plot_cfg.grid_size
+        return max(1, min(512, width)), max(1, min(512, height))
+
+    def _set_grid_controls(size: tuple[int, int]) -> None:
+        grid_state["updating_controls"] = True
+        try:
+            grid_w.value = size[0]
+            grid_h.value = size[1]
+        finally:
+            grid_state["updating_controls"] = False
+
+    def _set_loaded_status() -> None:
+        last_status = grid_state["last_status"]
+        if not last_status:
+            return
+        active_grid_size = plot_cfg.grid_size
+        msg_parts = [
+            f"Loaded NSDF measurement data: {last_status['measurement_count']} points.",
+            f"Inferred grid size: {last_status['inferred_grid_size'][0]} x {last_status['inferred_grid_size'][1]}.",
+            f"Active grid size: {active_grid_size[0]} x {active_grid_size[1]}.",
+            f"Grid source: {grid_state['active_source']}.",
+            f"Coordinate normalization: {last_status['bounds_source']}.",
+            "Compatible fields: " + ", ".join(last_status["fields"]) + ".",
+        ]
+        if last_status["s3_source"]:
+            msg_parts.insert(0, last_status["s3_source"])
+        msg_parts.extend(last_status["messages"])
+        msg_parts.extend(last_status["warnings"])
+        set_status("\n".join(msg_parts), ok=True)
 
     def load_payload() -> None:
         global loaded_bundle  # noqa: PLW0603
@@ -266,7 +311,13 @@ else:
             measurement = validate_nsdf_measurement_doc(bundle.data)
             fields = list_nsdf_field_headers(bundle.data, bundle.surrogate)
             inferred_grid_size = infer_nsdf_grid_size(bundle.data)
-            active_grid_size = fixed_grid_size or inferred_grid_size
+            if infer_nsdf_bounds_grid_size(bundle.data):
+                grid_state["manual_grid_size"] = None
+            active_grid_size, active_grid_source = resolve_nsdf_grid_size(
+                bundle.data,
+                env_grid_size=env_grid_size,
+                manual_grid_size=grid_state["manual_grid_size"],
+            )
             surrogate_info = validate_nsdf_surrogate_doc(
                 bundle.surrogate,
                 measurement.observed_values.shape[0],
@@ -280,32 +331,27 @@ else:
 
         loaded_bundle = bundle
         plot_cfg.grid_size = active_grid_size
-        grid_w.value = active_grid_size[0]
-        grid_h.value = active_grid_size[1]
-
-        msg_parts = [
-            f"Loaded NSDF measurement data: {measurement.observed_values.shape[0]} points.",
-            f"Inferred grid size: {inferred_grid_size[0]} x {inferred_grid_size[1]}.",
-            f"Active grid size: {active_grid_size[0]} x {active_grid_size[1]}.",
-            f"Coordinate normalization: {measurement.bounds_source}.",
-            "Compatible fields: " + ", ".join(fields) + ".",
-        ]
+        grid_state["active_source"] = active_grid_source
+        _set_grid_controls(active_grid_size)
+        s3_source = ""
         if bundle.paths.has_s3_source():
-            msg_parts.insert(
-                0,
-                f"S3 source: s3://{bundle.paths.s3_bucket}/{bundle.paths.s3_data_key}; event-triggered refresh.",
+            s3_source = (
+                f"S3 source: s3://{bundle.paths.s3_bucket}/{bundle.paths.s3_data_key}; "
+                "event-triggered refresh."
             )
-        msg_parts.extend(bundle.messages)
-        msg_parts.extend(surrogate_info.warnings)
-        set_status("\n".join(msg_parts), ok=True)
+        grid_state["last_status"] = {
+            "measurement_count": measurement.observed_values.shape[0],
+            "inferred_grid_size": inferred_grid_size,
+            "bounds_source": measurement.bounds_source,
+            "fields": fields,
+            "s3_source": s3_source,
+            "messages": list(bundle.messages),
+            "warnings": list(surrogate_info.warnings),
+        }
+        _set_loaded_status()
 
     def apply_grid_size() -> None:
-        try:
-            w = int(grid_w.value)
-            h = int(grid_h.value)
-        except Exception:
-            return
-        plot_cfg.grid_size = (max(1, min(512, w)), max(1, min(512, h)))
+        plot_cfg.grid_size = _grid_size_from_controls()
 
     def rebuild_figures() -> None:
         apply_grid_size()
@@ -325,11 +371,42 @@ else:
         load_payload()
         rebuild_figures()
 
-    def on_external_refresh() -> None:
-        doc.add_next_tick_callback(on_reload)
+    def on_external_refresh(_doc: Any = doc, _on_reload: Callable[[], None] = on_reload) -> None:
+        _doc.add_next_tick_callback(_on_reload)
+
+    def on_grid_control_change(attr: str, old: Any, new: Any) -> None:
+        if grid_state["updating_controls"]:
+            return
+        manual_grid_size = _grid_size_from_controls()
+        grid_state["manual_grid_size"] = manual_grid_size
+        grid_state["active_source"] = "manual controls"
+        plot_cfg.grid_size = manual_grid_size
+        rebuild_figures()
+        _set_loaded_status()
+
+    def on_reset_grid() -> None:
+        grid_state["manual_grid_size"] = None
+        if loaded_bundle is None:
+            active_grid_size = env_grid_size or plot_cfg.grid_size
+            active_grid_source = "environment" if env_grid_size else "dataset_x"
+        else:
+            active_grid_size, active_grid_source = resolve_nsdf_grid_size(
+                loaded_bundle.data,
+                env_grid_size=env_grid_size,
+                manual_grid_size=None,
+            )
+        plot_cfg.grid_size = active_grid_size
+        grid_state["active_source"] = active_grid_source
+        _set_grid_controls(active_grid_size)
+        rebuild_figures()
+        _set_loaded_status()
+
+    grid_w.on_change("value", on_grid_control_change)
+    grid_h.on_change("value", on_grid_control_change)
+    btn_reset_grid.on_click(on_reset_grid)
 
     controls = column(
-        row(grid_w, grid_h, sizing_mode="scale_width"),
+        row(grid_w, grid_h, btn_reset_grid, sizing_mode="scale_width"),
         status_div,
         sizing_mode="stretch_width",
     )
@@ -354,7 +431,11 @@ else:
     if paths.has_s3_source():
         _refresh_token = register_refresh_callback(on_external_refresh)
 
-        def _cleanup_refresh_callback(session_context: Any) -> None:
-            unregister_refresh_callback(_refresh_token)
+        def _cleanup_refresh_callback(
+            session_context: Any,
+            token: int = _refresh_token,
+            unregister: Callable[[int], None] = unregister_refresh_callback,
+        ) -> None:
+            unregister(token)
 
         doc.on_session_destroyed(_cleanup_refresh_callback)
