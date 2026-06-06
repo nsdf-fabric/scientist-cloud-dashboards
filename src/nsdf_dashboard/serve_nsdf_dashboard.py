@@ -61,7 +61,7 @@ def main() -> None:
     dashboard_script = os.path.join(os.path.dirname(__file__), "ORNL_CHESS_strain.py")
     app = Application(ScriptHandler(filename=dashboard_script))
     server: Optional[Server] = Server(
-        {'/': app},
+        {base_url: app},
         io_loop=io_loop,
         port=bokeh_port,
         address=bokeh_host,
