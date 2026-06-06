@@ -56,11 +56,12 @@ def main() -> None:
     bokeh_port = _int_env("BOKEH_PORT", 8059)
     bokeh_host = _env_value("BOKEH_HOST", "0.0.0.0")
     websocket_origin = _env_value("BOKEH_ALLOW_WEBSOCKET_ORIGIN", "*")
+    base_url = _env_value("BOKEH_BASE_URL", "/")
     io_loop = IOLoop.current()
     dashboard_script = os.path.join(os.path.dirname(__file__), "ORNL_CHESS_strain.py")
     app = Application(ScriptHandler(filename=dashboard_script))
     server: Optional[Server] = Server(
-        {"/": app},
+        {base_url: app},
         io_loop=io_loop,
         port=bokeh_port,
         address=bokeh_host,
@@ -78,7 +79,7 @@ def main() -> None:
 
     server.start()
     print(
-        f"Bokeh dashboard: http://{bokeh_host}:{bokeh_port}/",
+        f"Bokeh dashboard: http://{bokeh_host}:{bokeh_port}{base_url}",
         flush=True,
     )
     print(
