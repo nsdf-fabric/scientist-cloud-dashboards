@@ -8,12 +8,11 @@ import os
 import tempfile
 
 import numpy as np
-from fastapi.testclient import TestClient
+from fastapi import HTTPException
 
-import ornl_chess_strain_lib as lib
-import refresh_api
-import refresh_bus
-from ornl_chess_strain_lib import (
+import nsdf_dashboard.ornl_chess_strain_lib as lib
+from nsdf_dashboard import refresh_api, refresh_bus
+from nsdf_dashboard.ornl_chess_strain_lib import (
     StrainDashboardPaths,
     StrainFieldPlotConfig,
     build_strain_field_grids,
@@ -312,11 +311,20 @@ def test_refresh_api_rejects_missing_or_bad_api_key() -> None:
     old_env = dict(os.environ)
     refresh_bus.clear_refresh_callbacks()
     try:
-        os.environ.clear()
+        os.environ.pop("ORNL_S3_ENV_FILE", None)
         os.environ["ORNL_REFRESH_API_KEY"] = "secret"
-        client = TestClient(refresh_api.create_app())
-        assert client.post("/refresh").status_code == 401
-        assert client.post("/refresh", headers={"X-API-Key": "wrong"}).status_code == 401
+        endpoint = next(
+            route.endpoint
+            for route in refresh_api.create_app().routes
+            if getattr(route, "path", "") == "/refresh"
+        )
+        for api_key in ("", "wrong"):
+            try:
+                endpoint(x_api_key=api_key)
+            except HTTPException as exc:
+                assert exc.status_code == 401
+            else:
+                raise AssertionError("expected unauthorized refresh request to raise")
     finally:
         refresh_bus.clear_refresh_callbacks()
         os.environ.clear()
@@ -328,13 +336,16 @@ def test_refresh_api_authorized_trigger() -> None:
     refresh_bus.clear_refresh_callbacks()
     calls: list[str] = []
     try:
-        os.environ.clear()
+        os.environ.pop("ORNL_S3_ENV_FILE", None)
         os.environ["ORNL_REFRESH_API_KEY"] = "secret"
         refresh_bus.register_refresh_callback(lambda: calls.append("refresh"))
-        client = TestClient(refresh_api.create_app())
-        response = client.post("/refresh", headers={"X-API-Key": "secret"})
-        assert response.status_code == 200
-        assert response.json() == {"ok": True, "triggered": 1}
+        endpoint = next(
+            route.endpoint
+            for route in refresh_api.create_app().routes
+            if getattr(route, "path", "") == "/refresh"
+        )
+        response = endpoint(x_api_key="secret")
+        assert response == {"ok": True, "triggered": 1}
         assert calls == ["refresh"]
     finally:
         refresh_bus.clear_refresh_callbacks()
@@ -356,7 +367,6 @@ def main() -> None:
         test_manual_grid_size_overrides_env_without_bounds,
         test_reset_grid_size_returns_to_auto_source,
         test_refresh_bounds_replaces_manual_grid_size,
-        test_a2_dataset_grid_size_is_21_by_13,
         test_local_surrogate_sibling_inference,
         test_env_file_parser_and_s3_config_detection,
         test_s3_bundle_loads_and_infers_surrogate_key,

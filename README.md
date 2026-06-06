@@ -105,16 +105,18 @@ objects are non-fatal.
 Run with the env file path:
 
 ```bash
-export ORNL_S3_ENV_FILE=/secure/path/nsdf-s3.env
+cp .env.example .env
+# edit .env, or point ORNL_S3_ENV_FILE at another env file
+export ORNL_S3_ENV_FILE=${PWD}/.env
 
-UV_CACHE_DIR=/tmp/uv-cache uv run --with-requirements requirements.txt \
-  python serve_nsdf_dashboard.py
+uv sync
+uv run python -m nsdf_dashboard
 ```
 
 Open the dashboard:
 
 ```text
-http://localhost:8059/ORNL_CHESS_strain/
+http://localhost:8059/
 ```
 
 Trigger a refresh from S3:
@@ -135,12 +137,31 @@ IMAGE_NAME=scientist-cloud-dashboards
 docker build --tag ${IMAGE_NAME} .
 
 docker run --rm \
-  -e ORNL_NSDF_DATA_JSON_PATH="/ORNL_strain/data.json" \
-  -e ORNL_SURROGATE_JSON_PATH="/ORNL_strain/surrogate.json" \
-  -e ORNL_STRAIN_SOURCE_ORDER=env_path,env_url,query_url \
-  -v ${PWD}/ORNL_strain:/ORNL_strain \
+  --env-file .env \
   -p 8059:8059 \
+  -p 8060:8060 \
   ${IMAGE_NAME}
+```
+
+## Docker Compose
+
+```bash
+cp .env.example .env
+# edit .env
+docker compose up -d --build
+```
+
+Open:
+
+```text
+http://localhost:8059/
+```
+
+Trigger refresh:
+
+```bash
+curl -X POST http://localhost:8060/refresh \
+  -H "X-API-Key: choose-a-secret-refresh-key"
 ```
 
 ## Apptainer Run
@@ -161,25 +182,23 @@ apptainer run \
 ## Local Run
 
 ```bash
-export ORNL_NSDF_DATA_JSON_PATH=/data/data.json
-export ORNL_SURROGATE_JSON_PATH=/data/surrogate.json
-export ORNL_STRAIN_SOURCE_ORDER=env_path,env_url,query_url
+cp .env.example .env
+# edit .env
+export ORNL_S3_ENV_FILE=${PWD}/.env
 
-bokeh serve ORNL_CHESS_strain.py \
-  --port 8059 \
-  --address 0.0.0.0 \
-  --allow-websocket-origin=localhost:8059
+uv sync
+uv run python -m nsdf_dashboard
 ```
 
 Then open:
 
 ```text
-http://localhost:8059/ORNL_CHESS_strain/?nsdf_data_json_url=https%3A%2F%2F...
+http://localhost:8059/
 ```
 
 ## Smoke Checks
 
 ```bash
 python3 -m compileall .
-python3 test_nsdf_dashboard_smoke.py
+uv run python tests/test_nsdf_dashboard.py
 ```

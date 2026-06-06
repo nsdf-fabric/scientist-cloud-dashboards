@@ -6,8 +6,8 @@ from typing import Dict
 
 from fastapi import FastAPI, Header, HTTPException, status
 
-from ornl_chess_strain_lib import load_simple_env_file
-from refresh_bus import registered_count, trigger_refresh
+from nsdf_dashboard.ornl_chess_strain_lib import load_simple_env_file
+from nsdf_dashboard.refresh_bus import registered_count, trigger_refresh
 
 
 def _env_value(name: str) -> str:
