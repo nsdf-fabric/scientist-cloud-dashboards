@@ -1,9 +1,10 @@
 """
 ORNL / CHESS NSDF measurement dashboard.
 
-Loads native NSDF ``data.json`` plus optional ``surrogate.json`` and renders three heatmaps:
-measurement locations, estimate, and variance. Legacy ``ORNL_STRAIN_JSON_*`` environment
-variables and ``strain_json_*`` query parameters remain aliases for NSDF ``data.json``.
+Loads native NSDF ``data.json``, optional ``surrogate.json``, and optional ``next_x.json``;
+renders three heatmaps: measurement locations, estimate, and variance.
+Legacy ``ORNL_STRAIN_JSON_*`` environment variables and ``strain_json_*`` query parameters
+remain aliases for NSDF ``data.json``.
 """
 from __future__ import annotations
 
@@ -17,11 +18,13 @@ from bokeh.layouts import column, row
 from bokeh.models import Button, Div, Spinner
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", ".."))
-SHARED_UTILS_DIR = os.path.join(PROJECT_ROOT, "scientistCloudLib", "SCLib_Dashboards")
-
-if SHARED_UTILS_DIR not in sys.path and os.path.isdir(SHARED_UTILS_DIR):
-    sys.path.insert(0, SHARED_UTILS_DIR)
+for _shared_candidate in (
+    os.path.abspath(os.path.join(SCRIPT_DIR, "..")),
+    os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", "..", "scientistCloudLib", "SCLib_Dashboards")),
+):
+    if os.path.isdir(_shared_candidate) and _shared_candidate not in sys.path:
+        sys.path.insert(0, _shared_candidate)
+        break
 
 
 def _initialize_dashboard_standalone(
@@ -89,6 +92,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (  # noqa: E402
     enrich_strain_paths_from_dataset_doc,
     find_strain_json_under_dataset_dir,
     infer_nsdf_grid_size,
+    is_scientistcloud_portal_data_mount_context,
     list_nsdf_field_headers,
     load_simple_env_file,
     load_nsdf_json_bundle,
@@ -97,6 +101,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (  # noqa: E402
     resolve_strain_paths_for_session,
     resolve_nsdf_grid_size,
     validate_nsdf_measurement_doc,
+    validate_nsdf_next_x_doc,
     validate_nsdf_surrogate_doc,
 )
 from nsdf_dashboard.refresh_bus import register_refresh_callback, unregister_refresh_callback  # noqa: E402
@@ -170,6 +175,8 @@ else:
     ).strip()
     _query_surrogate_path0 = _first_arg("surrogate_json_path")
     _query_surrogate_url0 = _first_arg("surrogate_json_url")
+    _query_next_x_path0 = _first_arg("next_x_json_path")
+    _query_next_x_url0 = _first_arg("next_x_json_url")
 
     _bd = str(_params.get("base_dir") or "")
     _sd = str(_params.get("save_dir") or "")
@@ -220,11 +227,14 @@ else:
                 json_url=jurl,
                 surrogate_json_path=p.surrogate_json_path,
                 surrogate_json_url=p.surrogate_json_url,
+                next_x_json_path=p.next_x_json_path,
+                next_x_json_url=p.next_x_json_url,
                 local_data_dir=p.local_data_dir,
                 s3_env_file=p.s3_env_file,
                 s3_bucket=p.s3_bucket,
                 s3_data_key=p.s3_data_key,
                 s3_surrogate_key=p.s3_surrogate_key,
+                s3_next_x_key=p.s3_next_x_key,
                 s3_endpoint_url=p.s3_endpoint_url,
                 s3_region=p.s3_region,
             )
@@ -240,6 +250,8 @@ else:
                     query_strain_json_url=_query_data_url0,
                     query_surrogate_json_path=_query_surrogate_path0,
                     query_surrogate_json_url=_query_surrogate_url0,
+                    query_next_x_json_path=_query_next_x_path0,
+                    query_next_x_json_url=_query_next_x_url0,
                     env=StrainDashboardPaths.from_environ(),
                 )
             ),
@@ -258,6 +270,7 @@ else:
     grid_w = Spinner(title="Grid width", low=1, high=512, step=1, value=plot_cfg.grid_size[0], width=100)
     grid_h = Spinner(title="Grid height", low=1, high=512, step=1, value=plot_cfg.grid_size[1], width=100)
     btn_reset_grid = Button(label="Reset", button_type="default", width=80)
+    btn_reload = Button(label="Reload", button_type="primary", width=90)
     btn_toggle_status = Button(label="Show status", button_type="default", width=110)
 
     loaded_bundle: Optional[NSDFLoadedBundle] = None
@@ -305,6 +318,10 @@ else:
             f"Coordinate normalization: {last_status['bounds_source']}.",
             "Compatible fields: " + ", ".join(last_status["fields"]) + ".",
         ]
+        if last_status.get("next_x_summary"):
+            msg_parts.append(last_status["next_x_summary"])
+        if last_status.get("next_x_warnings"):
+            msg_parts.extend(last_status["next_x_warnings"])
         if last_status["source_line"]:
             msg_parts.insert(0, last_status["source_line"])
         msg_parts.extend(last_status["messages"])
@@ -331,6 +348,7 @@ else:
                 bundle.surrogate,
                 measurement.observed_values.shape[0],
             )
+            next_x_info = validate_nsdf_next_x_doc(bundle.next_x)
         except Exception as e:
             loaded_bundle = None
             set_status(f"NSDF load failed: {e}", ok=False)
@@ -350,6 +368,18 @@ else:
                 f"S3 source: s3://{bundle.paths.s3_bucket}/{bundle.paths.s3_data_key}; "
                 "event-triggered refresh."
             )
+        elif (bundle.paths.local_json_path or "").strip() or (bundle.paths.json_url or "").strip():
+            loc = (bundle.paths.local_json_path or "").strip()
+            source_line = f"Source: {loc or bundle.paths.json_url}"
+        next_x_summary = ""
+        if next_x_info.entries:
+            workflow_ids = ", ".join(entry.workflow_id for entry in next_x_info.entries)
+            next_x_summary = (
+                f"next_x: {len(next_x_info.entries)} workflow(s), "
+                f"{next_x_info.total_points} proposed point(s) ({workflow_ids})."
+            )
+        elif bundle.next_x is not None:
+            next_x_summary = "next_x: loaded but no valid workflow entries."
         grid_state["last_status"] = {
             "measurement_count": measurement.observed_values.shape[0],
             "inferred_grid_size": inferred_grid_size,
@@ -358,6 +388,8 @@ else:
             "source_line": source_line,
             "messages": list(bundle.messages),
             "warnings": list(surrogate_info.warnings),
+            "next_x_summary": next_x_summary,
+            "next_x_warnings": list(next_x_info.warnings),
         }
         _set_loaded_status()
 
@@ -419,15 +451,19 @@ else:
     grid_w.on_change("value", on_grid_control_change)
     grid_h.on_change("value", on_grid_control_change)
     btn_reset_grid.on_click(on_reset_grid)
+    btn_reload.on_click(on_reload)
     btn_toggle_status.on_click(on_toggle_status)
 
     controls = column(
-        row(grid_w, grid_h, btn_reset_grid, btn_toggle_status, sizing_mode="scale_width"),
+        row(grid_w, grid_h, btn_reload, btn_reset_grid, btn_toggle_status, sizing_mode="scale_width"),
         status_div,
         sizing_mode="stretch_width",
     )
 
-    header = create_header_banner("ORNL CHESS NSDF measurements", "DIAL Dashboard")
+    if is_scientistcloud_portal_data_mount_context(_bd, _sd):
+        header = create_header_banner("ORNL CHESS Strain", "ScientistCloud")
+    else:
+        header = create_header_banner("ORNL CHESS NSDF measurements", "DIAL Dashboard")
     root = column(header, controls, figures_column, sizing_mode="stretch_width")
     doc.add_root(root)
 
@@ -438,12 +474,12 @@ else:
             Div(
                 text=(
                     "<p>No NSDF data.json resolved yet. Configure <code>LOCAL_DATA_DIR</code> "
-                    "with a local <code>data.json</code>, or configure <code>S3_BUCKET</code> / "
-                    "<code>S3_DATA_KEY</code>.</p>"
+                    "with local <code>data.json</code>, <code>surrogate.json</code>, and "
+                    "<code>next_x.json</code>, or set portal/S3/env paths.</p>"
                 )
             )
         ]
-    if paths.local_data_dir or paths.has_s3_source():
+    if paths.local_data_dir or paths.has_s3_source() or paths.local_json_path or paths.json_url:
         _refresh_token = register_refresh_callback(on_external_refresh)
 
         def _cleanup_refresh_callback(

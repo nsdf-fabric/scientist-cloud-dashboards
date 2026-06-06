@@ -90,11 +90,14 @@ class StrainDashboardPaths:
     json_url: str = ""
     surrogate_json_path: str = ""
     surrogate_json_url: str = ""
+    next_x_json_path: str = ""
+    next_x_json_url: str = ""
     local_data_dir: str = ""
     s3_env_file: str = ""
     s3_bucket: str = ""
     s3_data_key: str = ""
     s3_surrogate_key: str = ""
+    s3_next_x_key: str = ""
     s3_endpoint_url: str = ""
     s3_region: str = "us-east-1"
 
@@ -118,11 +121,14 @@ class StrainDashboardPaths:
             ).strip(),
             surrogate_json_path=os.environ.get("ORNL_SURROGATE_JSON_PATH", "").strip(),
             surrogate_json_url=os.environ.get("ORNL_SURROGATE_JSON_URL", "").strip(),
+            next_x_json_path=os.environ.get("ORNL_NEXT_X_JSON_PATH", "").strip(),
+            next_x_json_url=os.environ.get("ORNL_NEXT_X_JSON_URL", "").strip(),
             local_data_dir=env_value("LOCAL_DATA_DIR"),
             s3_env_file=os.environ.get("ORNL_S3_ENV_FILE", "").strip(),
             s3_bucket=env_value("S3_BUCKET"),
             s3_data_key=env_value("S3_DATA_KEY"),
             s3_surrogate_key=env_value("S3_SURROGATE_KEY"),
+            s3_next_x_key=env_value("S3_NEXT_X_KEY"),
             s3_endpoint_url=env_value("S3_ENDPOINT_URL"),
             s3_region=env_value("S3_REGION", "us-east-1") or "us-east-1",
         )
@@ -137,6 +143,7 @@ def _copy_s3_fields(src: StrainDashboardPaths, dst: StrainDashboardPaths) -> Str
     dst.s3_bucket = src.s3_bucket
     dst.s3_data_key = src.s3_data_key
     dst.s3_surrogate_key = src.s3_surrogate_key
+    dst.s3_next_x_key = src.s3_next_x_key
     dst.s3_endpoint_url = src.s3_endpoint_url
     dst.s3_region = src.s3_region
     return dst
@@ -244,6 +251,8 @@ def resolve_strain_paths_for_session(
     query_strain_json_url: str = "",
     query_surrogate_json_path: str = "",
     query_surrogate_json_url: str = "",
+    query_next_x_json_path: str = "",
+    query_next_x_json_url: str = "",
     env: Optional[StrainDashboardPaths] = None,
 ) -> StrainDashboardPaths:
     """
@@ -261,17 +270,22 @@ def resolve_strain_paths_for_session(
     env_url = (env.json_url or "").strip()
     surrogate_path = (query_surrogate_json_path or "").strip() or (env.surrogate_json_path or "").strip()
     surrogate_url = (query_surrogate_json_url or "").strip() or (env.surrogate_json_url or "").strip()
+    next_x_path = (query_next_x_json_path or "").strip() or (env.next_x_json_path or "").strip()
+    next_x_url = (query_next_x_json_url or "").strip() or (env.next_x_json_url or "").strip()
     bd = (base_dir or "").strip()
     sd = (save_dir or "").strip()
 
-    def with_surrogate(p: StrainDashboardPaths) -> StrainDashboardPaths:
+    def with_auxiliary(p: StrainDashboardPaths) -> StrainDashboardPaths:
         p.surrogate_json_path = surrogate_path
         p.surrogate_json_url = surrogate_url
+        p.next_x_json_path = next_x_path
+        p.next_x_json_url = next_x_url
         p.local_data_dir = env.local_data_dir
         p.s3_env_file = env.s3_env_file
         p.s3_bucket = env.s3_bucket
         p.s3_data_key = env.s3_data_key
         p.s3_surrogate_key = env.s3_surrogate_key
+        p.s3_next_x_key = env.s3_next_x_key
         p.s3_endpoint_url = env.s3_endpoint_url
         p.s3_region = env.s3_region
         return p
@@ -283,33 +297,33 @@ def resolve_strain_paths_for_session(
         if token == "upload":
             p = find_strain_json_under_dataset_dir(bd)
             if p:
-                return with_surrogate(StrainDashboardPaths(local_json_path=p, json_url=display_url()))
+                return with_auxiliary(StrainDashboardPaths(local_json_path=p, json_url=display_url()))
         elif token == "converted":
             p = find_strain_json_under_dataset_dir(sd)
             if p:
-                return with_surrogate(StrainDashboardPaths(local_json_path=p, json_url=display_url()))
+                return with_auxiliary(StrainDashboardPaths(local_json_path=p, json_url=display_url()))
         elif token == "query_path":
             if not q_path:
                 continue
             if _looks_like_http_url(q_path):
-                return with_surrogate(StrainDashboardPaths(local_json_path="", json_url=q_path))
+                return with_auxiliary(StrainDashboardPaths(local_json_path="", json_url=q_path))
             if os.path.isfile(q_path):
-                return with_surrogate(StrainDashboardPaths(local_json_path=q_path, json_url=display_url()))
+                return with_auxiliary(StrainDashboardPaths(local_json_path=q_path, json_url=display_url()))
         elif token == "query_url":
             if q_url:
-                return with_surrogate(StrainDashboardPaths(local_json_path="", json_url=q_url))
+                return with_auxiliary(StrainDashboardPaths(local_json_path="", json_url=q_url))
         elif token == "env_path":
             if not env_path:
                 continue
             if _looks_like_http_url(env_path):
-                return with_surrogate(StrainDashboardPaths(local_json_path="", json_url=env_path))
+                return with_auxiliary(StrainDashboardPaths(local_json_path="", json_url=env_path))
             if os.path.isfile(env_path):
-                return with_surrogate(StrainDashboardPaths(local_json_path=env_path, json_url=display_url()))
+                return with_auxiliary(StrainDashboardPaths(local_json_path=env_path, json_url=display_url()))
         elif token == "env_url":
             if env_url:
-                return with_surrogate(StrainDashboardPaths(local_json_path="", json_url=env_url))
+                return with_auxiliary(StrainDashboardPaths(local_json_path="", json_url=env_url))
 
-    return with_surrogate(StrainDashboardPaths(local_json_path="", json_url=""))
+    return with_auxiliary(StrainDashboardPaths(local_json_path="", json_url=""))
 
 
 @dataclass
@@ -372,11 +386,32 @@ class NSDFSurrogateData:
 
 
 @dataclass
+class NSDFNextXEntry:
+    """One workflow block from ``next_x.json``."""
+
+    workflow_id: str
+    coordinates: np.ndarray
+
+
+@dataclass
+class NSDFNextXData:
+    """Validated optional ``next_x.json`` entries."""
+
+    entries: List[NSDFNextXEntry] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+    @property
+    def total_points(self) -> int:
+        return sum(int(entry.coordinates.shape[0]) for entry in self.entries)
+
+
+@dataclass
 class NSDFLoadedBundle:
-    """Loaded NSDF data and optional surrogate metadata for the UI."""
+    """Loaded NSDF data and optional surrogate / next_x metadata for the UI."""
 
     data: Dict[str, Any]
     surrogate: Optional[Dict[str, Any]] = None
+    next_x: Optional[List[Dict[str, Any]]] = None
     messages: List[str] = field(default_factory=list)
     paths: StrainDashboardPaths = field(default_factory=StrainDashboardPaths)
 
@@ -484,6 +519,8 @@ def enrich_strain_paths_from_dataset_doc(
                 json_url="",
                 surrogate_json_path=paths.surrogate_json_path,
                 surrogate_json_url=paths.surrogate_json_url,
+                next_x_json_path=paths.next_x_json_path,
+                next_x_json_url=paths.next_x_json_url,
             ),
         )
     if not doc:
@@ -499,6 +536,8 @@ def enrich_strain_paths_from_dataset_doc(
                 json_url=link,
                 surrogate_json_path=paths.surrogate_json_path,
                 surrogate_json_url=paths.surrogate_json_url,
+                next_x_json_path=paths.next_x_json_path,
+                next_x_json_url=paths.next_x_json_url,
             ),
         )
     if os.path.isfile(link):
@@ -509,6 +548,8 @@ def enrich_strain_paths_from_dataset_doc(
                 json_url="",
                 surrogate_json_path=paths.surrogate_json_path,
                 surrogate_json_url=paths.surrogate_json_url,
+                next_x_json_path=paths.next_x_json_path,
+                next_x_json_url=paths.next_x_json_url,
             ),
         )
     # s3:// and other schemes: pass as URL for downstream loaders
@@ -519,6 +560,8 @@ def enrich_strain_paths_from_dataset_doc(
             json_url=link,
             surrogate_json_path=paths.surrogate_json_path,
             surrogate_json_url=paths.surrogate_json_url,
+            next_x_json_path=paths.next_x_json_path,
+            next_x_json_url=paths.next_x_json_url,
         ),
     )
 
@@ -890,6 +933,150 @@ def load_optional_surrogate_json(
     return None, messages, effective
 
 
+def _sibling_next_x_path(data_path: str) -> str:
+    p = (data_path or "").strip()
+    if not p or _looks_like_http_url(p):
+        return ""
+    if os.path.basename(p).lower() != "data.json":
+        return ""
+    return os.path.join(os.path.dirname(p), "next_x.json")
+
+
+def _sibling_next_x_url(data_url: str) -> str:
+    from urllib.parse import urlparse, urlunparse
+
+    u = (data_url or "").strip()
+    if not _looks_like_http_url(u):
+        return ""
+    parts = urlparse(u)
+    if not parts.path.lower().endswith("/data.json"):
+        return ""
+    new_path = parts.path[: -len("data.json")] + "next_x.json"
+    return urlunparse((parts.scheme, parts.netloc, new_path, parts.params, parts.query, parts.fragment))
+
+
+def _sibling_next_x_s3_key(data_key: str) -> str:
+    key = (data_key or "").strip()
+    if not key.lower().endswith("data.json"):
+        return ""
+    return key[: -len("data.json")] + "next_x.json"
+
+
+def validate_nsdf_next_x_doc(value: Any) -> NSDFNextXData:
+    """Validate ``next_x.json``: a list of workflow blocks with coordinate pairs."""
+    warnings: List[str] = []
+    if value is None:
+        return NSDFNextXData(warnings=warnings)
+    if not isinstance(value, list):
+        return NSDFNextXData(warnings=["Skipping next_x JSON: expected a JSON array."])
+
+    entries: List[NSDFNextXEntry] = []
+    for i, item in enumerate(value):
+        if not isinstance(item, dict):
+            warnings.append(f"Skipping next_x[{i}]: expected a JSON object.")
+            continue
+        workflow_id = str(item.get("workflow_id") or "").strip()
+        if not workflow_id:
+            warnings.append(f"Skipping next_x[{i}]: missing workflow_id.")
+            continue
+        data = item.get("data")
+        if not isinstance(data, list) or not data:
+            warnings.append(f"Skipping next_x[{i}] ({workflow_id!r}): data must be a non-empty list.")
+            continue
+        coords: List[Tuple[float, float]] = []
+        bad_row = False
+        for j, row_value in enumerate(data):
+            if not isinstance(row_value, list) or len(row_value) < 2:
+                warnings.append(
+                    f"Skipping next_x[{i}] ({workflow_id!r}): data[{j}] must contain labx/labz values."
+                )
+                bad_row = True
+                break
+            x, z = row_value[0], row_value[1]
+            if not (_is_number(x) and _is_number(z)):
+                warnings.append(
+                    f"Skipping next_x[{i}] ({workflow_id!r}): data[{j}] must contain numeric values."
+                )
+                bad_row = True
+                break
+            fx, fz = float(x), float(z)
+            if not (math.isfinite(fx) and math.isfinite(fz)):
+                warnings.append(
+                    f"Skipping next_x[{i}] ({workflow_id!r}): data[{j}] values must be finite."
+                )
+                bad_row = True
+                break
+            coords.append((fx, fz))
+        if bad_row:
+            continue
+        entries.append(
+            NSDFNextXEntry(
+                workflow_id=workflow_id,
+                coordinates=np.asarray(coords, dtype=np.float64),
+            )
+        )
+    return NSDFNextXData(entries=entries, warnings=warnings)
+
+
+def load_optional_next_x_json(
+    paths: StrainDashboardPaths,
+    *,
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+) -> Tuple[Optional[List[Dict[str, Any]]], List[str], StrainDashboardPaths]:
+    """
+    Load optional ``next_x.json`` from explicit path/URL or inferred sibling.
+
+    Missing inferred siblings are non-fatal.
+    """
+    messages: List[str] = []
+    explicit_path = (paths.next_x_json_path or "").strip()
+    explicit_url = (paths.next_x_json_url or "").strip()
+    effective = StrainDashboardPaths(
+        local_json_path=paths.local_json_path,
+        json_url=paths.json_url,
+        surrogate_json_path=paths.surrogate_json_path,
+        surrogate_json_url=paths.surrogate_json_url,
+        next_x_json_path=explicit_path,
+        next_x_json_url=explicit_url,
+        local_data_dir=paths.local_data_dir,
+    )
+
+    candidates: List[Tuple[str, str, bool]] = []
+    if explicit_path:
+        candidates.append(("path", explicit_path, True))
+    if explicit_url:
+        candidates.append(("url", explicit_url, True))
+    if not candidates:
+        sib_path = _sibling_next_x_path(paths.local_json_path)
+        if sib_path:
+            candidates.append(("path", sib_path, False))
+        else:
+            sib_url = _sibling_next_x_url(paths.json_url)
+            if sib_url:
+                candidates.append(("url", sib_url, False))
+
+    for kind, value, explicit in candidates:
+        try:
+            if kind == "path":
+                doc = load_json_from_local_path(value)
+                effective.next_x_json_path = value
+            else:
+                doc = load_json_from_url(value, s3_auth_override=mongo_s3_auth)
+                effective.next_x_json_url = value
+            if not isinstance(doc, list):
+                raise ValueError("next_x.json must be a JSON array.")
+            messages.append(f"Loaded next_x JSON from {kind}: {value}")
+            return doc, messages, effective
+        except FileNotFoundError as exc:
+            level = "Configured" if explicit else "Inferred"
+            messages.append(f"{level} next_x JSON not loaded: {exc}")
+        except Exception as exc:
+            level = "Configured" if explicit else "Inferred"
+            messages.append(f"{level} next_x JSON skipped: {exc}")
+
+    return None, messages, effective
+
+
 def load_nsdf_json_bundle_from_local_data_dir(paths: StrainDashboardPaths) -> Optional[NSDFLoadedBundle]:
     """Load fixed-name data/surrogate JSON files from LOCAL_DATA_DIR when present."""
     local_dir = (paths.local_data_dir or "").strip()
@@ -915,7 +1102,20 @@ def load_nsdf_json_bundle_from_local_data_dir(paths: StrainDashboardPaths) -> Op
             messages.append(f"Loaded surrogate JSON from local path: {surrogate_path}")
         except Exception as exc:
             messages.append(f"Local surrogate JSON skipped: {exc}")
-    return NSDFLoadedBundle(data=data, surrogate=surrogate, messages=messages, paths=effective)
+    next_x = None
+    next_x_path = os.path.join(local_dir, "next_x.json")
+    if os.path.isfile(next_x_path):
+        try:
+            next_x_doc = load_json_from_local_path(next_x_path)
+            if isinstance(next_x_doc, list):
+                next_x = next_x_doc
+                effective.next_x_json_path = next_x_path
+                messages.append(f"Loaded next_x JSON from local path: {next_x_path}")
+            else:
+                messages.append("Local next_x JSON skipped: expected a JSON array.")
+        except Exception as exc:
+            messages.append(f"Local next_x JSON skipped: {exc}")
+    return NSDFLoadedBundle(data=data, surrogate=surrogate, next_x=next_x, messages=messages, paths=effective)
 
 
 def load_nsdf_json_bundle(
@@ -933,7 +1133,18 @@ def load_nsdf_json_bundle(
         paths,
         mongo_s3_auth=mongo_s3_auth,
     )
-    return NSDFLoadedBundle(data=data, surrogate=surrogate, messages=messages, paths=effective)
+    next_x, next_x_messages, effective = load_optional_next_x_json(
+        effective,
+        mongo_s3_auth=mongo_s3_auth,
+    )
+    messages.extend(next_x_messages)
+    return NSDFLoadedBundle(
+        data=data,
+        surrogate=surrogate,
+        next_x=next_x,
+        messages=messages,
+        paths=effective,
+    )
 
 
 def _sibling_surrogate_s3_key(data_key: str) -> str:
@@ -975,7 +1186,7 @@ def _make_nsdf_s3_client(paths: StrainDashboardPaths):
     return boto3.client("s3", **kwargs)
 
 
-def _load_json_from_s3_key(client: Any, bucket: str, key: str) -> Dict[str, Any]:
+def _load_json_from_s3_key(client: Any, bucket: str, key: str) -> Any:
     resp = client.get_object(Bucket=bucket, Key=key)
     raw = resp["Body"].read()
     return json.loads(raw.decode("utf-8"))
@@ -1006,12 +1217,14 @@ def load_nsdf_json_bundle_from_s3(paths: StrainDashboardPaths) -> NSDFLoadedBund
 
     surrogate = None
     surrogate_key = (paths.s3_surrogate_key or "").strip() or _sibling_surrogate_s3_key(data_key)
+    next_x_key = (paths.s3_next_x_key or "").strip() or _sibling_next_x_s3_key(data_key)
     effective = StrainDashboardPaths(
         s3_env_file=paths.s3_env_file,
         local_data_dir=paths.local_data_dir,
         s3_bucket=bucket,
         s3_data_key=data_key,
         s3_surrogate_key=surrogate_key,
+        s3_next_x_key=next_x_key,
         s3_endpoint_url=paths.s3_endpoint_url,
         s3_region=paths.s3_region,
     )
@@ -1025,7 +1238,22 @@ def load_nsdf_json_bundle_from_s3(paths: StrainDashboardPaths) -> NSDFLoadedBund
             else:
                 messages.append(f"S3 surrogate JSON skipped: {exc}")
 
-    return NSDFLoadedBundle(data=data, surrogate=surrogate, messages=messages, paths=effective)
+    next_x = None
+    if next_x_key:
+        try:
+            next_x_doc = _load_json_from_s3_key(client, bucket, next_x_key)
+            if isinstance(next_x_doc, list):
+                next_x = next_x_doc
+                messages.append(f"Loaded next_x JSON from s3://{bucket}/{next_x_key}")
+            else:
+                messages.append(f"S3 next_x JSON skipped: expected a JSON array at s3://{bucket}/{next_x_key}")
+        except Exception as exc:
+            if _s3_missing_error(exc):
+                messages.append(f"S3 next_x JSON not found: s3://{bucket}/{next_x_key}")
+            else:
+                messages.append(f"S3 next_x JSON skipped: {exc}")
+
+    return NSDFLoadedBundle(data=data, surrogate=surrogate, next_x=next_x, messages=messages, paths=effective)
 
 
 # ---------------------------------------------------------------------------

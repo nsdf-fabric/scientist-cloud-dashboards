@@ -23,6 +23,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (
     load_nsdf_json_bundle,
     resolve_nsdf_grid_size,
     validate_nsdf_measurement_doc,
+    validate_nsdf_next_x_doc,
 )
 
 
@@ -204,6 +205,43 @@ def test_local_surrogate_sibling_inference() -> None:
         assert bundle.paths.surrogate_json_path == surrogate_path
 
 
+def test_local_next_x_sibling_inference() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        data_path = os.path.join(tmp, "data.json")
+        next_x_path = os.path.join(tmp, "next_x.json")
+        with open(data_path, "w", encoding="utf-8") as fh:
+            json.dump(_base_data(), fh)
+        with open(next_x_path, "w", encoding="utf-8") as fh:
+            json.dump(
+                [
+                    {"workflow_id": "test-workflow", "data": [[4.0, 5.0], [6.0, 7.0]]},
+                    {"workflow_id": "0001", "data": [[6.0, 7.0]]},
+                ],
+                fh,
+            )
+
+        bundle = load_nsdf_json_bundle(StrainDashboardPaths(local_json_path=data_path))
+        assert bundle.next_x is not None
+        assert bundle.paths.next_x_json_path == next_x_path
+        info = validate_nsdf_next_x_doc(bundle.next_x)
+        assert len(info.entries) == 2
+        assert info.total_points == 3
+        assert info.entries[0].workflow_id == "test-workflow"
+
+
+def test_next_x_validation_skips_bad_rows() -> None:
+    info = validate_nsdf_next_x_doc(
+        [
+            {"workflow_id": "ok", "data": [[1.0, 2.0]]},
+            {"workflow_id": "", "data": [[3.0, 4.0]]},
+            {"workflow_id": "bad", "data": [[5.0]]},
+        ]
+    )
+    assert len(info.entries) == 1
+    assert info.entries[0].workflow_id == "ok"
+    assert info.warnings
+
+
 def test_env_file_parser_and_s3_config_detection() -> None:
     old_env = dict(os.environ)
     try:
@@ -260,6 +298,8 @@ class _FakeS3Client:
             return {"Body": _FakeBody(_base_data())}
         if Key == "prefix/surrogate.json":
             return {"Body": _FakeBody({"surrogate": [10.0, 20.0, 30.0]})}
+        if Key == "prefix/next_x.json":
+            return {"Body": _FakeBody([])}
         raise AssertionError(f"unexpected key {Key}")
 
 
@@ -276,7 +316,11 @@ def test_s3_bundle_loads_and_infers_surrogate_key() -> None:
         assert bundle.data["dataset_y"] == [1.0, 2.0, 3.0]
         assert bundle.surrogate == {"surrogate": [10.0, 20.0, 30.0]}
         assert bundle.paths.s3_surrogate_key == "prefix/surrogate.json"
-        assert fake_client.keys_requested == ["prefix/data.json", "prefix/surrogate.json"]
+        assert fake_client.keys_requested == [
+            "prefix/data.json",
+            "prefix/surrogate.json",
+            "prefix/next_x.json",
+        ]
     finally:
         lib._make_nsdf_s3_client = old_make_client
 
@@ -333,7 +377,11 @@ def test_missing_local_data_dir_falls_back_to_s3() -> None:
             bundle = load_nsdf_json_bundle(paths)
             assert bundle.data["dataset_y"] == [1.0, 2.0, 3.0]
             assert bundle.surrogate == {"surrogate": [10.0, 20.0, 30.0]}
-            assert fake_client.keys_requested == ["prefix/data.json", "prefix/surrogate.json"]
+            assert fake_client.keys_requested == [
+            "prefix/data.json",
+            "prefix/surrogate.json",
+            "prefix/next_x.json",
+        ]
     finally:
         lib._make_nsdf_s3_client = old_make_client
 
@@ -427,6 +475,8 @@ def main() -> None:
         test_reset_grid_size_returns_to_auto_source,
         test_refresh_bounds_replaces_manual_grid_size,
         test_local_surrogate_sibling_inference,
+        test_local_next_x_sibling_inference,
+        test_next_x_validation_skips_bad_rows,
         test_env_file_parser_and_s3_config_detection,
         test_s3_bundle_loads_and_infers_surrogate_key,
         test_local_data_dir_takes_priority_over_s3,
