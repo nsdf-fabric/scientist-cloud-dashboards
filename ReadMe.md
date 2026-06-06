@@ -80,9 +80,9 @@ If the data source is a local path ending in `data.json`, the dashboard also tri
 For data URLs ending in `data.json`, it tries the sibling `surrogate.json` URL.
 Missing inferred surrogate files are non-fatal.
 
-## S3 Auto Refresh
+## S3 Event Refresh
 
-For S3-backed data, put credentials and object locations in an env file:
+For S3-backed data, put credentials, object locations, and the refresh API key in an env file:
 
 ```bash
 # /secure/path/nsdf-s3.env
@@ -90,12 +90,12 @@ AWS_ACCESS_KEY_ID=YOUR_ACCESS_KEY
 AWS_SECRET_ACCESS_KEY=YOUR_SECRET_KEY
 AWS_SESSION_TOKEN=
 
+ORNL_REFRESH_API_KEY=choose-a-secret-refresh-key
 ORNL_NSDF_S3_BUCKET=your-bucket
 ORNL_NSDF_S3_DATA_KEY=path/to/data.json
 ORNL_NSDF_S3_SURROGATE_KEY=path/to/surrogate.json
 ORNL_NSDF_S3_ENDPOINT_URL=https://your-s3-compatible-endpoint.example.com
 ORNL_NSDF_S3_REGION=us-east-1
-ORNL_NSDF_REFRESH_SECONDS=10
 ```
 
 `ORNL_NSDF_S3_SURROGATE_KEY` is optional. If omitted and the data key ends in
@@ -108,20 +108,24 @@ Run with the env file path:
 export ORNL_S3_ENV_FILE=/secure/path/nsdf-s3.env
 
 UV_CACHE_DIR=/tmp/uv-cache uv run --with-requirements requirements.txt \
-  bokeh serve ORNL_CHESS_strain.py \
-  --port 8059 \
-  --address 0.0.0.0 \
-  --allow-websocket-origin=localhost:8059
+  python serve_nsdf_dashboard.py
 ```
 
-Open:
+Open the dashboard:
 
 ```text
 http://localhost:8059/ORNL_CHESS_strain/
 ```
 
-When `ORNL_NSDF_S3_BUCKET` and `ORNL_NSDF_S3_DATA_KEY` are configured, the dashboard
-reloads from S3 every `ORNL_NSDF_REFRESH_SECONDS` seconds. The default is 10 seconds.
+Trigger a refresh from S3:
+
+```bash
+curl -X POST http://localhost:8060/refresh \
+  -H "X-API-Key: choose-a-secret-refresh-key"
+```
+
+The endpoint is an alert only; it does not send data. Every open dashboard session
+reloads the configured S3 `data.json` and optional `surrogate.json`.
 
 ## Docker Run
 

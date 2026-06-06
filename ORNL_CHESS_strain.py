@@ -97,16 +97,7 @@ from ornl_chess_strain_lib import (  # noqa: E402
     validate_nsdf_measurement_doc,
     validate_nsdf_surrogate_doc,
 )
-
-
-def _float_env(name: str, default: float) -> float:
-    env_file_values = load_simple_env_file(os.environ.get("ORNL_S3_ENV_FILE", "").strip())
-    raw = os.environ.get(name) or env_file_values.get(name) or str(default)
-    try:
-        value = float(raw.strip())
-    except ValueError:
-        return default
-    return value if value > 0 else default
+from refresh_bus import register_refresh_callback, unregister_refresh_callback  # noqa: E402
 
 
 def _dashboard_env_value(name: str) -> str:
@@ -282,8 +273,6 @@ else:
 
     loaded_bundle: Optional[NSDFLoadedBundle] = None
     figures_column = column(sizing_mode="stretch_width")
-    s3_refresh_seconds = _float_env("ORNL_NSDF_REFRESH_SECONDS", 10.0)
-
     def set_status(msg: str, ok: bool = True) -> None:
         color = "#0a0" if ok else "#a00"
         status_div.text = f'<div style="color:{color};font-family:monospace;white-space:pre-wrap;">{msg}</div>'
@@ -348,10 +337,7 @@ else:
         if bundle.paths.has_s3_source():
             msg_parts.insert(
                 0,
-                (
-                    f"S3 source: s3://{bundle.paths.s3_bucket}/{bundle.paths.s3_data_key}; "
-                    f"refresh every {s3_refresh_seconds:g}s."
-                ),
+                f"S3 source: s3://{bundle.paths.s3_bucket}/{bundle.paths.s3_data_key}; event-triggered refresh.",
             )
         msg_parts.extend(bundle.messages)
         msg_parts.extend(surrogate_info.warnings)
@@ -382,6 +368,9 @@ else:
     def on_reload() -> None:
         load_payload()
         rebuild_figures()
+
+    def on_external_refresh() -> None:
+        doc.add_next_tick_callback(on_reload)
 
     btn_reload = Button(label="Load / reload JSON", button_type="primary", width=180)
     btn_reload.on_click(on_reload)
@@ -415,4 +404,9 @@ else:
             )
         ]
     if paths.has_s3_source():
-        doc.add_periodic_callback(on_reload, int(s3_refresh_seconds * 1000))
+        _refresh_token = register_refresh_callback(on_external_refresh)
+
+        def _cleanup_refresh_callback(session_context: Any) -> None:
+            unregister_refresh_callback(_refresh_token)
+
+        doc.on_session_destroyed(_cleanup_refresh_callback)

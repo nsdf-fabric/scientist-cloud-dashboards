@@ -6,10 +6,11 @@ RUN \
 
 WORKDIR /app
 
-COPY ornl_chess_strain_lib.py ORNL_CHESS_strain.py requirements.txt ./
+COPY ornl_chess_strain_lib.py ORNL_CHESS_strain.py refresh_api.py refresh_bus.py serve_nsdf_dashboard.py requirements.txt ./
 
 RUN pip install --no-cache-dir -r requirements.txt
 
 EXPOSE 8059
+EXPOSE 8060
 
-CMD ["python3", "-m", "bokeh", "serve", "ORNL_CHESS_strain.py",  "--port=8059", "--address=0.0.0.0", "--allow-websocket-origin=*"]
+CMD ["python3", "serve_nsdf_dashboard.py"]
