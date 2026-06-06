@@ -51,6 +51,7 @@ _LOG = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DEFAULT_GRID_SIZE: Tuple[int, int] = (26, 26)
+NSDF_DATA_JSON_BASENAME = "data.json"
 
 
 def _strip_env_quotes(value: str) -> str:
@@ -264,10 +265,10 @@ def resolve_strain_paths_for_session(
     """
     env = env or StrainDashboardPaths.from_environ()
     order = _strain_effective_source_order(base_dir, save_dir)
-    q_path = (query_strain_json_path or "").strip()
-    q_url = (query_strain_json_url or "").strip()
+    q_path = normalize_nsdf_remote_data_link((query_strain_json_path or "").strip())
+    q_url = normalize_nsdf_remote_data_link((query_strain_json_url or "").strip())
     env_path = (env.local_json_path or "").strip()
-    env_url = (env.json_url or "").strip()
+    env_url = normalize_nsdf_remote_data_link((env.json_url or "").strip())
     surrogate_path = (query_surrogate_json_path or "").strip() or (env.surrogate_json_path or "").strip()
     surrogate_url = (query_surrogate_json_url or "").strip() or (env.surrogate_json_url or "").strip()
     next_x_path = (query_next_x_json_path or "").strip() or (env.next_x_json_path or "").strip()
@@ -426,6 +427,85 @@ def _looks_like_http_url(value: str) -> bool:
     return v.startswith("http://") or v.startswith("https://")
 
 
+def _object_key_needs_nsdf_data_json(key: str) -> bool:
+    """True when an S3 object key is a folder prefix, not an explicit JSON object."""
+    normalized = (key or "").strip().strip("/")
+    if not normalized:
+        return True
+    leaf = normalized.rsplit("/", 1)[-1].lower()
+    if leaf == NSDF_DATA_JSON_BASENAME:
+        return False
+    if leaf.endswith(".json"):
+        return False
+    return True
+
+
+def normalize_nsdf_data_object_key(key: str) -> str:
+    """Append ``data.json`` when *key* names an NSDF folder prefix (direct S3 read, no mirror)."""
+    raw = (key or "").strip().lstrip("/")
+    if not _object_key_needs_nsdf_data_json(raw):
+        return raw
+    prefix = raw.rstrip("/")
+    return f"{prefix}/{NSDF_DATA_JSON_BASENAME}" if prefix else NSDF_DATA_JSON_BASENAME
+
+
+def normalize_nsdf_gateway_data_url(url: str) -> str:
+    """
+    When a gateway HTTPS URL points at an S3 prefix (e.g. ``…/test-chess/``), rewrite it to
+    ``…/test-chess/data.json`` so SigV4 ``GetObject`` reads the NSDF file directly.
+    """
+    from urllib.parse import urlunparse, urlparse
+
+    u = (url or "").strip()
+    if not _looks_like_http_url(u):
+        return u
+
+    parts = urlparse(u)
+    segments = [x for x in (parts.path or "").split("/") if x]
+    if len(segments) < 2:
+        return u
+
+    bucket = segments[0]
+    key = "/".join(segments[1:])
+    new_key = normalize_nsdf_data_object_key(key)
+    if new_key == key:
+        return u
+
+    new_path = "/" + "/".join([bucket, *new_key.split("/")])
+    return urlunparse((parts.scheme, parts.netloc, new_path, parts.params, parts.query, parts.fragment))
+
+
+def normalize_nsdf_remote_data_link(link: str) -> str:
+    """Normalize portal/S3 remote links so strain JSON loads via direct object read."""
+    u = (link or "").strip()
+    if not u:
+        return u
+    low = u.lower()
+    if low.startswith("s3://"):
+        body = u[5:].strip()
+        slash = body.find("/")
+        if slash == -1:
+            return u
+        bucket = body[:slash]
+        key = normalize_nsdf_data_object_key(body[slash + 1 :])
+        return f"s3://{bucket}/{key}"
+    if _looks_like_http_url(u):
+        return normalize_nsdf_gateway_data_url(u)
+    return u
+
+
+def parse_s3_uri(link: str) -> Tuple[str, str]:
+    """Return ``(bucket, object_key)`` from an ``s3://`` URI (key may be empty)."""
+    u = normalize_nsdf_remote_data_link((link or "").strip())
+    if not u.lower().startswith("s3://"):
+        return "", ""
+    body = u[5:].strip()
+    slash = body.find("/")
+    if slash == -1:
+        return body, ""
+    return body[:slash], body[slash + 1 :].lstrip("/")
+
+
 def _credential_is_placeholder(value: str) -> bool:
     v = (value or "").strip()
     if not v:
@@ -481,7 +561,7 @@ def apply_gateway_credentials_to_url(url: str, access_key: str, secret_key: str)
 
 def resolve_strain_json_remote_link_from_dataset(doc: Mapping[str, Any]) -> str:
     """Remote strain JSON URL with real gateway credentials when stored on the dataset."""
-    link = pick_strain_json_link_from_dataset_doc(doc)
+    link = normalize_nsdf_remote_data_link(pick_strain_json_link_from_dataset_doc(doc))
     if not link:
         return ""
     ak = str(doc.get("s3_access_key_id") or doc.get("accesskey") or "").strip()
@@ -528,6 +608,26 @@ def enrich_strain_paths_from_dataset_doc(
     link = resolve_strain_json_remote_link_from_dataset(doc)
     if not link:
         return paths
+    if link.lower().startswith("s3://"):
+        bucket, data_key = parse_s3_uri(link)
+        if bucket and data_key:
+            ep = str(doc.get("s3_endpoint_url") or "").strip()
+            reg = str(doc.get("s3_region_name") or "us-east-1").strip() or "us-east-1"
+            return _copy_s3_fields(
+                paths,
+                StrainDashboardPaths(
+                    local_json_path="",
+                    json_url="",
+                    surrogate_json_path=paths.surrogate_json_path,
+                    surrogate_json_url=paths.surrogate_json_url,
+                    next_x_json_path=paths.next_x_json_path,
+                    next_x_json_url=paths.next_x_json_url,
+                    s3_bucket=bucket,
+                    s3_data_key=data_key,
+                    s3_endpoint_url=ep,
+                    s3_region=reg,
+                ),
+            )
     if _looks_like_http_url(link):
         return _copy_s3_fields(
             paths,
@@ -760,7 +860,7 @@ def load_json_from_url(
     from urllib.error import HTTPError, URLError
     from urllib.request import Request, urlopen
 
-    u = (url or "").strip()
+    u = normalize_nsdf_gateway_data_url((url or "").strip())
     if not u.lower().startswith(("http://", "https://")):
         raise ValueError("JSON URL must start with http:// or https://")
 
@@ -1127,7 +1227,7 @@ def load_nsdf_json_bundle(
     if local_bundle is not None:
         return local_bundle
     if paths.has_s3_source():
-        return load_nsdf_json_bundle_from_s3(paths)
+        return load_nsdf_json_bundle_from_s3(paths, mongo_s3_auth=mongo_s3_auth)
     data = load_strain_json(paths, mongo_s3_auth=mongo_s3_auth)
     surrogate, messages, effective = load_optional_surrogate_json(
         paths,
@@ -1169,12 +1269,33 @@ def _s3_env_values(paths: StrainDashboardPaths) -> Dict[str, str]:
     }
 
 
-def _make_nsdf_s3_client(paths: StrainDashboardPaths):
+def _make_nsdf_s3_client(
+    paths: StrainDashboardPaths,
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+):
     import boto3
+    from botocore.config import Config as BotoConfig
 
     cfg = _s3_env_values(paths)
+    if mongo_s3_auth:
+        ak = (mongo_s3_auth.get("access_key_id") or "").strip()
+        sk = (mongo_s3_auth.get("secret_access_key") or "").strip()
+        if ak and sk:
+            cfg["aws_access_key_id"] = ak
+            cfg["aws_secret_access_key"] = sk
+        ep = (mongo_s3_auth.get("endpoint_url") or "").strip()
+        if ep:
+            cfg["endpoint_url"] = ep.rstrip("/")
+        reg = (mongo_s3_auth.get("region_name") or "").strip()
+        if reg:
+            cfg["region_name"] = reg
+        tok = (mongo_s3_auth.get("aws_session_token") or "").strip()
+        if tok:
+            cfg["aws_session_token"] = tok
+
     kwargs: Dict[str, Any] = {
         "region_name": cfg["region_name"],
+        "config": BotoConfig(signature_version="s3v4", s3={"addressing_style": "path"}),
     }
     if cfg["endpoint_url"]:
         kwargs["endpoint_url"] = cfg["endpoint_url"]
@@ -1203,7 +1324,11 @@ def _s3_missing_error(exc: Exception) -> bool:
     return code in ("NoSuchKey", "NoSuchBucket", "404", "NotFound")
 
 
-def load_nsdf_json_bundle_from_s3(paths: StrainDashboardPaths) -> NSDFLoadedBundle:
+def load_nsdf_json_bundle_from_s3(
+    paths: StrainDashboardPaths,
+    *,
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+) -> NSDFLoadedBundle:
     bucket = (paths.s3_bucket or "").strip()
     data_key = (paths.s3_data_key or "").strip()
     if not bucket or not data_key:
@@ -1211,7 +1336,7 @@ def load_nsdf_json_bundle_from_s3(paths: StrainDashboardPaths) -> NSDFLoadedBund
             "Set S3_BUCKET and S3_DATA_KEY to load NSDF data from S3."
         )
 
-    client = _make_nsdf_s3_client(paths)
+    client = _make_nsdf_s3_client(paths, mongo_s3_auth=mongo_s3_auth)
     data = _load_json_from_s3_key(client, bucket, data_key)
     messages = [f"Loaded NSDF data JSON from s3://{bucket}/{data_key}"]
 

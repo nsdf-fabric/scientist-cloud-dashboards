@@ -16,11 +16,15 @@ from nsdf_dashboard.ornl_chess_strain_lib import (
     StrainDashboardPaths,
     StrainFieldPlotConfig,
     build_strain_field_grids,
+    enrich_strain_paths_from_dataset_doc,
     infer_nsdf_bounds_grid_size,
     infer_nsdf_grid_size,
     list_nsdf_field_headers,
     load_simple_env_file,
+    load_json_from_url,
     load_nsdf_json_bundle,
+    normalize_nsdf_gateway_data_url,
+    normalize_nsdf_remote_data_link,
     resolve_nsdf_grid_size,
     validate_nsdf_measurement_doc,
     validate_nsdf_next_x_doc,
@@ -242,6 +246,76 @@ def test_next_x_validation_skips_bad_rows() -> None:
     assert info.warnings
 
 
+def test_normalize_gateway_prefix_to_data_json() -> None:
+    base = (
+        "https://us-east-1.gw.example.com/scientistcloud/test-chess"
+        "?access_key=AK&secret_key=SK"
+    )
+    normalized = normalize_nsdf_gateway_data_url(base)
+    assert normalized.endswith("/test-chess/data.json?access_key=AK&secret_key=SK")
+    assert normalize_nsdf_remote_data_link("s3://scientistcloud/test-chess/") == (
+        "s3://scientistcloud/test-chess/data.json"
+    )
+    explicit = normalize_nsdf_gateway_data_url(
+        "https://gw.example.com/bucket/prefix/data.json?access_key=AK&secret_key=SK"
+    )
+    assert "/prefix/data.json?" in explicit
+
+
+def test_enrich_directory_link_resolves_s3_prefix_for_direct_read() -> None:
+    doc = {
+        "google_drive_link": (
+            "https://us-east-1.gw.example.com/scientistcloud/test-chess"
+            "?access_key=AK&secret_key=SK"
+        ),
+        "s3_access_key_id": "AK",
+        "s3_secret_access_key": "SK",
+        "s3_endpoint_url": "https://us-east-1.gw.example.com",
+    }
+    paths = enrich_strain_paths_from_dataset_doc(StrainDashboardPaths(), doc)
+    assert "/test-chess/data.json" in paths.json_url
+    assert "access_key=AK" in paths.json_url
+
+
+def test_load_json_from_url_reads_prefix_via_data_json_key() -> None:
+    payload = _base_data()
+    requested: list[str] = []
+
+    class FakeBody:
+        def read(self) -> bytes:
+            return json.dumps(payload).encode("utf-8")
+
+    class FakeClient:
+        def get_object(self, *, Bucket: str, Key: str) -> dict:
+            requested.append(Key)
+            assert Bucket == "scientistcloud"
+            assert Key == "test-chess/data.json"
+            return {"Body": FakeBody()}
+
+    old = lib._load_json_via_s3_query_client
+    try:
+        lib._load_json_via_s3_query_client = lambda cfg: (
+            FakeClient().get_object(Bucket=cfg["bucket"], Key=cfg["key"]) and payload
+        )
+
+        def _fake_load(cfg: dict) -> dict:
+            requested.append(cfg["key"])
+            assert cfg["bucket"] == "scientistcloud"
+            assert cfg["key"] == "test-chess/data.json"
+            return payload
+
+        lib._load_json_via_s3_query_client = _fake_load
+        url = (
+            "https://us-east-1.gw.example.com/scientistcloud/test-chess"
+            "?access_key=AK&secret_key=SK"
+        )
+        doc = load_json_from_url(url)
+        assert doc["dataset_y"] == payload["dataset_y"]
+        assert requested == ["test-chess/data.json"]
+    finally:
+        lib._load_json_via_s3_query_client = old
+
+
 def test_env_file_parser_and_s3_config_detection() -> None:
     old_env = dict(os.environ)
     try:
@@ -307,7 +381,7 @@ def test_s3_bundle_loads_and_infers_surrogate_key() -> None:
     fake_client = _FakeS3Client()
     old_make_client = lib._make_nsdf_s3_client
     try:
-        lib._make_nsdf_s3_client = lambda paths: fake_client
+        lib._make_nsdf_s3_client = lambda paths, mongo_s3_auth=None: fake_client
         paths = StrainDashboardPaths(
             s3_bucket="my-bucket",
             s3_data_key="prefix/data.json",
@@ -329,7 +403,7 @@ def test_local_data_dir_takes_priority_over_s3() -> None:
     fake_client = _FakeS3Client()
     old_make_client = lib._make_nsdf_s3_client
     try:
-        lib._make_nsdf_s3_client = lambda paths: fake_client
+        lib._make_nsdf_s3_client = lambda paths, mongo_s3_auth=None: fake_client
         with tempfile.TemporaryDirectory() as tmp:
             with open(os.path.join(tmp, "data.json"), "w", encoding="utf-8") as fh:
                 json.dump(_base_data(), fh)
@@ -367,7 +441,7 @@ def test_missing_local_data_dir_falls_back_to_s3() -> None:
     fake_client = _FakeS3Client()
     old_make_client = lib._make_nsdf_s3_client
     try:
-        lib._make_nsdf_s3_client = lambda paths: fake_client
+        lib._make_nsdf_s3_client = lambda paths, mongo_s3_auth=None: fake_client
         with tempfile.TemporaryDirectory() as tmp:
             paths = StrainDashboardPaths(
                 local_data_dir=tmp,
@@ -477,6 +551,9 @@ def main() -> None:
         test_local_surrogate_sibling_inference,
         test_local_next_x_sibling_inference,
         test_next_x_validation_skips_bad_rows,
+        test_normalize_gateway_prefix_to_data_json,
+        test_enrich_directory_link_resolves_s3_prefix_for_direct_read,
+        test_load_json_from_url_reads_prefix_via_data_json_key,
         test_env_file_parser_and_s3_config_detection,
         test_s3_bundle_loads_and_infers_surrogate_key,
         test_local_data_dir_takes_priority_over_s3,
