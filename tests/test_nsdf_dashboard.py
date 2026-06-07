@@ -63,6 +63,21 @@ def _assert_mask_at(mask: np.ndarray, x: int, y: int) -> None:
     assert mask[y, x] == 1.0, f"expected measurement mask at ({x}, {y})"
 
 
+def test_resolve_bokeh_palette_rdbu_coolwarm_and_viridis() -> None:
+    from nsdf_dashboard.ornl_chess_strain_lib import _resolve_bokeh_palette
+
+    rdbu = _resolve_bokeh_palette("RdBu11")
+    coolwarm = _resolve_bokeh_palette("Coolwarm256")
+    viridis = _resolve_bokeh_palette("Viridis256")
+    assert len(rdbu) == 11
+    assert rdbu[0] == "#053061"
+    assert len(coolwarm) == 256
+    assert coolwarm[0] == "#3b4cc0"
+    assert coolwarm[-1] == "#b40426"
+    assert len(viridis) == 256
+    assert viridis[0] != coolwarm[0]
+
+
 def test_empty_measurement_doc_allows_pre_capture_view() -> None:
     data = {
         "dataset_x": [],

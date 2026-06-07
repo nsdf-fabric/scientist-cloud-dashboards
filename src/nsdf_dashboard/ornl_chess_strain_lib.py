@@ -371,12 +371,12 @@ class StrainFieldPlotConfig:
     x_axis_label: str = "labx"
     y_axis_label: str = "labz"
     title_measurements: str = "Measurement locations"
-    title_estimate: str = "Estimate"
-    title_variance: str = "Variance"
+    title_estimate: str = "Prediction"
+    title_variance: str = "Uncertainty"
     flip_y_for_display: bool = True
-    colormap_estimate: str = "Viridis256"
+    colormap_estimate: str = "Coolwarm256"
     colormap_variance: str = "Viridis256"
-    colormap_mask: Tuple[str, str] = ("#2d1b4e", "#fde724")
+    colormap_mask: Tuple[str, str] = ("#ffffff", "#ffffff")
 
 
 @dataclass
@@ -2707,6 +2707,206 @@ def _add_grid_point_overlay(
     return figure.scatter(px, py, **scatter_kwargs)
 
 
+def _hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
+    value = hex_color.lstrip("#")
+    return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+
+
+def _rgb_to_hex(red: int, green: int, blue: int) -> str:
+    return f"#{red:02x}{green:02x}{blue:02x}"
+
+
+def _lerp_rgb(
+    start: Tuple[int, int, int],
+    end: Tuple[int, int, int],
+    t: float,
+) -> Tuple[int, int, int]:
+    return tuple(int(round(start[i] + (end[i] - start[i]) * t)) for i in range(3))  # type: ignore[return-value]
+
+
+def _sample_three_stop_diverging_palette(
+    low_hex: str,
+    mid_hex: str,
+    high_hex: str,
+    *,
+    steps: int = 256,
+) -> List[str]:
+    """Smooth diverging palette (low -> mid -> high), matplotlib coolwarm-style."""
+    low = _hex_to_rgb(low_hex)
+    mid = _hex_to_rgb(mid_hex)
+    high = _hex_to_rgb(high_hex)
+    if steps <= 1:
+        return [_rgb_to_hex(*mid)]
+    colors: List[str] = []
+    for index in range(steps):
+        t = index / (steps - 1)
+        if t <= 0.5:
+            rgb = _lerp_rgb(low, mid, t / 0.5)
+        else:
+            rgb = _lerp_rgb(mid, high, (t - 0.5) / 0.5)
+        colors.append(_rgb_to_hex(*rgb))
+    return colors
+
+
+def _continuous_palette_generators() -> Dict[str, Any]:
+    """Named smooth palettes not bundled as flat lists in Bokeh."""
+    return {
+        "coolwarm256": lambda: _sample_three_stop_diverging_palette("#3b4cc0", "#f7f7f7", "#b40426"),
+        "coolwarm": lambda: _sample_three_stop_diverging_palette("#3b4cc0", "#f7f7f7", "#b40426"),
+    }
+
+
+def _resolve_bokeh_palette(palette_name: str) -> List[Any]:
+    """Resolve a Bokeh palette name (e.g. Coolwarm256, Viridis256) to a color list."""
+    import re
+
+    import bokeh.palettes as palettes_module
+    from bokeh.palettes import Viridis256
+
+    custom = _continuous_palette_generators().get(palette_name.lower())
+    if custom is not None:
+        return custom()
+
+    direct = getattr(palettes_module, palette_name, None)
+    if isinstance(direct, (list, tuple)):
+        return list(direct)
+
+    try:
+        from bokeh.palettes import all_palettes  # type: ignore
+
+        palette = all_palettes.get(palette_name)
+        if isinstance(palette, (list, tuple)):
+            return list(palette)
+        match = re.fullmatch(r"([A-Za-z]+)(\d+)", palette_name)
+        if match:
+            family, size_str = match.group(1), match.group(2)
+            family_palette = all_palettes.get(family)
+            if isinstance(family_palette, dict):
+                sized = family_palette.get(int(size_str))
+                if isinstance(sized, (list, tuple)):
+                    return list(sized)
+    except Exception:
+        pass
+    return list(Viridis256)
+
+
+def _symmetric_rdbu_limits(
+    *arrays: np.ndarray,
+    fallback: Tuple[float, float] = (-1.0, 1.0),
+) -> Tuple[float, float]:
+    """Symmetric limits centered at zero for diverging RdBu maps."""
+    chunks: List[np.ndarray] = []
+    for arr in arrays:
+        if arr is None:
+            continue
+        finite = np.asarray(arr, dtype=np.float64)[np.isfinite(arr)]
+        if finite.size:
+            chunks.append(finite)
+    if not chunks:
+        return fallback
+    combined = np.concatenate(chunks)
+    abs_max = max(float(np.max(np.abs(combined))), 1e-12)
+    return -abs_max, abs_max
+
+
+_STRAIN_COLORBAR_MARGIN = 72
+_STRAIN_FRAME_BASE = 320
+
+
+def _strain_plot_figure(
+    title: str,
+    nx: int,
+    ny: int,
+    cfg: StrainFieldPlotConfig,
+) -> Any:
+    """Shared Bokeh figure: equal lab-unit aspect, fixed frame, colorbar gutter."""
+    from bokeh.models import FixedTicker
+    from bokeh.plotting import figure
+
+    frame_w, frame_h = _proportional_frame_size(nx, ny, base=_STRAIN_FRAME_BASE)
+    p = figure(
+        title=title,
+        x_range=(0, nx),
+        y_range=(0, ny),
+        frame_width=frame_w,
+        frame_height=frame_h,
+        width=frame_w + _STRAIN_COLORBAR_MARGIN,
+        height=frame_h,
+        min_border_right=_STRAIN_COLORBAR_MARGIN,
+        tools="pan,wheel_zoom,box_zoom,reset,save",
+        match_aspect=True,
+        aspect_scale=1,
+        sizing_mode="fixed",
+        background_fill_color="#ffffff",
+        border_fill_color="#ffffff",
+    )
+    p.xaxis.axis_label = cfg.x_axis_label
+    p.yaxis.axis_label = cfg.y_axis_label
+    p.xaxis.ticker = FixedTicker(ticks=list(range(0, nx + 1, max(1, nx // 5))))
+    p.yaxis.ticker = FixedTicker(ticks=list(range(0, ny + 1, max(1, ny // 5))))
+    return p
+
+
+def _attach_heatmap_colorbar(
+    figure: Any,
+    mapper: Any,
+    lo: float,
+    hi: float,
+) -> None:
+    from bokeh.models import BasicTicker, ColorBar, NumeralTickFormatter
+
+    span = abs(hi - lo)
+    if span >= 100 or max(abs(lo), abs(hi)) >= 1000:
+        tick_format = "0.00e0"
+    elif span >= 1:
+        tick_format = "0.00"
+    elif span >= 0.01:
+        tick_format = "0.0000"
+    else:
+        tick_format = "0.00e0"
+    color_bar = ColorBar(
+        color_mapper=mapper,
+        ticker=BasicTicker(),
+        formatter=NumeralTickFormatter(format=tick_format),
+        label_standoff=8,
+        border_line_color=None,
+        location=(0, 0),
+        width=12,
+    )
+    figure.add_layout(color_bar, "right")
+
+
+def _add_colored_square_overlay(
+    figure: Any,
+    gx: np.ndarray,
+    gy: np.ndarray,
+    values: np.ndarray,
+    nx: int,
+    ny: int,
+    flip_y: bool,
+    mapper: Any,
+    *,
+    size: int = 11,
+) -> Optional[Any]:
+    if gx.size == 0:
+        return None
+    from bokeh.models import ColumnDataSource
+
+    px, py = _grid_display_coords(gx, gy, nx, ny, flip_y)
+    source = ColumnDataSource(data={"x": px, "y": py, "value": np.asarray(values, dtype=np.float64)})
+    return figure.scatter(
+        "x",
+        "y",
+        source=source,
+        marker="square",
+        size=size,
+        line_color="#333333",
+        line_width=0.8,
+        fill_alpha=0.95,
+        color={"field": "value", "transform": mapper},
+    )
+
+
 def format_nsdf_workflow_display(
     surrogate_info: NSDFSurrogateData,
     next_x_info: "NSDFNextXData",
@@ -2978,6 +3178,7 @@ def build_strain_field_grids(
         "measurement_bounds": measurement.bounds,
         "measurement_gx": gx,
         "measurement_gy": gy,
+        "measurement_values": values.copy(),
         "plottable_fields": surrogate.plottable_fields,
         "warnings": list(surrogate.warnings),
     }
@@ -3066,84 +3267,58 @@ def make_strain_heatmap_figure(
     cfg: StrainFieldPlotConfig,
     *,
     palette_name: str = "Viridis256",
-    discrete_mask: bool = False,
     low_high: Optional[Tuple[float, float]] = None,
     show_colorbar: bool = False,
 ):
-    from bokeh.models import BasicTicker, ColorBar, FixedTicker, LinearColorMapper, NumeralTickFormatter
-    from bokeh.palettes import Viridis256
-    from bokeh.plotting import figure
+    from bokeh.models import LinearColorMapper
 
     nx, ny = cfg.grid_size
     zd = _maybe_flip_y(np.asarray(z, dtype=np.float64), cfg.flip_y_for_display)
 
-    lo = 0.0
-    hi = 1.0
-    if discrete_mask:
-        lo_c, hi_c = cfg.colormap_mask
-        palette = [lo_c, hi_c]
-        mapper = LinearColorMapper(palette=palette, low=0.0, high=1.0)
+    palette = _resolve_bokeh_palette(palette_name)
+    if low_high is not None:
+        lo, hi = low_high
     else:
-        try:
-            from bokeh.palettes import all_palettes  # type: ignore
+        finite = zd[np.isfinite(zd)]
+        lo = float(np.nanmin(finite)) if finite.size else 0.0
+        hi = float(np.nanmax(finite)) if finite.size else 1.0
+        if lo == hi:
+            hi = lo + 1e-12
+    mapper = LinearColorMapper(palette=palette, low=lo, high=hi)
 
-            palette = all_palettes.get(palette_name) or Viridis256
-        except Exception:
-            palette = Viridis256
-        if low_high is not None:
-            lo, hi = low_high
-        else:
-            finite = zd[np.isfinite(zd)]
-            lo = float(np.nanmin(finite)) if finite.size else 0.0
-            hi = float(np.nanmax(finite)) if finite.size else 1.0
-            if lo == hi:
-                hi = lo + 1e-12
-        mapper = LinearColorMapper(palette=palette, low=lo, high=hi)
-
-    frame_w, frame_h = _proportional_frame_size(nx, ny)
-    # Reserve the same right margin on every panel so row layout does not squash aspect.
-    colorbar_margin = 72
-    needs_colorbar = show_colorbar and not discrete_mask
-    p = figure(
-        title=title,
-        x_range=(0, nx),
-        y_range=(0, ny),
-        frame_width=frame_w,
-        frame_height=frame_h,
-        width=frame_w + colorbar_margin,
-        height=frame_h,
-        min_border_right=colorbar_margin,
-        tools="pan,wheel_zoom,box_zoom,reset,save",
-        match_aspect=True,
-        aspect_scale=1,
-        sizing_mode="fixed",
-    )
-    p.xaxis.axis_label = cfg.x_axis_label
-    p.yaxis.axis_label = cfg.y_axis_label
-    p.xaxis.ticker = FixedTicker(ticks=list(range(0, nx + 1, max(1, nx // 5))))
-    p.yaxis.ticker = FixedTicker(ticks=list(range(0, ny + 1, max(1, ny // 5))))
-
+    p = _strain_plot_figure(title, nx, ny, cfg)
     p.image(image=[zd], x=0, y=0, dw=nx, dh=ny, color_mapper=mapper)
-    if needs_colorbar:
-        span = abs(hi - lo)
-        if span >= 100 or max(abs(lo), abs(hi)) >= 1000:
-            tick_format = "0.00e0"
-        elif span >= 1:
-            tick_format = "0.00"
-        elif span >= 0.01:
-            tick_format = "0.0000"
-        else:
-            tick_format = "0.00e0"
-        color_bar = ColorBar(
-            color_mapper=mapper,
-            ticker=BasicTicker(),
-            formatter=NumeralTickFormatter(format=tick_format),
-            label_standoff=8,
-            border_line_color=None,
-            location=(0, 0),
-        )
-        p.add_layout(color_bar, "right")
+    if show_colorbar:
+        _attach_heatmap_colorbar(p, mapper, lo, hi)
     return p
+
+
+def make_strain_measurement_figure(
+    title: str,
+    cfg: StrainFieldPlotConfig,
+    *,
+    gx: np.ndarray,
+    gy: np.ndarray,
+    values: np.ndarray,
+    mapper: Any,
+    lo: float,
+    hi: float,
+) -> Tuple[Any, Optional[Any]]:
+    """White canvas with square markers colored by dataset_y (RdBu) and matching colorbar."""
+    nx, ny = cfg.grid_size
+    p = _strain_plot_figure(title, nx, ny, cfg)
+    renderer = _add_colored_square_overlay(
+        p,
+        gx,
+        gy,
+        values,
+        nx,
+        ny,
+        cfg.flip_y_for_display,
+        mapper,
+    )
+    _attach_heatmap_colorbar(p, mapper, lo, hi)
+    return p, renderer
 
 
 def make_strain_triplet_figures(
@@ -3154,47 +3329,48 @@ def make_strain_triplet_figures(
     next_x_info: Optional[NSDFNextXData] = None,
     active_workflow_id: Optional[str] = None,
 ):
+    from bokeh.models import LinearColorMapper
+
     sub = f" — {row_subtitle}" if row_subtitle else ""
     est = grids.estimate
-    finite = est[np.isfinite(est)]
-    lo = float(np.nanmin(finite)) if finite.size else 0.0
-    hi = float(np.nanmax(finite)) if finite.size else 1.0
-    if lo == hi:
-        hi = lo + 1e-12
-
     nx, ny = cfg.grid_size
     bounds = grids.meta.get("measurement_bounds")
     if not isinstance(bounds, tuple):
         bounds = None
 
-    p0 = make_strain_heatmap_figure(
-        f"{cfg.title_measurements}{sub}",
-        grids.measurements,
-        cfg,
-        palette_name=cfg.colormap_estimate,
-        discrete_mask=True,
-        low_high=(0.0, 1.0),
-    )
-    point_legend_items: List[Tuple[str, Any]] = []
     measured_gx = grids.meta.get("measurement_gx")
     measured_gy = grids.meta.get("measurement_gy")
-    if isinstance(measured_gx, np.ndarray) and isinstance(measured_gy, np.ndarray) and measured_gx.size:
-        sampled_renderer = _add_grid_point_overlay(
-            p0,
-            measured_gx,
-            measured_gy,
-            nx,
-            ny,
-            cfg.flip_y_for_display,
-            color=cfg.colormap_mask[1],
-            marker="circle",
-            size=9,
-            line_color="#ffffff",
-            line_width=1.25,
-            fill_alpha=0.95,
+    measured_vals = grids.meta.get("measurement_values")
+    if not isinstance(measured_gx, np.ndarray):
+        measured_gx = np.array([], dtype=np.int64)
+    if not isinstance(measured_gy, np.ndarray):
+        measured_gy = np.array([], dtype=np.int64)
+    if not isinstance(measured_vals, np.ndarray):
+        measured_vals = np.array([], dtype=np.float64)
+
+    rdbu_palette = _resolve_bokeh_palette(cfg.colormap_estimate)
+    rdbu_lo, rdbu_hi = _symmetric_rdbu_limits(est, measured_vals)
+    rdbu_mapper = LinearColorMapper(palette=rdbu_palette, low=rdbu_lo, high=rdbu_hi)
+
+    if measured_gx.size:
+        p0, sampled_renderer = make_strain_measurement_figure(
+            f"{cfg.title_measurements}{sub}",
+            cfg,
+            gx=measured_gx,
+            gy=measured_gy,
+            values=measured_vals,
+            mapper=rdbu_mapper,
+            lo=rdbu_lo,
+            hi=rdbu_hi,
         )
-        if sampled_renderer is not None:
-            point_legend_items.append(("Sampled", sampled_renderer))
+    else:
+        p0 = _strain_plot_figure(f"{cfg.title_measurements}{sub}", nx, ny, cfg)
+        _attach_heatmap_colorbar(p0, rdbu_mapper, rdbu_lo, rdbu_hi)
+        sampled_renderer = None
+
+    point_legend_items: List[Tuple[str, Any]] = []
+    if sampled_renderer is not None:
+        point_legend_items.append(("Sampled", sampled_renderer))
     if next_x_info is not None and active_workflow_id:
         nx_gx, nx_gy = next_x_grid_coords_for_workflow(
             next_x_info,
@@ -3221,12 +3397,13 @@ def make_strain_triplet_figures(
             if proposed_renderer is not None:
                 point_legend_items.append(("Proposed next scan", proposed_renderer))
     _attach_point_legend_below(p0, point_legend_items)
+
     p1 = make_strain_heatmap_figure(
         f"{cfg.title_estimate}{sub}",
         grids.estimate,
         cfg,
         palette_name=cfg.colormap_estimate,
-        low_high=(lo, hi),
+        low_high=(rdbu_lo, rdbu_hi),
         show_colorbar=True,
     )
     var = grids.variance
