@@ -1985,18 +1985,29 @@ def _grid_display_coords(
     return px, py
 
 
-def _configure_point_legend_below(figure: Any) -> None:
-    if not figure.legend or not figure.legend.items:
+def _attach_point_legend_below(
+    figure: Any,
+    legend_items: List[Tuple[str, Any]],
+) -> None:
+    """Place marker legend in the layout below the plot frame (not over the heatmap)."""
+    if not legend_items:
         return
-    figure.legend.location = "bottom"
-    figure.legend.orientation = "horizontal"
-    figure.legend.click_policy = "hide"
-    figure.legend.background_fill_alpha = 0.92
-    figure.legend.border_line_alpha = 0.0
-    figure.legend.label_text_font_size = "9pt"
-    figure.legend.spacing = 14
-    figure.legend.margin = 6
-    figure.min_border_bottom = 78
+    from bokeh.models import Legend, LegendItem
+
+    legend = Legend(
+        items=[LegendItem(label=label, renderers=[renderer]) for label, renderer in legend_items],
+        location="center",
+        orientation="horizontal",
+        click_policy="hide",
+        background_fill_alpha=0.92,
+        border_line_alpha=0.0,
+        label_text_font_size="9pt",
+        spacing=14,
+        margin=0,
+        padding=6,
+    )
+    figure.add_layout(legend, "below")
+    figure.min_border_bottom = 10
 
 
 def _add_grid_point_overlay(
@@ -2010,13 +2021,12 @@ def _add_grid_point_overlay(
     color: str,
     marker: str,
     size: int,
-    legend_label: str,
     line_color: Optional[str] = None,
     line_width: float = 1.5,
     fill_alpha: float = 0.95,
-) -> None:
+) -> Optional[Any]:
     if gx.size == 0:
-        return
+        return None
     px, py = _grid_display_coords(gx, gy, nx, ny, flip_y)
     scatter_kwargs: Dict[str, Any] = {
         "size": size,
@@ -2026,9 +2036,8 @@ def _add_grid_point_overlay(
         "line_width": line_width,
         "fill_alpha": fill_alpha,
         "line_alpha": 1.0,
-        "legend_label": legend_label,
     }
-    figure.scatter(px, py, **scatter_kwargs)
+    return figure.scatter(px, py, **scatter_kwargs)
 
 
 def format_nsdf_workflow_display(
@@ -2458,10 +2467,11 @@ def make_strain_triplet_figures(
         discrete_mask=True,
         low_high=(0.0, 1.0),
     )
+    point_legend_items: List[Tuple[str, Any]] = []
     measured_gx = grids.meta.get("measurement_gx")
     measured_gy = grids.meta.get("measurement_gy")
     if isinstance(measured_gx, np.ndarray) and isinstance(measured_gy, np.ndarray) and measured_gx.size:
-        _add_grid_point_overlay(
+        sampled_renderer = _add_grid_point_overlay(
             p0,
             measured_gx,
             measured_gy,
@@ -2471,11 +2481,12 @@ def make_strain_triplet_figures(
             color=cfg.colormap_mask[1],
             marker="circle",
             size=9,
-            legend_label="Sampled",
             line_color="#ffffff",
             line_width=1.25,
             fill_alpha=0.95,
         )
+        if sampled_renderer is not None:
+            point_legend_items.append(("Sampled", sampled_renderer))
     if next_x_info is not None and active_workflow_id:
         nx_gx, nx_gy = next_x_grid_coords_for_workflow(
             next_x_info,
@@ -2485,7 +2496,7 @@ def make_strain_triplet_figures(
             bounds,
         )
         if nx_gx.size:
-            _add_grid_point_overlay(
+            proposed_renderer = _add_grid_point_overlay(
                 p0,
                 nx_gx,
                 nx_gy,
@@ -2495,12 +2506,13 @@ def make_strain_triplet_figures(
                 color="#ff6600",
                 marker="cross",
                 size=16,
-                legend_label="Proposed next scan",
                 line_color="#ff6600",
                 line_width=2.5,
                 fill_alpha=0.0,
             )
-    _configure_point_legend_below(p0)
+            if proposed_renderer is not None:
+                point_legend_items.append(("Proposed next scan", proposed_renderer))
+    _attach_point_legend_below(p0, point_legend_items)
     p1 = make_strain_heatmap_figure(
         f"{cfg.title_estimate}{sub}",
         grids.estimate,
