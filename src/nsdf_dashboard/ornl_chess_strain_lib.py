@@ -88,6 +88,25 @@ def load_simple_env_file(path: str) -> Dict[str, str]:
     return out
 
 
+def _find_optional_env_file() -> str:
+    """Return a repo/cwd ``.env`` path when ``ORNL_S3_ENV_FILE`` is not set."""
+    candidates: List[str] = []
+    cwd = os.getcwd()
+    if cwd:
+        candidates.append(os.path.join(cwd, ".env"))
+    pkg_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    candidates.append(os.path.join(pkg_root, ".env"))
+    seen: set[str] = set()
+    for candidate in candidates:
+        norm = os.path.abspath(candidate)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        if os.path.isfile(norm):
+            return norm
+    return ""
+
+
 @dataclass
 class StrainDashboardPaths:
     """Where to load NSDF data and optional surrogate JSON."""
@@ -110,7 +129,8 @@ class StrainDashboardPaths:
 
     @classmethod
     def from_environ(cls) -> "StrainDashboardPaths":
-        env_file_values = load_simple_env_file(os.environ.get("ORNL_S3_ENV_FILE", "").strip())
+        env_file = os.environ.get("ORNL_S3_ENV_FILE", "").strip() or _find_optional_env_file()
+        env_file_values = load_simple_env_file(env_file)
 
         def env_value(name: str, default: str = "") -> str:
             return (os.environ.get(name) or env_file_values.get(name) or default).strip()
@@ -131,7 +151,7 @@ class StrainDashboardPaths:
             next_x_json_path=os.environ.get("ORNL_NEXT_X_JSON_PATH", "").strip(),
             next_x_json_url=os.environ.get("ORNL_NEXT_X_JSON_URL", "").strip(),
             local_data_dir=env_value("LOCAL_DATA_DIR"),
-            s3_env_file=os.environ.get("ORNL_S3_ENV_FILE", "").strip(),
+            s3_env_file=env_file,
             s3_bucket=env_value("S3_BUCKET"),
             s3_data_key=env_value("S3_DATA_KEY"),
             s3_surrogate_key=env_value("S3_SURROGATE_KEY"),
@@ -663,6 +683,21 @@ def nsdf_listing_directory(
     return ""
 
 
+def _local_data_dir_configured(paths: StrainDashboardPaths) -> bool:
+    """True when ``LOCAL_DATA_DIR`` is set — local runs must not touch S3."""
+    local_dir = (paths.local_data_dir or "").strip()
+    return bool(local_dir and os.path.isdir(local_dir))
+
+
+def _remote_snapshot_listing_enabled(paths: StrainDashboardPaths) -> bool:
+    """True when snapshots should be discovered from S3 / gateway URL."""
+    if _local_data_dir_configured(paths):
+        return False
+    if paths.has_s3_source():
+        return True
+    return bool((paths.json_url or "").strip())
+
+
 def list_nsdf_version_suffixes_from_directory(directory: str) -> List[str]:
     """List timestamp suffixes from ``data_<suffix>.json`` files (newest first)."""
     d = (directory or "").strip()
@@ -750,6 +785,9 @@ def discover_nsdf_version_options(
     Return ``(value, label)`` pairs for a version selector.
 
     ``latest`` is always first; values are ISO-like suffixes such as ``20260606T223505Z``.
+
+    Local ``LOCAL_DATA_DIR`` runs list only that folder. S3 / gateway runs list only
+    the resolved remote prefix. The two sources are never merged.
     """
     options: List[Tuple[str, str]] = [("latest", "Latest (data.json)")]
     seen: set[str] = set()
@@ -759,6 +797,9 @@ def discover_nsdf_version_options(
         if suffix not in seen:
             seen.add(suffix)
             options.append((suffix, suffix))
+
+    if not _remote_snapshot_listing_enabled(paths):
+        return options
 
     for suffix in list_nsdf_version_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth):
         if suffix not in seen:
@@ -1510,6 +1551,17 @@ def load_nsdf_json_bundle(
     *,
     mongo_s3_auth: Optional[Dict[str, str]] = None,
 ) -> NSDFLoadedBundle:
+    if _local_data_dir_configured(paths):
+        local_bundle = load_nsdf_json_bundle_from_local_data_dir(paths)
+        if local_bundle is not None:
+            return local_bundle
+        data_fn, _, _ = nsdf_triplet_basenames(paths.version_suffix or "")
+        local_dir = (paths.local_data_dir or "").strip()
+        raise FileNotFoundError(
+            f"Local NSDF file not found: {os.path.join(local_dir, data_fn)} "
+            f"(LOCAL_DATA_DIR={local_dir!r})"
+        )
+
     local_bundle = load_nsdf_json_bundle_from_local_data_dir(paths)
     if local_bundle is not None:
         return local_bundle

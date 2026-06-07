@@ -585,6 +585,7 @@ class _FakeBody:
 class _FakeS3Client:
     def __init__(self):
         self.keys_requested: list[str] = []
+        self.listed_suffixes: list[str] = []
 
     def get_object(self, Bucket: str, Key: str) -> dict:  # noqa: N803
         self.keys_requested.append(Key)
@@ -597,6 +598,13 @@ class _FakeS3Client:
         if Key == "prefix/next_x.json":
             return {"Body": _FakeBody([])}
         raise AssertionError(f"unexpected key {Key}")
+
+    def list_objects_v2(self, **kwargs) -> dict:  # noqa: N803
+        contents = [
+            {"Key": f"prefix/data_{suffix}.json"}
+            for suffix in self.listed_suffixes
+        ]
+        return {"Contents": contents, "IsTruncated": False}
 
 
 def test_s3_bundle_loads_and_infers_surrogate_key() -> None:
@@ -659,7 +667,7 @@ def test_local_data_dir_loads_local_surrogate() -> None:
         assert bundle.paths.surrogate_json_path == surrogate_path
 
 
-def test_missing_local_data_dir_falls_back_to_s3() -> None:
+def test_missing_local_data_dir_does_not_fall_back_to_s3() -> None:
     fake_client = _FakeS3Client()
     old_make_client = lib._make_nsdf_s3_client
     try:
@@ -670,14 +678,56 @@ def test_missing_local_data_dir_falls_back_to_s3() -> None:
                 s3_bucket="my-bucket",
                 s3_data_key="prefix/data.json",
             )
-            bundle = load_nsdf_json_bundle(paths)
-            assert bundle.data["dataset_y"] == [1.0, 2.0, 3.0]
-            assert bundle.surrogate == {"surrogate": [10.0, 20.0, 30.0]}
-            assert fake_client.keys_requested == [
-            "prefix/data.json",
-            "prefix/surrogate.json",
-            "prefix/next_x.json",
-        ]
+            try:
+                load_nsdf_json_bundle(paths)
+            except FileNotFoundError as exc:
+                assert "Local NSDF file not found" in str(exc)
+            else:
+                raise AssertionError("expected missing local data.json to raise FileNotFoundError")
+            assert fake_client.keys_requested == []
+    finally:
+        lib._make_nsdf_s3_client = old_make_client
+
+
+def test_local_snapshot_discovery_excludes_s3() -> None:
+    fake_client = _FakeS3Client()
+    fake_client.listed_suffixes = ["20990101T000000Z"]
+    old_make_client = lib._make_nsdf_s3_client
+    try:
+        lib._make_nsdf_s3_client = lambda paths, mongo_s3_auth=None: fake_client
+        with tempfile.TemporaryDirectory() as tmp:
+            open(os.path.join(tmp, "data.json"), "w", encoding="utf-8").close()
+            open(os.path.join(tmp, "data_20260606T215241Z.json"), "w", encoding="utf-8").close()
+            paths = StrainDashboardPaths(
+                local_data_dir=tmp,
+                s3_bucket="my-bucket",
+                s3_data_key="prefix/data.json",
+            )
+            options = discover_nsdf_version_options(paths)
+            values = [value for value, _label in options]
+            assert "20260606T215241Z" in values
+            assert "20990101T000000Z" not in values
+    finally:
+        lib._make_nsdf_s3_client = old_make_client
+
+
+def test_s3_snapshot_discovery_uses_remote_prefix_only() -> None:
+    fake_client = _FakeS3Client()
+    fake_client.listed_suffixes = ["20260606T215241Z", "20260607T023932Z"]
+    old_make_client = lib._make_nsdf_s3_client
+    try:
+        lib._make_nsdf_s3_client = lambda paths, mongo_s3_auth=None: fake_client
+        with tempfile.TemporaryDirectory() as tmp:
+            open(os.path.join(tmp, "data_20990101T000000Z.json"), "w", encoding="utf-8").close()
+            paths = StrainDashboardPaths(
+                s3_bucket="my-bucket",
+                s3_data_key="prefix/data.json",
+            )
+            options = discover_nsdf_version_options(paths)
+            values = [value for value, _label in options]
+            assert "20260606T215241Z" in values
+            assert "20260607T023932Z" in values
+            assert "20990101T000000Z" not in values
     finally:
         lib._make_nsdf_s3_client = old_make_client
 
@@ -781,7 +831,9 @@ def main() -> None:
         test_s3_bundle_loads_and_infers_surrogate_key,
         test_local_data_dir_takes_priority_over_s3,
         test_local_data_dir_loads_local_surrogate,
-        test_missing_local_data_dir_falls_back_to_s3,
+        test_missing_local_data_dir_does_not_fall_back_to_s3,
+        test_local_snapshot_discovery_excludes_s3,
+        test_s3_snapshot_discovery_uses_remote_prefix_only,
         test_refresh_api_key_loads_from_env_file,
         test_refresh_bus_register_trigger_unregister,
         test_refresh_api_rejects_missing_or_bad_api_key,
