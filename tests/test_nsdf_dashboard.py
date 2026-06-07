@@ -501,6 +501,64 @@ def test_enrich_directory_link_resolves_s3_prefix_for_direct_read() -> None:
     paths = enrich_strain_paths_from_dataset_doc(StrainDashboardPaths(), doc)
     assert "/test-chess/data.json" in paths.json_url
     assert "access_key=AK" in paths.json_url
+    assert paths.s3_bucket == "scientistcloud"
+    assert paths.s3_data_key == "test-chess/data.json"
+    assert paths.s3_endpoint_url == "https://us-east-1.gw.example.com"
+
+
+def test_gateway_url_promotes_to_s3_for_latest_surrogate_fallback() -> None:
+    class _GatewayFallbackClient(_FakeS3Client):
+        def get_object(self, Bucket: str, Key: str) -> dict:  # noqa: N803
+            self.keys_requested.append(Key)
+            if Key == "chess-data/data.json":
+                return {"Body": _FakeBody(_base_data())}
+            if Key == "chess-data/surrogate.json":
+                from botocore.exceptions import ClientError
+
+                raise ClientError({"Error": {"Code": "NoSuchKey", "Message": "missing"}}, "GetObject")
+            if Key == "chess-data/surrogate_20260607T180614Z.json":
+                return {
+                    "Body": _FakeBody(
+                        {
+                            "surrogate": [1.0, 2.0, 3.0, 4.0],
+                            "uncertainty": [0.1, 0.2, 0.3, 0.4],
+                            "bounds": [[0.0, 2.0], [0.0, 2.0]],
+                        }
+                    )
+                }
+            if Key == "chess-data/next_x.json":
+                return {"Body": _FakeBody([])}
+            raise AssertionError(f"unexpected key {Key}")
+
+    fake_client = _GatewayFallbackClient()
+    fake_client.listed_suffixes = ["20260607T180614Z"]
+    old_make_client = lib._make_nsdf_s3_client
+    try:
+        lib._make_nsdf_s3_client = lambda paths, mongo_s3_auth=None: fake_client
+        gateway_url = (
+            "https://us-east-1.gw.example.com/scientistcloud/chess-data/data.json"
+            "?access_key=AK&secret_key=SK"
+        )
+        paths = apply_nsdf_version_suffix(
+            enrich_strain_paths_from_dataset_doc(
+                StrainDashboardPaths(json_url=gateway_url),
+                None,
+            ),
+            "",
+        )
+        assert paths.has_s3_source()
+        bundle = load_nsdf_json_bundle(
+            paths,
+            mongo_s3_auth={"access_key_id": "AK", "secret_access_key": "SK"},
+        )
+        assert bundle.surrogate is not None
+        assert "chess-data/surrogate_20260607T180614Z.json" in fake_client.keys_requested
+        cfg = StrainFieldPlotConfig()
+        cfg.grid_size = resolve_nsdf_grid_size(bundle.data, surrogate_doc=bundle.surrogate)[0]
+        grids = build_strain_field_grids(bundle.data, cfg, bundle.surrogate)
+        assert grids.meta["estimate_source"] == "surrogate_grid"
+    finally:
+        lib._make_nsdf_s3_client = old_make_client
 
 
 def test_load_json_from_url_reads_prefix_via_data_json_key() -> None:
@@ -962,6 +1020,7 @@ def main() -> None:
         test_nsdf_version_suffix_triplet_and_apply,
         test_list_nsdf_version_suffixes_from_directory,
         test_enrich_directory_link_resolves_s3_prefix_for_direct_read,
+        test_gateway_url_promotes_to_s3_for_latest_surrogate_fallback,
         test_load_json_from_url_reads_prefix_via_data_json_key,
         test_env_file_parser_and_s3_config_detection,
         test_s3_bundle_loads_and_infers_surrogate_key,

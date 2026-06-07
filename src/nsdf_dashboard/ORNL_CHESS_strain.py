@@ -153,6 +153,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (  # noqa: E402
     list_nsdf_field_headers,
     load_simple_env_file,
     load_nsdf_json_bundle,
+    promote_gateway_json_url_to_s3_paths,
     make_strain_triplet_figures,
     infer_nsdf_bounds_grid_size,
     format_nsdf_workflow_display,
@@ -279,6 +280,8 @@ else:
         loc = (p.local_json_path or "").strip()
         jurl = (p.json_url or "").strip()
         if loc or not jurl:
+            return p
+        if promote_gateway_json_url_to_s3_paths(StrainDashboardPaths(json_url=jurl)).has_s3_source():
             return p
         mirror = find_strain_json_under_dataset_dir(_bd) or find_strain_json_under_dataset_dir(_sd)
         if mirror:

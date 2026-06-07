@@ -1025,6 +1025,48 @@ def resolve_strain_json_remote_link_from_dataset(doc: Mapping[str, Any]) -> str:
     return link
 
 
+def promote_gateway_json_url_to_s3_paths(paths: StrainDashboardPaths) -> StrainDashboardPaths:
+    """
+    When ``json_url`` is a ScientistCloud gateway link, populate ``s3_bucket`` / ``s3_data_key``.
+
+    Portal datasets usually pass gateway HTTPS URLs without explicit S3 fields. Promoting
+    enables direct S3 reads and timestamped surrogate fallback for ``data.json`` / latest.
+    """
+    if paths.has_s3_source():
+        return paths
+    url = normalize_nsdf_gateway_data_url((paths.json_url or "").strip())
+    if not url:
+        return paths
+    cfg = _parse_gateway_url_with_query_keys(url)
+    if not cfg:
+        return paths
+    bucket = (cfg.get("bucket") or "").strip()
+    key = normalize_nsdf_data_object_key((cfg.get("key") or "").strip())
+    if not bucket or not key:
+        return paths
+    return StrainDashboardPaths(
+        local_json_path=paths.local_json_path,
+        json_url=url,
+        surrogate_json_path=paths.surrogate_json_path,
+        surrogate_json_url=paths.surrogate_json_url,
+        next_x_json_path=paths.next_x_json_path,
+        next_x_json_url=paths.next_x_json_url,
+        local_data_dir=paths.local_data_dir,
+        s3_env_file=paths.s3_env_file,
+        s3_bucket=bucket,
+        s3_data_key=key,
+        s3_surrogate_key=paths.s3_surrogate_key,
+        s3_next_x_key=paths.s3_next_x_key,
+        s3_endpoint_url=(cfg.get("endpoint_url") or paths.s3_endpoint_url or "").strip(),
+        s3_region=(cfg.get("region_name") or paths.s3_region or "us-east-1").strip() or "us-east-1",
+        version_suffix=paths.version_suffix,
+    )
+
+
+def _finalize_strain_paths(paths: StrainDashboardPaths) -> StrainDashboardPaths:
+    return promote_gateway_json_url_to_s3_paths(paths)
+
+
 def enrich_strain_paths_from_dataset_doc(
     paths: StrainDashboardPaths,
     doc: Optional[Mapping[str, Any]],
@@ -1037,49 +1079,82 @@ def enrich_strain_paths_from_dataset_doc(
     (same fields as portal dashboard share links).
     """
     if (paths.local_json_path or "").strip() or (paths.json_url or "").strip():
-        return paths
+        return _finalize_strain_paths(paths)
     bd = (base_dir or "").strip()
     sd = (save_dir or "").strip()
     mirror = find_strain_json_under_dataset_dir(bd) or find_strain_json_under_dataset_dir(sd)
     if mirror:
-        return _copy_s3_fields(
-            paths,
-            StrainDashboardPaths(
-                local_json_path=mirror,
-                json_url="",
-                surrogate_json_path=paths.surrogate_json_path,
-                surrogate_json_url=paths.surrogate_json_url,
-                next_x_json_path=paths.next_x_json_path,
-                next_x_json_url=paths.next_x_json_url,
-            ),
-        )
-    if not doc:
-        return paths
-    link = resolve_strain_json_remote_link_from_dataset(doc)
-    if not link:
-        return paths
-    if link.lower().startswith("s3://"):
-        bucket, data_key = parse_s3_uri(link)
-        if bucket and data_key:
-            ep = str(doc.get("s3_endpoint_url") or "").strip()
-            reg = str(doc.get("s3_region_name") or "us-east-1").strip() or "us-east-1"
-            return _copy_s3_fields(
+        return _finalize_strain_paths(
+            _copy_s3_fields(
                 paths,
                 StrainDashboardPaths(
-                    local_json_path="",
+                    local_json_path=mirror,
                     json_url="",
                     surrogate_json_path=paths.surrogate_json_path,
                     surrogate_json_url=paths.surrogate_json_url,
                     next_x_json_path=paths.next_x_json_path,
                     next_x_json_url=paths.next_x_json_url,
-                    s3_bucket=bucket,
-                    s3_data_key=data_key,
-                    s3_endpoint_url=ep,
-                    s3_region=reg,
                 ),
             )
+        )
+    if not doc:
+        return _finalize_strain_paths(paths)
+    link = resolve_strain_json_remote_link_from_dataset(doc)
+    if not link:
+        return _finalize_strain_paths(paths)
+    if link.lower().startswith("s3://"):
+        bucket, data_key = parse_s3_uri(link)
+        if bucket and data_key:
+            ep = str(doc.get("s3_endpoint_url") or "").strip()
+            reg = str(doc.get("s3_region_name") or "us-east-1").strip() or "us-east-1"
+            return _finalize_strain_paths(
+                _copy_s3_fields(
+                    paths,
+                    StrainDashboardPaths(
+                        local_json_path="",
+                        json_url="",
+                        surrogate_json_path=paths.surrogate_json_path,
+                        surrogate_json_url=paths.surrogate_json_url,
+                        next_x_json_path=paths.next_x_json_path,
+                        next_x_json_url=paths.next_x_json_url,
+                        s3_bucket=bucket,
+                        s3_data_key=data_key,
+                        s3_endpoint_url=ep,
+                        s3_region=reg,
+                    ),
+                )
+            )
     if _looks_like_http_url(link):
-        return _copy_s3_fields(
+        return _finalize_strain_paths(
+            _copy_s3_fields(
+                paths,
+                StrainDashboardPaths(
+                    local_json_path="",
+                    json_url=link,
+                    surrogate_json_path=paths.surrogate_json_path,
+                    surrogate_json_url=paths.surrogate_json_url,
+                    next_x_json_path=paths.next_x_json_path,
+                    next_x_json_url=paths.next_x_json_url,
+                ),
+            )
+        )
+    if os.path.isfile(link):
+        return _finalize_strain_paths(
+            _copy_s3_fields(
+                paths,
+                StrainDashboardPaths(
+                    local_json_path=link,
+                    json_url="",
+                    surrogate_json_path=paths.surrogate_json_path,
+                    surrogate_json_url=paths.surrogate_json_url,
+                    next_x_json_path=paths.next_x_json_path,
+                    next_x_json_url=paths.next_x_json_url,
+                ),
+            )
+        )
+    # s3:// and other schemes: pass as URL for downstream loaders
+    return _finalize_strain_paths(
+        _copy_s3_fields(
             paths,
             StrainDashboardPaths(
                 local_json_path="",
@@ -1090,29 +1165,6 @@ def enrich_strain_paths_from_dataset_doc(
                 next_x_json_url=paths.next_x_json_url,
             ),
         )
-    if os.path.isfile(link):
-        return _copy_s3_fields(
-            paths,
-            StrainDashboardPaths(
-                local_json_path=link,
-                json_url="",
-                surrogate_json_path=paths.surrogate_json_path,
-                surrogate_json_url=paths.surrogate_json_url,
-                next_x_json_path=paths.next_x_json_path,
-                next_x_json_url=paths.next_x_json_url,
-            ),
-        )
-    # s3:// and other schemes: pass as URL for downstream loaders
-    return _copy_s3_fields(
-        paths,
-        StrainDashboardPaths(
-            local_json_path="",
-            json_url=link,
-            surrogate_json_path=paths.surrogate_json_path,
-            surrogate_json_url=paths.surrogate_json_url,
-            next_x_json_path=paths.next_x_json_path,
-            next_x_json_url=paths.next_x_json_url,
-        ),
     )
 
 
@@ -1733,8 +1785,11 @@ def load_nsdf_json_bundle(
             f"(LOCAL_DATA_DIR={local_dir!r})"
         )
 
-    load_paths = _strip_local_data_dir_paths(paths)
+    load_paths = promote_gateway_json_url_to_s3_paths(_strip_local_data_dir_paths(paths))
     if load_paths.has_s3_source():
+        load_paths.local_json_path = ""
+        load_paths.surrogate_json_path = ""
+        load_paths.next_x_json_path = ""
         return load_nsdf_json_bundle_from_s3(load_paths, mongo_s3_auth=mongo_s3_auth)
     data = load_strain_json(load_paths, mongo_s3_auth=mongo_s3_auth)
     surrogate, messages, effective = load_optional_surrogate_json(
