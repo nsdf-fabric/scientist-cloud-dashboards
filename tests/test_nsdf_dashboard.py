@@ -253,6 +253,17 @@ def test_surrogate_bounds_overrides_sparse_data_inference() -> None:
     assert surrogate_doc_defines_grid_size(surrogate) is True
 
 
+def test_surrogate_bounds_used_when_planned_grid_differs_from_sparse_points() -> None:
+    """Planned bounds (30x39) define the display canvas even when sparse points infer 19x19."""
+    data = {
+        "dataset_x": [[float(x), float(z)] for x in range(19) for z in range(19)],
+        "dataset_y": [float(x + z) for x in range(19) for z in range(19)],
+        "bounds": [[0, 30], [0, 39]],
+    }
+    surrogate = {"bounds": [[0, 30], [0, 39]], "surrogate": [0.0, 0.0]}
+    assert resolve_nsdf_grid_size(data, surrogate_doc=surrogate) == ((30, 39), "surrogate bounds")
+
+
 def test_legacy_surrogate_dim_array_still_resolves_grid_size() -> None:
     data = {
         "dataset_x": [[0.0, 0.0], [1.0, 1.0]],

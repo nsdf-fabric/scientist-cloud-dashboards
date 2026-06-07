@@ -3042,6 +3042,24 @@ def _maybe_flip_y(arr: np.ndarray, flip: bool) -> np.ndarray:
     return np.flipud(arr) if flip else arr
 
 
+def _proportional_frame_size(
+    nx: int,
+    ny: int,
+    *,
+    base: int = 320,
+) -> Tuple[int, int]:
+    """Data-frame width/height preserving nx:ny aspect (longest axis = base pixels)."""
+    if nx <= 0 or ny <= 0:
+        return base, base
+    if nx >= ny:
+        frame_width = base
+        frame_height = max(120, int(round(base * ny / nx)))
+    else:
+        frame_height = base
+        frame_width = max(120, int(round(base * nx / ny)))
+    return frame_width, frame_height
+
+
 def make_strain_heatmap_figure(
     title: str,
     z: np.ndarray,
@@ -3082,15 +3100,23 @@ def make_strain_heatmap_figure(
                 hi = lo + 1e-12
         mapper = LinearColorMapper(palette=palette, low=lo, high=hi)
 
+    frame_w, frame_h = _proportional_frame_size(nx, ny)
+    # Reserve the same right margin on every panel so row layout does not squash aspect.
+    colorbar_margin = 72
+    needs_colorbar = show_colorbar and not discrete_mask
     p = figure(
         title=title,
         x_range=(0, nx),
         y_range=(0, ny),
-        width=380 if show_colorbar else 320,
-        height=320,
+        frame_width=frame_w,
+        frame_height=frame_h,
+        width=frame_w + colorbar_margin,
+        height=frame_h,
+        min_border_right=colorbar_margin,
         tools="pan,wheel_zoom,box_zoom,reset,save",
         match_aspect=True,
         aspect_scale=1,
+        sizing_mode="fixed",
     )
     p.xaxis.axis_label = cfg.x_axis_label
     p.yaxis.axis_label = cfg.y_axis_label
@@ -3098,7 +3124,7 @@ def make_strain_heatmap_figure(
     p.yaxis.ticker = FixedTicker(ticks=list(range(0, ny + 1, max(1, ny // 5))))
 
     p.image(image=[zd], x=0, y=0, dw=nx, dh=ny, color_mapper=mapper)
-    if show_colorbar and not discrete_mask:
+    if needs_colorbar:
         span = abs(hi - lo)
         if span >= 100 or max(abs(lo), abs(hi)) >= 1000:
             tick_format = "0.00e0"
