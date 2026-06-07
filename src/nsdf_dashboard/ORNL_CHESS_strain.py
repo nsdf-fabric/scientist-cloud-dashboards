@@ -157,6 +157,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (  # noqa: E402
     load_nsdf_json_bundle,
     promote_gateway_json_url_to_s3_paths,
     make_strain_triplet_figures,
+    make_strain_triplet_row,
     infer_nsdf_bounds_grid_size,
     format_nsdf_workflow_display,
     resolve_nsdf_workflow_id,
@@ -704,14 +705,14 @@ else:
             surrogate_info = validate_nsdf_surrogate_doc(loaded_bundle.surrogate)
             next_x_info = validate_nsdf_next_x_doc(loaded_bundle.next_x)
             active_workflow_id = resolve_nsdf_workflow_id(surrogate_info, next_x_info)
-            p0, p1, p2 = make_strain_triplet_figures(
+            triplet_row = make_strain_triplet_row(
                 grids,
                 plot_cfg,
                 row_subtitle="dataset_y",
                 next_x_info=next_x_info,
                 active_workflow_id=active_workflow_id,
             )
-            figures_column.children = [row(p0, p1, p2, sizing_mode="fixed")]
+            figures_column.children = [triplet_row]
             if grid_state.get("last_status") is not None:
                 resolved = _resolve_paths()
                 triplet_errors, triplet_warnings = collect_nsdf_triplet_load_issues(

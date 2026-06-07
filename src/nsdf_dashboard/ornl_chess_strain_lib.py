@@ -2843,7 +2843,6 @@ def _attach_point_legend_below(
             padding=6,
         )
         figure.add_layout(legend, "below")
-    figure.min_border_bottom = 40
 
 
 def _add_grid_point_overlay(
@@ -2978,8 +2977,82 @@ def _symmetric_rdbu_limits(
     return -abs_max, abs_max
 
 
-_STRAIN_COLORBAR_MARGIN = 72
-_STRAIN_FRAME_BASE = 320
+_STRAIN_COLORBAR_MARGIN = 75
+_STRAIN_FRAME_BASE = 360
+_STRAIN_MIN_BORDER_LEFT = 58
+_STRAIN_MIN_BORDER_TOP = 42
+_STRAIN_LEGEND_FOOTER_HEIGHT = 32
+_STRAIN_MIN_BORDER_BOTTOM = 36  # axis label only; legend footer is outside the figure
+
+
+def _strain_legend_footer_div(
+    legend_items: List[Tuple[str, Any]],
+    *,
+    width: int = 0,
+) -> Any:
+    """Fixed-height footer aligned under one triplet panel."""
+    from bokeh.models import Div
+
+    chips: List[str] = []
+    for label, _renderer in legend_items:
+        if label == "Sampled":
+            chips.append('<span style="color:#333;">&#9632; Sampled</span>')
+        elif label == "Proposed next scan":
+            chips.append('<span style="color:#ff6600;font-weight:600;">+ Proposed next scan</span>')
+        else:
+            chips.append(f"<span>{label}</span>")
+    html = "&nbsp;&nbsp;&nbsp;".join(chips)
+    return Div(
+        text=html,
+        width=width or None,
+        height=_STRAIN_LEGEND_FOOTER_HEIGHT,
+        sizing_mode="fixed",
+        styles={
+            "padding": "4px 0 0 0",
+            "margin": "0",
+            "border": "0",
+            "text-align": "center",
+            "font-size": "9pt",
+            "line-height": "1.4",
+            "overflow": "hidden",
+            "box-sizing": "border-box",
+        },
+    )
+
+
+@dataclass(frozen=True)
+class StrainFigureLayout:
+    frame_width: int
+    frame_height: int
+    outer_width: int
+    outer_height: int
+
+
+def _strain_figure_layout(nx: int, ny: int) -> StrainFigureLayout:
+    """Pixel layout shared by all triplet panels (frame + chrome + colorbar gutter)."""
+    frame_w, frame_h = _proportional_frame_size(nx, ny, base=_STRAIN_FRAME_BASE)
+    outer_w = frame_w + _STRAIN_MIN_BORDER_LEFT + _STRAIN_COLORBAR_MARGIN
+    outer_h = frame_h + _STRAIN_MIN_BORDER_TOP + _STRAIN_MIN_BORDER_BOTTOM
+    return StrainFigureLayout(
+        frame_width=frame_w,
+        frame_height=frame_h,
+        outer_width=outer_w,
+        outer_height=outer_h,
+    )
+
+
+def _lock_strain_figure_layout(figure: Any, layout: StrainFigureLayout) -> None:
+    """Force identical outer/frame dimensions after glyphs, color bars, and legends."""
+    figure.frame_width = layout.frame_width
+    figure.frame_height = layout.frame_height
+    figure.width = layout.outer_width
+    figure.height = layout.outer_height
+    figure.min_border_left = _STRAIN_MIN_BORDER_LEFT
+    figure.min_border_right = _STRAIN_COLORBAR_MARGIN
+    figure.min_border_top = _STRAIN_MIN_BORDER_TOP
+    figure.min_border_bottom = _STRAIN_MIN_BORDER_BOTTOM
+    figure.sizing_mode = "fixed"
+    figure.toolbar_location = "above"
 
 
 def _strain_plot_figure(
@@ -2987,22 +3060,28 @@ def _strain_plot_figure(
     nx: int,
     ny: int,
     cfg: StrainFieldPlotConfig,
+    *,
+    layout: Optional[StrainFigureLayout] = None,
 ) -> Any:
     """Shared Bokeh figure: equal lab-unit aspect, fixed frame, colorbar gutter."""
     from bokeh.models import FixedTicker
     from bokeh.plotting import figure
 
-    frame_w, frame_h = _proportional_frame_size(nx, ny, base=_STRAIN_FRAME_BASE)
+    panel_layout = layout or _strain_figure_layout(nx, ny)
     p = figure(
         title=title,
         x_range=(0, nx),
         y_range=(0, ny),
-        frame_width=frame_w,
-        frame_height=frame_h,
-        width=frame_w + _STRAIN_COLORBAR_MARGIN,
-        height=frame_h,
+        frame_width=panel_layout.frame_width,
+        frame_height=panel_layout.frame_height,
+        width=panel_layout.outer_width,
+        height=panel_layout.outer_height,
+        min_border_left=_STRAIN_MIN_BORDER_LEFT,
         min_border_right=_STRAIN_COLORBAR_MARGIN,
+        min_border_top=_STRAIN_MIN_BORDER_TOP,
+        min_border_bottom=_STRAIN_MIN_BORDER_BOTTOM,
         tools="pan,wheel_zoom,box_zoom,reset,save",
+        toolbar_location="above",
         match_aspect=True,
         aspect_scale=1,
         sizing_mode="fixed",
@@ -3014,6 +3093,28 @@ def _strain_plot_figure(
     p.xaxis.ticker = FixedTicker(ticks=list(range(0, nx + 1, max(1, nx // 5))))
     p.yaxis.ticker = FixedTicker(ticks=list(range(0, ny + 1, max(1, ny // 5))))
     return p
+
+
+def _add_strain_white_grid_image(
+    figure: Any,
+    nx: int,
+    ny: int,
+    cfg: StrainFieldPlotConfig,
+) -> None:
+    """Full-grid image layer so scatter panels share heatmap sizing/aspect behavior."""
+    from bokeh.models import LinearColorMapper
+
+    zd = _maybe_flip_y(np.ones((ny, nx), dtype=np.float64), cfg.flip_y_for_display)
+    mapper = LinearColorMapper(palette=["#ffffff", "#ffffff"], low=0.0, high=1.0)
+    figure.image(
+        image=[zd],
+        x=0,
+        y=0,
+        dw=nx,
+        dh=ny,
+        color_mapper=mapper,
+        level="image",
+    )
 
 
 def _attach_heatmap_colorbar(
@@ -3438,6 +3539,7 @@ def make_strain_heatmap_figure(
     palette_name: str = "Viridis256",
     low_high: Optional[Tuple[float, float]] = None,
     show_colorbar: bool = False,
+    layout: Optional[StrainFigureLayout] = None,
 ):
     from bokeh.models import LinearColorMapper
 
@@ -3455,10 +3557,12 @@ def make_strain_heatmap_figure(
             hi = lo + 1e-12
     mapper = LinearColorMapper(palette=palette, low=lo, high=hi)
 
-    p = _strain_plot_figure(title, nx, ny, cfg)
+    p = _strain_plot_figure(title, nx, ny, cfg, layout=layout)
     p.image(image=[zd], x=0, y=0, dw=nx, dh=ny, color_mapper=mapper)
     if show_colorbar:
         _attach_heatmap_colorbar(p, mapper, lo, hi)
+    if layout is not None:
+        _lock_strain_figure_layout(p, layout)
     return p
 
 
@@ -3472,10 +3576,12 @@ def make_strain_measurement_figure(
     mapper: Any,
     lo: float,
     hi: float,
+    layout: Optional[StrainFigureLayout] = None,
 ) -> Tuple[Any, Optional[Any]]:
     """White canvas with square markers colored by dataset_y (RdBu) and matching colorbar."""
     nx, ny = cfg.grid_size
-    p = _strain_plot_figure(title, nx, ny, cfg)
+    p = _strain_plot_figure(title, nx, ny, cfg, layout=layout)
+    _add_strain_white_grid_image(p, nx, ny, cfg)
     renderer = _add_colored_square_overlay(
         p,
         gx,
@@ -3487,17 +3593,19 @@ def make_strain_measurement_figure(
         mapper,
     )
     _attach_heatmap_colorbar(p, mapper, lo, hi)
+    if layout is not None:
+        _lock_strain_figure_layout(p, layout)
     return p, renderer
 
 
-def make_strain_triplet_figures(
+def _build_strain_triplet_figures(
     grids: StrainFieldGrids,
     cfg: StrainFieldPlotConfig,
     *,
     row_subtitle: str = "",
     next_x_info: Optional[NSDFNextXData] = None,
     active_workflow_id: Optional[str] = None,
-):
+) -> Tuple[Any, Any, Any, List[Tuple[str, Any]]]:
     from bokeh.models import LinearColorMapper
 
     sub = f" — {row_subtitle}" if row_subtitle else ""
@@ -3520,6 +3628,7 @@ def make_strain_triplet_figures(
     rdbu_palette = _resolve_bokeh_palette(cfg.colormap_estimate)
     rdbu_lo, rdbu_hi = _symmetric_rdbu_limits(est, measured_vals)
     rdbu_mapper = LinearColorMapper(palette=rdbu_palette, low=rdbu_lo, high=rdbu_hi)
+    panel_layout = _strain_figure_layout(nx, ny)
 
     if measured_gx.size:
         p0, sampled_renderer = make_strain_measurement_figure(
@@ -3531,10 +3640,13 @@ def make_strain_triplet_figures(
             mapper=rdbu_mapper,
             lo=rdbu_lo,
             hi=rdbu_hi,
+            layout=panel_layout,
         )
     else:
-        p0 = _strain_plot_figure(f"{cfg.title_measurements}{sub}", nx, ny, cfg)
+        p0 = _strain_plot_figure(f"{cfg.title_measurements}{sub}", nx, ny, cfg, layout=panel_layout)
+        _add_strain_white_grid_image(p0, nx, ny, cfg)
         _attach_heatmap_colorbar(p0, rdbu_mapper, rdbu_lo, rdbu_hi)
+        _lock_strain_figure_layout(p0, panel_layout)
         sampled_renderer = None
 
     point_legend_items: List[Tuple[str, Any]] = []
@@ -3565,8 +3677,6 @@ def make_strain_triplet_figures(
             )
             if proposed_renderer is not None:
                 point_legend_items.append(("Proposed next scan", proposed_renderer))
-    _attach_point_legend_below(p0, point_legend_items)
-
     p1 = make_strain_heatmap_figure(
         f"{cfg.title_estimate}{sub}",
         grids.estimate,
@@ -3574,6 +3684,7 @@ def make_strain_triplet_figures(
         palette_name=cfg.colormap_estimate,
         low_high=(rdbu_lo, rdbu_hi),
         show_colorbar=True,
+        layout=panel_layout,
     )
     var = grids.variance
     vf = var[np.isfinite(var)]
@@ -3588,5 +3699,76 @@ def make_strain_triplet_figures(
         palette_name=cfg.colormap_variance,
         low_high=(vlo, vhi),
         show_colorbar=True,
+        layout=panel_layout,
+    )
+    _lock_strain_figure_layout(p0, panel_layout)
+    _lock_strain_figure_layout(p1, panel_layout)
+    _lock_strain_figure_layout(p2, panel_layout)
+    return p0, p1, p2, point_legend_items
+
+
+def make_strain_triplet_figures(
+    grids: StrainFieldGrids,
+    cfg: StrainFieldPlotConfig,
+    *,
+    row_subtitle: str = "",
+    next_x_info: Optional[NSDFNextXData] = None,
+    active_workflow_id: Optional[str] = None,
+) -> Tuple[Any, Any, Any]:
+    p0, p1, p2, _legend_items = _build_strain_triplet_figures(
+        grids,
+        cfg,
+        row_subtitle=row_subtitle,
+        next_x_info=next_x_info,
+        active_workflow_id=active_workflow_id,
     )
     return p0, p1, p2
+
+
+def make_strain_triplet_row(
+    grids: StrainFieldGrids,
+    cfg: StrainFieldPlotConfig,
+    *,
+    row_subtitle: str = "",
+    next_x_info: Optional[NSDFNextXData] = None,
+    active_workflow_id: Optional[str] = None,
+) -> Any:
+    """Three equal figures on one row; legend/spacers on a second row (no height compression)."""
+    from bokeh.layouts import column, row
+
+    p0, p1, p2, legend_items = _build_strain_triplet_figures(
+        grids,
+        cfg,
+        row_subtitle=row_subtitle,
+        next_x_info=next_x_info,
+        active_workflow_id=active_workflow_id,
+    )
+    panel_w = int(p0.width or 0)
+    panel_h = int(p0.height or 0)
+    footer_plot1 = _strain_legend_footer_div(legend_items, width=panel_w)
+    footer_spacer = _strain_legend_footer_div([], width=panel_w)
+
+    plot_row = row(
+        p0,
+        p1,
+        p2,
+        sizing_mode="fixed",
+        width=panel_w * 3 if panel_w else None,
+        height=panel_h or None,
+    )
+    footer_row = row(
+        footer_plot1,
+        footer_spacer,
+        footer_spacer,
+        sizing_mode="fixed",
+        width=panel_w * 3 if panel_w else None,
+        height=_STRAIN_LEGEND_FOOTER_HEIGHT,
+    )
+    total_h = (panel_h or 0) + _STRAIN_LEGEND_FOOTER_HEIGHT
+    return column(
+        plot_row,
+        footer_row,
+        sizing_mode="fixed",
+        width=panel_w * 3 if panel_w else None,
+        height=total_h or None,
+    )
