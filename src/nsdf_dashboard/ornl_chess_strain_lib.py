@@ -2233,14 +2233,17 @@ def make_strain_heatmap_figure(
     palette_name: str = "Viridis256",
     discrete_mask: bool = False,
     low_high: Optional[Tuple[float, float]] = None,
+    show_colorbar: bool = False,
 ):
-    from bokeh.models import FixedTicker, LinearColorMapper
+    from bokeh.models import BasicTicker, ColorBar, FixedTicker, LinearColorMapper, NumeralTickFormatter
     from bokeh.palettes import Viridis256
     from bokeh.plotting import figure
 
     nx, ny = cfg.grid_size
     zd = _maybe_flip_y(np.asarray(z, dtype=np.float64), cfg.flip_y_for_display)
 
+    lo = 0.0
+    hi = 1.0
     if discrete_mask:
         lo_c, hi_c = cfg.colormap_mask
         palette = [lo_c, hi_c]
@@ -2266,7 +2269,7 @@ def make_strain_heatmap_figure(
         title=title,
         x_range=(0, nx),
         y_range=(0, ny),
-        width=320,
+        width=380 if show_colorbar else 320,
         height=320,
         tools="pan,wheel_zoom,box_zoom,reset,save",
         match_aspect=True,
@@ -2278,6 +2281,25 @@ def make_strain_heatmap_figure(
     p.yaxis.ticker = FixedTicker(ticks=list(range(0, ny + 1, max(1, ny // 5))))
 
     p.image(image=[zd], x=0, y=0, dw=nx, dh=ny, color_mapper=mapper)
+    if show_colorbar and not discrete_mask:
+        span = abs(hi - lo)
+        if span >= 100 or max(abs(lo), abs(hi)) >= 1000:
+            tick_format = "0.00e0"
+        elif span >= 1:
+            tick_format = "0.00"
+        elif span >= 0.01:
+            tick_format = "0.0000"
+        else:
+            tick_format = "0.00e0"
+        color_bar = ColorBar(
+            color_mapper=mapper,
+            ticker=BasicTicker(),
+            formatter=NumeralTickFormatter(format=tick_format),
+            label_standoff=8,
+            border_line_color=None,
+            location=(0, 0),
+        )
+        p.add_layout(color_bar, "right")
     return p
 
 
@@ -2309,6 +2331,7 @@ def make_strain_triplet_figures(
         cfg,
         palette_name=cfg.colormap_estimate,
         low_high=(lo, hi),
+        show_colorbar=True,
     )
     var = grids.variance
     vf = var[np.isfinite(var)]
@@ -2322,5 +2345,6 @@ def make_strain_triplet_figures(
         cfg,
         palette_name=cfg.colormap_variance,
         low_high=(vlo, vhi),
+        show_colorbar=True,
     )
     return p0, p1, p2
