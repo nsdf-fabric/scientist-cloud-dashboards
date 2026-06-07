@@ -805,6 +805,7 @@ class _FakeS3Client:
     def __init__(self):
         self.keys_requested: list[str] = []
         self.listed_suffixes: list[str] = []
+        self.listed_next_x_suffixes: list[str] | None = None
 
     def get_object(self, Bucket: str, Key: str) -> dict:  # noqa: N803
         self.keys_requested.append(Key)
@@ -820,9 +821,25 @@ class _FakeS3Client:
 
     def list_objects_v2(self, **kwargs) -> dict:  # noqa: N803
         contents = []
+        seen: set[str] = set()
         for suffix in self.listed_suffixes:
-            contents.append({"Key": f"prefix/data_{suffix}.json"})
-            contents.append({"Key": f"prefix/surrogate_{suffix}.json"})
+            for key in (
+                f"prefix/data_{suffix}.json",
+                f"prefix/surrogate_{suffix}.json",
+            ):
+                if key not in seen:
+                    seen.add(key)
+                    contents.append({"Key": key})
+        nx_suffixes = (
+            self.listed_next_x_suffixes
+            if self.listed_next_x_suffixes is not None
+            else self.listed_suffixes
+        )
+        for suffix in nx_suffixes:
+            key = f"prefix/next_x_{suffix}.json"
+            if key not in seen:
+                seen.add(key)
+                contents.append({"Key": key})
         return {"Contents": contents, "IsTruncated": False}
 
 
@@ -891,6 +908,42 @@ def test_latest_without_surrogate_json_uses_timestamped_fallback() -> None:
             cfg.grid_size = resolve_nsdf_grid_size(bundle.data, surrogate_doc=bundle.surrogate)[0]
             grids = build_strain_field_grids(bundle.data, cfg, bundle.surrogate)
             assert grids.meta["estimate_source"] == "surrogate_grid"
+
+
+def test_latest_without_next_x_json_uses_timestamped_fallback_after_data() -> None:
+    with _local_files_first_for_testing():
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "data.json"), "w", encoding="utf-8") as fh:
+                json.dump(_base_data(), fh)
+            with open(os.path.join(tmp, "data_20260606T223505Z.json"), "w", encoding="utf-8") as fh:
+                json.dump(_base_data(), fh)
+            with open(os.path.join(tmp, "next_x_20260606T223508Z.json"), "w", encoding="utf-8") as fh:
+                json.dump(
+                    [{"workflow_id": "wf-after", "data": [[1.0, 1.0]]}],
+                    fh,
+                )
+            bundle = load_nsdf_json_bundle(StrainDashboardPaths(local_data_dir=tmp))
+            assert bundle.next_x is not None
+            assert bundle.next_x[0]["workflow_id"] == "wf-after"
+            assert bundle.paths.next_x_json_path.endswith("next_x_20260606T223508Z.json")
+
+
+def test_nsdf_suffixes_after_reference() -> None:
+    from nsdf_dashboard.ornl_chess_strain_lib import (
+        _nsdf_reference_data_suffix,
+        _nsdf_suffixes_after_reference,
+    )
+
+    assert _nsdf_reference_data_suffix("data_20260606T223505Z.json") == "20260606T223505Z"
+    assert _nsdf_reference_data_suffix(
+        "data.json",
+        data_suffixes=["20260606T223505Z", "20260606T215241Z"],
+    ) == "20260606T223505Z"
+    after = _nsdf_suffixes_after_reference(
+        ["20260606T223507Z", "20260606T223505Z", "20260606T223400Z"],
+        "20260606T223505Z",
+    )
+    assert after == ["20260606T223507Z"]
 
 
 def test_s3_surrogate_fallback_when_latest_triplet_missing() -> None:

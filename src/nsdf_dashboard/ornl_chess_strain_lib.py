@@ -771,6 +771,23 @@ def list_nsdf_surrogate_suffixes_from_directory(directory: str) -> List[str]:
     return sorted(set(suffixes), reverse=True)
 
 
+def list_nsdf_next_x_suffixes_from_directory(directory: str) -> List[str]:
+    """List timestamp suffixes from ``next_x_<suffix>.json`` files (newest first)."""
+    d = (directory or "").strip()
+    if not d or not os.path.isdir(d):
+        return []
+    suffixes: List[str] = []
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return []
+    for name in names:
+        parsed = parse_nsdf_next_x_filename(name)
+        if parsed:
+            suffixes.append(parsed)
+    return sorted(set(suffixes), reverse=True)
+
+
 def list_nsdf_version_suffixes_from_s3(
     paths: StrainDashboardPaths,
     *,
@@ -841,6 +858,50 @@ def parse_nsdf_surrogate_filename(name: str) -> Optional[str]:
     return middle or None
 
 
+def parse_nsdf_next_x_filename(name: str) -> Optional[str]:
+    """Parse ``next_x_<suffix>.json``; return suffix or ``None`` for ``next_x.json``."""
+    base = os.path.basename((name or "").strip())
+    if base == "next_x.json":
+        return None
+    if not (base.startswith("next_x_") and base.endswith(".json")):
+        return None
+    middle = base[len("next_x_") : -len(".json")]
+    return middle or None
+
+
+def _nsdf_reference_data_suffix(
+    data_name: str,
+    *,
+    data_suffixes: Optional[Sequence[str]] = None,
+) -> Optional[str]:
+    """
+    Timestamp floor for auxiliary fallbacks.
+
+    For ``data_<ts>.json`` returns ``ts``. For latest ``data.json`` uses the newest
+    ``data_<ts>.json`` suffix in the directory when present.
+    """
+    parsed = parse_nsdf_data_filename(os.path.basename((data_name or "").strip()))
+    if parsed:
+        return parsed
+    if data_suffixes:
+        ordered = sorted(set(data_suffixes), reverse=True)
+        if ordered:
+            return ordered[0]
+    return None
+
+
+def _nsdf_suffixes_after_reference(
+    suffixes: Sequence[str],
+    reference_suffix: Optional[str],
+) -> List[str]:
+    """Newest-first auxiliary suffixes strictly after ``reference_suffix``."""
+    ordered = sorted(set(suffixes), reverse=True)
+    if not reference_suffix:
+        return ordered
+    ref = reference_suffix.strip().upper()
+    return [suffix for suffix in ordered if suffix.strip().upper() > ref]
+
+
 def list_nsdf_surrogate_suffixes_from_s3(
     paths: StrainDashboardPaths,
     *,
@@ -888,6 +949,65 @@ def list_nsdf_surrogate_suffixes_from_s3(
             for obj in result.get("Contents") or []:
                 name = os.path.basename(str(obj.get("Key") or ""))
                 parsed = parse_nsdf_surrogate_filename(name)
+                if parsed:
+                    suffixes.append(parsed)
+            if not result.get("IsTruncated"):
+                break
+            continuation = result.get("NextContinuationToken")
+            if not continuation:
+                break
+    except Exception:
+        return []
+    return sorted(set(suffixes), reverse=True)
+
+
+def list_nsdf_next_x_suffixes_from_s3(
+    paths: StrainDashboardPaths,
+    *,
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """List timestamp suffixes from ``next_x_<suffix>.json`` under the S3 prefix."""
+    bucket = (paths.s3_bucket or "").strip()
+    data_key = (paths.s3_data_key or "").strip()
+    if not bucket and (paths.json_url or "").strip():
+        cfg = _parse_gateway_url_with_query_keys((paths.json_url or "").strip())
+        if cfg:
+            bucket = (cfg.get("bucket") or "").strip()
+            data_key = (cfg.get("key") or "").strip()
+    if not bucket:
+        return []
+
+    prefix = ""
+    if data_key:
+        if "/" in data_key:
+            prefix = data_key.rsplit("/", 1)[0] + "/"
+        elif parse_nsdf_data_filename(data_key) is None:
+            prefix = data_key.rstrip("/") + "/"
+
+    list_paths = StrainDashboardPaths(
+        s3_bucket=bucket,
+        s3_data_key=data_key or "data.json",
+        s3_endpoint_url=paths.s3_endpoint_url,
+        s3_region=paths.s3_region,
+        s3_env_file=paths.s3_env_file,
+        json_url=paths.json_url,
+    )
+    try:
+        client = _make_nsdf_s3_client(list_paths, mongo_s3_auth=mongo_s3_auth)
+    except Exception:
+        return []
+
+    suffixes: List[str] = []
+    continuation: Optional[str] = None
+    try:
+        while True:
+            params: Dict[str, Any] = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": 1000}
+            if continuation:
+                params["ContinuationToken"] = continuation
+            result = client.list_objects_v2(**params)
+            for obj in result.get("Contents") or []:
+                name = os.path.basename(str(obj.get("Key") or ""))
+                parsed = parse_nsdf_next_x_filename(name)
                 if parsed:
                     suffixes.append(parsed)
             if not result.get("IsTruncated"):
@@ -1530,7 +1650,17 @@ def load_optional_surrogate_json(
             candidates.append(("path", path, False))
             tried.add(path)
     if paths.json_url:
-        for suffix in _merged_snapshot_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth):
+        from urllib.parse import urlparse
+
+        data_name = (
+            os.path.basename(urlparse(paths.json_url).path or "")
+            if _looks_like_http_url(paths.json_url)
+            else ""
+        )
+        data_suffixes = list_nsdf_version_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth)
+        reference = _nsdf_reference_data_suffix(data_name, data_suffixes=data_suffixes)
+        sur_suffixes = list_nsdf_surrogate_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth)
+        for suffix in _nsdf_suffixes_after_reference(sur_suffixes, reference):
             _, sur_fn, _ = nsdf_triplet_basenames(suffix)
             sur_url = _replace_url_basename(paths.json_url, sur_fn)
             if sur_url not in tried:
@@ -1709,6 +1839,29 @@ def load_optional_next_x_json(
             if sib_url:
                 candidates.append(("url", sib_url, False))
 
+    tried = {value for _, value, _ in candidates}
+    for path in _iter_next_x_path_candidates(paths):
+        if path not in tried:
+            candidates.append(("path", path, False))
+            tried.add(path)
+    if paths.json_url:
+        from urllib.parse import urlparse
+
+        data_name = (
+            os.path.basename(urlparse(paths.json_url).path or "")
+            if _looks_like_http_url(paths.json_url)
+            else ""
+        )
+        data_suffixes = list_nsdf_version_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth)
+        reference = _nsdf_reference_data_suffix(data_name, data_suffixes=data_suffixes)
+        nx_suffixes = list_nsdf_next_x_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth)
+        for suffix in _nsdf_suffixes_after_reference(nx_suffixes, reference):
+            _, _, nx_fn = nsdf_triplet_basenames(suffix)
+            nx_url = _replace_url_basename(paths.json_url, nx_fn)
+            if nx_url not in tried:
+                candidates.append(("url", nx_url, False))
+                tried.add(nx_url)
+
     for kind, value, explicit in candidates:
         try:
             if kind == "path":
@@ -1871,7 +2024,11 @@ def _iter_surrogate_path_candidates(
     add((paths.surrogate_json_path or "").strip())
     add(_sibling_surrogate_path(data_path))
 
-    for listed_suffix in _merged_snapshot_suffixes_from_directory(directory):
+    data_basename = os.path.basename(data_path) if data_path else ""
+    data_suffixes = list_nsdf_version_suffixes_from_directory(directory)
+    reference = _nsdf_reference_data_suffix(data_basename, data_suffixes=data_suffixes)
+    sur_suffixes = list_nsdf_surrogate_suffixes_from_directory(directory)
+    for listed_suffix in _nsdf_suffixes_after_reference(sur_suffixes, reference):
         _, sur_fn, _ = nsdf_triplet_basenames(listed_suffix)
         if directory:
             add(os.path.join(directory, sur_fn))
@@ -1901,7 +2058,11 @@ def _iter_next_x_path_candidates(
     add((paths.next_x_json_path or "").strip())
     add(_sibling_next_x_path(data_path))
 
-    for listed_suffix in list_nsdf_version_suffixes_from_directory(directory):
+    data_basename = os.path.basename(data_path) if data_path else ""
+    data_suffixes = list_nsdf_version_suffixes_from_directory(directory)
+    reference = _nsdf_reference_data_suffix(data_basename, data_suffixes=data_suffixes)
+    nx_suffixes = list_nsdf_next_x_suffixes_from_directory(directory)
+    for listed_suffix in _nsdf_suffixes_after_reference(nx_suffixes, reference):
         _, _, nx_fn = nsdf_triplet_basenames(listed_suffix)
         if directory:
             add(os.path.join(directory, nx_fn))
@@ -1930,7 +2091,11 @@ def _iter_surrogate_s3_key_candidates(
     add((paths.s3_surrogate_key or "").strip())
     add(_sibling_surrogate_s3_key(data_key))
 
-    for listed_suffix in _merged_snapshot_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth):
+    data_basename = data_key.rsplit("/", 1)[-1] if data_key else ""
+    data_suffixes = list_nsdf_version_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth)
+    reference = _nsdf_reference_data_suffix(data_basename, data_suffixes=data_suffixes)
+    sur_suffixes = list_nsdf_surrogate_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth)
+    for listed_suffix in _nsdf_suffixes_after_reference(sur_suffixes, reference):
         _, sur_fn, _ = nsdf_triplet_basenames(listed_suffix)
         add(prefix + sur_fn)
     return candidates
@@ -1958,7 +2123,11 @@ def _iter_next_x_s3_key_candidates(
     add((paths.s3_next_x_key or "").strip())
     add(_sibling_next_x_s3_key(data_key))
 
-    for listed_suffix in list_nsdf_version_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth):
+    data_basename = data_key.rsplit("/", 1)[-1] if data_key else ""
+    data_suffixes = list_nsdf_version_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth)
+    reference = _nsdf_reference_data_suffix(data_basename, data_suffixes=data_suffixes)
+    nx_suffixes = list_nsdf_next_x_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth)
+    for listed_suffix in _nsdf_suffixes_after_reference(nx_suffixes, reference):
         _, _, nx_fn = nsdf_triplet_basenames(listed_suffix)
         add(prefix + nx_fn)
     return candidates
