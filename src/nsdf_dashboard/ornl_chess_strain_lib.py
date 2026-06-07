@@ -2981,7 +2981,43 @@ _STRAIN_COLORBAR_MARGIN = 75
 _STRAIN_FRAME_BASE = 360
 _STRAIN_MIN_BORDER_LEFT = 58
 _STRAIN_MIN_BORDER_TOP = 42
-_STRAIN_MIN_BORDER_BOTTOM = 48  # legend slot; reserved on every panel for equal height
+_STRAIN_LEGEND_FOOTER_HEIGHT = 32
+_STRAIN_MIN_BORDER_BOTTOM = 36  # axis label only; legend footer is outside the figure
+
+
+def _strain_legend_footer_div(
+    legend_items: List[Tuple[str, Any]],
+    *,
+    width: int = 0,
+) -> Any:
+    """Fixed-height footer aligned under one triplet panel."""
+    from bokeh.models import Div
+
+    chips: List[str] = []
+    for label, _renderer in legend_items:
+        if label == "Sampled":
+            chips.append('<span style="color:#333;">&#9632; Sampled</span>')
+        elif label == "Proposed next scan":
+            chips.append('<span style="color:#ff6600;font-weight:600;">+ Proposed next scan</span>')
+        else:
+            chips.append(f"<span>{label}</span>")
+    html = "&nbsp;&nbsp;&nbsp;".join(chips)
+    return Div(
+        text=html,
+        width=width or None,
+        height=_STRAIN_LEGEND_FOOTER_HEIGHT,
+        sizing_mode="fixed",
+        styles={
+            "padding": "4px 0 0 0",
+            "margin": "0",
+            "border": "0",
+            "text-align": "center",
+            "font-size": "9pt",
+            "line-height": "1.4",
+            "overflow": "hidden",
+            "box-sizing": "border-box",
+        },
+    )
 
 
 @dataclass(frozen=True)
@@ -3562,14 +3598,14 @@ def make_strain_measurement_figure(
     return p, renderer
 
 
-def make_strain_triplet_figures(
+def _build_strain_triplet_figures(
     grids: StrainFieldGrids,
     cfg: StrainFieldPlotConfig,
     *,
     row_subtitle: str = "",
     next_x_info: Optional[NSDFNextXData] = None,
     active_workflow_id: Optional[str] = None,
-):
+) -> Tuple[Any, Any, Any, List[Tuple[str, Any]]]:
     from bokeh.models import LinearColorMapper
 
     sub = f" — {row_subtitle}" if row_subtitle else ""
@@ -3665,8 +3701,74 @@ def make_strain_triplet_figures(
         show_colorbar=True,
         layout=panel_layout,
     )
-    _attach_point_legend_below(p0, point_legend_items)
     _lock_strain_figure_layout(p0, panel_layout)
     _lock_strain_figure_layout(p1, panel_layout)
     _lock_strain_figure_layout(p2, panel_layout)
+    return p0, p1, p2, point_legend_items
+
+
+def make_strain_triplet_figures(
+    grids: StrainFieldGrids,
+    cfg: StrainFieldPlotConfig,
+    *,
+    row_subtitle: str = "",
+    next_x_info: Optional[NSDFNextXData] = None,
+    active_workflow_id: Optional[str] = None,
+) -> Tuple[Any, Any, Any]:
+    p0, p1, p2, _legend_items = _build_strain_triplet_figures(
+        grids,
+        cfg,
+        row_subtitle=row_subtitle,
+        next_x_info=next_x_info,
+        active_workflow_id=active_workflow_id,
+    )
     return p0, p1, p2
+
+
+def make_strain_triplet_row(
+    grids: StrainFieldGrids,
+    cfg: StrainFieldPlotConfig,
+    *,
+    row_subtitle: str = "",
+    next_x_info: Optional[NSDFNextXData] = None,
+    active_workflow_id: Optional[str] = None,
+) -> Any:
+    """Three equal figures on one row; legend/spacers on a second row (no height compression)."""
+    from bokeh.layouts import column, row
+
+    p0, p1, p2, legend_items = _build_strain_triplet_figures(
+        grids,
+        cfg,
+        row_subtitle=row_subtitle,
+        next_x_info=next_x_info,
+        active_workflow_id=active_workflow_id,
+    )
+    panel_w = int(p0.width or 0)
+    panel_h = int(p0.height or 0)
+    footer_plot1 = _strain_legend_footer_div(legend_items, width=panel_w)
+    footer_spacer = _strain_legend_footer_div([], width=panel_w)
+
+    plot_row = row(
+        p0,
+        p1,
+        p2,
+        sizing_mode="fixed",
+        width=panel_w * 3 if panel_w else None,
+        height=panel_h or None,
+    )
+    footer_row = row(
+        footer_plot1,
+        footer_spacer,
+        footer_spacer,
+        sizing_mode="fixed",
+        width=panel_w * 3 if panel_w else None,
+        height=_STRAIN_LEGEND_FOOTER_HEIGHT,
+    )
+    total_h = (panel_h or 0) + _STRAIN_LEGEND_FOOTER_HEIGHT
+    return column(
+        plot_row,
+        footer_row,
+        sizing_mode="fixed",
+        width=panel_w * 3 if panel_w else None,
+        height=total_h or None,
+    )
