@@ -711,7 +711,18 @@ else:
                 next_x_info=next_x_info,
                 active_workflow_id=active_workflow_id,
             )
-            figures_column.children = [row(p0, p1, p2, sizing_mode="fixed")]
+            panel_w = int(p0.width or 0)
+            panel_h = int(p0.height or 0)
+            figures_column.children = [
+                row(
+                    p0,
+                    p1,
+                    p2,
+                    sizing_mode="fixed",
+                    width=panel_w * 3 if panel_w else None,
+                    height=panel_h or None,
+                )
+            ]
             if grid_state.get("last_status") is not None:
                 resolved = _resolve_paths()
                 triplet_errors, triplet_warnings = collect_nsdf_triplet_load_issues(
