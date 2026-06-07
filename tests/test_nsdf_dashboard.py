@@ -6,6 +6,7 @@ import math
 import json
 import os
 import tempfile
+from contextlib import contextmanager
 
 import numpy as np
 from fastapi import HTTPException
@@ -32,6 +33,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (
     load_simple_env_file,
     load_json_from_url,
     load_nsdf_json_bundle,
+    local_files_first_for_testing,
     make_strain_triplet_figures,
     normalize_nsdf_gateway_data_url,
     normalize_nsdf_remote_data_link,
@@ -456,7 +458,8 @@ def test_nsdf_version_suffix_triplet_and_apply() -> None:
     base = StrainDashboardPaths(
         local_data_dir="/tmp/chess-data",
     )
-    versioned = apply_nsdf_version_suffix(base, "20260606T223505Z")
+    with _local_files_first_for_testing():
+        versioned = apply_nsdf_version_suffix(base, "20260606T223505Z")
     assert versioned.local_json_path.endswith("data_20260606T223505Z.json")
     assert versioned.surrogate_json_path.endswith("surrogate_20260606T223505Z.json")
     assert versioned.next_x_json_path.endswith("next_x_20260606T223505Z.json")
@@ -479,7 +482,8 @@ def test_list_nsdf_version_suffixes_from_directory() -> None:
         open(os.path.join(tmp, "data_20260607T023932Z.json"), "w", encoding="utf-8").close()
         suffixes = list_nsdf_version_suffixes_from_directory(tmp)
         assert suffixes == ["20260607T023932Z", "20260606T215241Z"]
-        options = discover_nsdf_version_options(StrainDashboardPaths(local_data_dir=tmp))
+        with _local_files_first_for_testing():
+            options = discover_nsdf_version_options(StrainDashboardPaths(local_data_dir=tmp))
         assert options[0] == ("latest", "Latest (data.json)")
         assert ("20260607T023932Z", "20260607T023932Z") in options
 
@@ -574,6 +578,19 @@ def test_env_file_parser_and_s3_config_detection() -> None:
         os.environ.update(old_env)
 
 
+@contextmanager
+def _local_files_first_for_testing():
+    old = os.environ.get("LOCAL_FILES_FIRST_FOR_TESTING")
+    os.environ["LOCAL_FILES_FIRST_FOR_TESTING"] = "1"
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop("LOCAL_FILES_FIRST_FOR_TESTING", None)
+        else:
+            os.environ["LOCAL_FILES_FIRST_FOR_TESTING"] = old
+
+
 class _FakeBody:
     def __init__(self, payload: dict):
         self.payload = payload
@@ -634,37 +651,67 @@ def test_local_data_dir_takes_priority_over_s3() -> None:
     old_make_client = lib._make_nsdf_s3_client
     try:
         lib._make_nsdf_s3_client = lambda paths, mongo_s3_auth=None: fake_client
+        with _local_files_first_for_testing():
+            with tempfile.TemporaryDirectory() as tmp:
+                with open(os.path.join(tmp, "data.json"), "w", encoding="utf-8") as fh:
+                    json.dump(_base_data(), fh)
+                paths = StrainDashboardPaths(
+                    local_data_dir=tmp,
+                    s3_bucket="my-bucket",
+                    s3_data_key="prefix/data.json",
+                )
+                bundle = load_nsdf_json_bundle(paths)
+                assert bundle.data["dataset_y"] == [1.0, 2.0, 3.0]
+                assert bundle.surrogate is None
+                assert bundle.paths.local_json_path == os.path.join(tmp, "data.json")
+                assert bundle.paths.surrogate_json_path == ""
+                assert fake_client.keys_requested == []
+    finally:
+        lib._make_nsdf_s3_client = old_make_client
+
+
+def test_s3_preferred_when_local_data_dir_without_testing_flag() -> None:
+    fake_client = _FakeS3Client()
+    old_make_client = lib._make_nsdf_s3_client
+    old_flag = os.environ.pop("LOCAL_FILES_FIRST_FOR_TESTING", None)
+    try:
+        lib._make_nsdf_s3_client = lambda paths, mongo_s3_auth=None: fake_client
         with tempfile.TemporaryDirectory() as tmp:
             with open(os.path.join(tmp, "data.json"), "w", encoding="utf-8") as fh:
-                json.dump(_base_data(), fh)
+                json.dump({"dataset_y": [99.0]}, fh)
             paths = StrainDashboardPaths(
                 local_data_dir=tmp,
                 s3_bucket="my-bucket",
                 s3_data_key="prefix/data.json",
             )
+            assert not local_files_first_for_testing()
             bundle = load_nsdf_json_bundle(paths)
             assert bundle.data["dataset_y"] == [1.0, 2.0, 3.0]
-            assert bundle.surrogate is None
-            assert bundle.paths.local_json_path == os.path.join(tmp, "data.json")
-            assert bundle.paths.surrogate_json_path == ""
-            assert fake_client.keys_requested == []
+            assert fake_client.keys_requested == [
+                "prefix/data.json",
+                "prefix/surrogate.json",
+                "prefix/next_x.json",
+            ]
     finally:
         lib._make_nsdf_s3_client = old_make_client
+        if old_flag is not None:
+            os.environ["LOCAL_FILES_FIRST_FOR_TESTING"] = old_flag
 
 
 def test_local_data_dir_loads_local_surrogate() -> None:
-    with tempfile.TemporaryDirectory() as tmp:
-        data_path = os.path.join(tmp, "data.json")
-        surrogate_path = os.path.join(tmp, "surrogate.json")
-        with open(data_path, "w", encoding="utf-8") as fh:
-            json.dump(_base_data(), fh)
-        with open(surrogate_path, "w", encoding="utf-8") as fh:
-            json.dump({"surrogate": [10.0, 20.0, 30.0]}, fh)
-        bundle = load_nsdf_json_bundle(StrainDashboardPaths(local_data_dir=tmp))
-        assert bundle.data["dataset_y"] == [1.0, 2.0, 3.0]
-        assert bundle.surrogate == {"surrogate": [10.0, 20.0, 30.0]}
-        assert bundle.paths.local_json_path == data_path
-        assert bundle.paths.surrogate_json_path == surrogate_path
+    with _local_files_first_for_testing():
+        with tempfile.TemporaryDirectory() as tmp:
+            data_path = os.path.join(tmp, "data.json")
+            surrogate_path = os.path.join(tmp, "surrogate.json")
+            with open(data_path, "w", encoding="utf-8") as fh:
+                json.dump(_base_data(), fh)
+            with open(surrogate_path, "w", encoding="utf-8") as fh:
+                json.dump({"surrogate": [10.0, 20.0, 30.0]}, fh)
+            bundle = load_nsdf_json_bundle(StrainDashboardPaths(local_data_dir=tmp))
+            assert bundle.data["dataset_y"] == [1.0, 2.0, 3.0]
+            assert bundle.surrogate == {"surrogate": [10.0, 20.0, 30.0]}
+            assert bundle.paths.local_json_path == data_path
+            assert bundle.paths.surrogate_json_path == surrogate_path
 
 
 def test_missing_local_data_dir_does_not_fall_back_to_s3() -> None:
@@ -672,19 +719,20 @@ def test_missing_local_data_dir_does_not_fall_back_to_s3() -> None:
     old_make_client = lib._make_nsdf_s3_client
     try:
         lib._make_nsdf_s3_client = lambda paths, mongo_s3_auth=None: fake_client
-        with tempfile.TemporaryDirectory() as tmp:
-            paths = StrainDashboardPaths(
-                local_data_dir=tmp,
-                s3_bucket="my-bucket",
-                s3_data_key="prefix/data.json",
-            )
-            try:
-                load_nsdf_json_bundle(paths)
-            except FileNotFoundError as exc:
-                assert "Local NSDF file not found" in str(exc)
-            else:
-                raise AssertionError("expected missing local data.json to raise FileNotFoundError")
-            assert fake_client.keys_requested == []
+        with _local_files_first_for_testing():
+            with tempfile.TemporaryDirectory() as tmp:
+                paths = StrainDashboardPaths(
+                    local_data_dir=tmp,
+                    s3_bucket="my-bucket",
+                    s3_data_key="prefix/data.json",
+                )
+                try:
+                    load_nsdf_json_bundle(paths)
+                except FileNotFoundError as exc:
+                    assert "Local NSDF file not found" in str(exc)
+                else:
+                    raise AssertionError("expected missing local data.json to raise FileNotFoundError")
+                assert fake_client.keys_requested == []
     finally:
         lib._make_nsdf_s3_client = old_make_client
 
@@ -695,18 +743,19 @@ def test_local_snapshot_discovery_excludes_s3() -> None:
     old_make_client = lib._make_nsdf_s3_client
     try:
         lib._make_nsdf_s3_client = lambda paths, mongo_s3_auth=None: fake_client
-        with tempfile.TemporaryDirectory() as tmp:
-            open(os.path.join(tmp, "data.json"), "w", encoding="utf-8").close()
-            open(os.path.join(tmp, "data_20260606T215241Z.json"), "w", encoding="utf-8").close()
-            paths = StrainDashboardPaths(
-                local_data_dir=tmp,
-                s3_bucket="my-bucket",
-                s3_data_key="prefix/data.json",
-            )
-            options = discover_nsdf_version_options(paths)
-            values = [value for value, _label in options]
-            assert "20260606T215241Z" in values
-            assert "20990101T000000Z" not in values
+        with _local_files_first_for_testing():
+            with tempfile.TemporaryDirectory() as tmp:
+                open(os.path.join(tmp, "data.json"), "w", encoding="utf-8").close()
+                open(os.path.join(tmp, "data_20260606T215241Z.json"), "w", encoding="utf-8").close()
+                paths = StrainDashboardPaths(
+                    local_data_dir=tmp,
+                    s3_bucket="my-bucket",
+                    s3_data_key="prefix/data.json",
+                )
+                options = discover_nsdf_version_options(paths)
+                values = [value for value, _label in options]
+                assert "20260606T215241Z" in values
+                assert "20990101T000000Z" not in values
     finally:
         lib._make_nsdf_s3_client = old_make_client
 
@@ -830,6 +879,7 @@ def main() -> None:
         test_env_file_parser_and_s3_config_detection,
         test_s3_bundle_loads_and_infers_surrogate_key,
         test_local_data_dir_takes_priority_over_s3,
+        test_s3_preferred_when_local_data_dir_without_testing_flag,
         test_local_data_dir_loads_local_surrogate,
         test_missing_local_data_dir_does_not_fall_back_to_s3,
         test_local_snapshot_discovery_excludes_s3,

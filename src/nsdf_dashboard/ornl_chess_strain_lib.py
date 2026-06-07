@@ -107,6 +107,16 @@ def _find_optional_env_file() -> str:
     return ""
 
 
+def local_files_first_for_testing() -> bool:
+    """True when ``LOCAL_FILES_FIRST_FOR_TESTING`` enables ``LOCAL_DATA_DIR`` routing."""
+    raw = (os.environ.get("LOCAL_FILES_FIRST_FOR_TESTING") or "").strip()
+    if not raw:
+        env_file = os.environ.get("ORNL_S3_ENV_FILE", "").strip() or _find_optional_env_file()
+        if env_file:
+            raw = (load_simple_env_file(env_file).get("LOCAL_FILES_FIRST_FOR_TESTING") or "").strip()
+    return raw.lower() in ("1", "true", "yes")
+
+
 @dataclass
 class StrainDashboardPaths:
     """Where to load NSDF data and optional surrogate JSON."""
@@ -620,7 +630,7 @@ def apply_nsdf_version_suffix(
         version_suffix=suffix,
     )
 
-    if out.local_data_dir:
+    if out.local_data_dir and local_files_first_for_testing():
         base = out.local_data_dir.rstrip("/")
         out.local_json_path = os.path.join(base, data_fn)
         if suffix:
@@ -664,7 +674,7 @@ def nsdf_listing_directory(
 ) -> str:
     """Best-effort local directory for discovering timestamped NSDF JSON backups."""
     candidates: List[str] = []
-    if (paths.local_data_dir or "").strip():
+    if (paths.local_data_dir or "").strip() and local_files_first_for_testing():
         candidates.append((paths.local_data_dir or "").strip())
     loc = (paths.local_json_path or "").strip()
     if loc and not _looks_like_http_url(loc):
@@ -683,15 +693,51 @@ def nsdf_listing_directory(
     return ""
 
 
-def _local_data_dir_configured(paths: StrainDashboardPaths) -> bool:
-    """True when ``LOCAL_DATA_DIR`` is set — local runs must not touch S3."""
+def _local_data_dir_active(paths: StrainDashboardPaths) -> bool:
+    """True when ``LOCAL_DATA_DIR`` is the exclusive data source (testing mode)."""
     local_dir = (paths.local_data_dir or "").strip()
-    return bool(local_dir and os.path.isdir(local_dir))
+    return bool(local_dir and os.path.isdir(local_dir) and local_files_first_for_testing())
+
+
+def _strip_local_data_dir_paths(paths: StrainDashboardPaths) -> StrainDashboardPaths:
+    """Remove ``LOCAL_DATA_DIR`` routing unless testing mode is enabled."""
+    if local_files_first_for_testing():
+        return paths
+    local_dir = os.path.abspath((paths.local_data_dir or "").strip())
+    if not local_dir:
+        return paths
+
+    def under_local(p: str) -> bool:
+        p = (p or "").strip()
+        if not p or _looks_like_http_url(p):
+            return False
+        try:
+            return os.path.commonpath([local_dir, os.path.abspath(p)]) == local_dir
+        except ValueError:
+            return False
+
+    return StrainDashboardPaths(
+        local_json_path="" if under_local(paths.local_json_path) else paths.local_json_path,
+        json_url=paths.json_url,
+        surrogate_json_path="" if under_local(paths.surrogate_json_path) else paths.surrogate_json_path,
+        surrogate_json_url=paths.surrogate_json_url,
+        next_x_json_path="" if under_local(paths.next_x_json_path) else paths.next_x_json_path,
+        next_x_json_url=paths.next_x_json_url,
+        local_data_dir="",
+        s3_env_file=paths.s3_env_file,
+        s3_bucket=paths.s3_bucket,
+        s3_data_key=paths.s3_data_key,
+        s3_surrogate_key=paths.s3_surrogate_key,
+        s3_next_x_key=paths.s3_next_x_key,
+        s3_endpoint_url=paths.s3_endpoint_url,
+        s3_region=paths.s3_region,
+        version_suffix=paths.version_suffix,
+    )
 
 
 def _remote_snapshot_listing_enabled(paths: StrainDashboardPaths) -> bool:
     """True when snapshots should be discovered from S3 / gateway URL."""
-    if _local_data_dir_configured(paths):
+    if _local_data_dir_active(paths):
         return False
     if paths.has_s3_source():
         return True
@@ -786,8 +832,9 @@ def discover_nsdf_version_options(
 
     ``latest`` is always first; values are ISO-like suffixes such as ``20260606T223505Z``.
 
-    Local ``LOCAL_DATA_DIR`` runs list only that folder. S3 / gateway runs list only
-    the resolved remote prefix. The two sources are never merged.
+    With ``LOCAL_FILES_FIRST_FOR_TESTING=1``, ``LOCAL_DATA_DIR`` runs list only that
+    folder. Otherwise S3 / gateway runs list only the resolved remote prefix. The two
+    sources are never merged.
     """
     options: List[Tuple[str, str]] = [("latest", "Latest (data.json)")]
     seen: set[str] = set()
@@ -1551,7 +1598,7 @@ def load_nsdf_json_bundle(
     *,
     mongo_s3_auth: Optional[Dict[str, str]] = None,
 ) -> NSDFLoadedBundle:
-    if _local_data_dir_configured(paths):
+    if _local_data_dir_active(paths):
         local_bundle = load_nsdf_json_bundle_from_local_data_dir(paths)
         if local_bundle is not None:
             return local_bundle
@@ -1562,14 +1609,12 @@ def load_nsdf_json_bundle(
             f"(LOCAL_DATA_DIR={local_dir!r})"
         )
 
-    local_bundle = load_nsdf_json_bundle_from_local_data_dir(paths)
-    if local_bundle is not None:
-        return local_bundle
-    if paths.has_s3_source():
-        return load_nsdf_json_bundle_from_s3(paths, mongo_s3_auth=mongo_s3_auth)
-    data = load_strain_json(paths, mongo_s3_auth=mongo_s3_auth)
+    load_paths = _strip_local_data_dir_paths(paths)
+    if load_paths.has_s3_source():
+        return load_nsdf_json_bundle_from_s3(load_paths, mongo_s3_auth=mongo_s3_auth)
+    data = load_strain_json(load_paths, mongo_s3_auth=mongo_s3_auth)
     surrogate, messages, effective = load_optional_surrogate_json(
-        paths,
+        load_paths,
         mongo_s3_auth=mongo_s3_auth,
     )
     next_x, next_x_messages, effective = load_optional_next_x_json(
