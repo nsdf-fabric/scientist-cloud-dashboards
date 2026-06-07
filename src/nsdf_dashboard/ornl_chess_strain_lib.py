@@ -372,7 +372,7 @@ class NSDFMeasurementData:
 
 @dataclass
 class NSDFSurrogateData:
-    """Validated length-compatible optional surrogate arrays."""
+    """Validated optional surrogate model arrays and grid metadata."""
 
     surrogate: Optional[np.ndarray] = None
     uncertainty: Optional[np.ndarray] = None
@@ -1684,11 +1684,12 @@ def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def _numeric_1d_array_or_none(
+def _numeric_1d_surrogate_array_or_none(
     doc: Optional[Mapping[str, Any]],
     key: str,
     warnings: List[str],
 ) -> Optional[np.ndarray]:
+    """Parse a surrogate model 1D field (length independent of measurement count)."""
     if not doc or key not in doc:
         return None
     value = doc.get(key)
@@ -1703,6 +1704,104 @@ def _numeric_1d_array_or_none(
         warnings.append(f"Skipping surrogate field {key!r}: values must be finite.")
         return None
     return arr
+
+
+def _surrogate_source_grid_size(
+    length: int,
+    surrogate_info: NSDFSurrogateData,
+    surrogate_doc: Optional[Mapping[str, Any]],
+    display_size: Tuple[int, int],
+    warnings: List[str],
+) -> Optional[Tuple[int, int]]:
+    """Infer the model grid shape for a flattened surrogate field."""
+    if surrogate_info.dim:
+        nx, ny = surrogate_info.dim
+        if nx * ny == length:
+            return nx, ny
+        warnings.append(
+            f"Surrogate dim {nx} x {ny} ({nx * ny} cells) does not match field length {length}."
+        )
+    if isinstance(surrogate_doc, Mapping):
+        bounds_size = infer_nsdf_bounds_grid_size(surrogate_doc)
+        if bounds_size and bounds_size[0] * bounds_size[1] == length:
+            return bounds_size
+    display_nx, display_ny = display_size
+    if length == display_nx * display_ny:
+        return display_nx, display_ny
+    side = int(round(math.sqrt(length)))
+    if side > 0 and side * side == length:
+        return side, side
+    for ny in range(1, int(math.sqrt(length)) + 1):
+        if length % ny != 0:
+            continue
+        nx = length // ny
+        if nx >= ny:
+            return nx, ny
+    warnings.append(
+        f"Could not infer surrogate grid shape for field length {length}; "
+        "provide surrogate dim or bounds."
+    )
+    return None
+
+
+def _align_grid_to_display(
+    grid: np.ndarray,
+    target_nx: int,
+    target_ny: int,
+) -> np.ndarray:
+    """Resize a model grid onto the dashboard display grid."""
+    src_ny, src_nx = grid.shape
+    if src_nx == target_nx and src_ny == target_ny:
+        return grid
+    try:
+        from scipy import ndimage  # type: ignore
+
+        zoom_y = target_ny / float(src_ny)
+        zoom_x = target_nx / float(src_nx)
+        return ndimage.zoom(grid, (zoom_y, zoom_x), order=1)
+    except Exception:
+        y_idx = np.clip(
+            np.rint(np.linspace(0, src_ny - 1, target_ny)).astype(int),
+            0,
+            src_ny - 1,
+        )
+        x_idx = np.clip(
+            np.rint(np.linspace(0, src_nx - 1, target_nx)).astype(int),
+            0,
+            src_nx - 1,
+        )
+        return grid[np.ix_(y_idx, x_idx)]
+
+
+def _surrogate_field_to_display_grid(
+    values: Optional[np.ndarray],
+    *,
+    key: str,
+    surrogate_info: NSDFSurrogateData,
+    surrogate_doc: Optional[Mapping[str, Any]],
+    display_size: Tuple[int, int],
+    warnings: List[str],
+) -> Optional[np.ndarray]:
+    """Reshape a flattened surrogate model field and align it to the display grid."""
+    if values is None:
+        return None
+    length = int(values.shape[0])
+    source_size = _surrogate_source_grid_size(
+        length,
+        surrogate_info,
+        surrogate_doc,
+        display_size,
+        warnings,
+    )
+    if source_size is None:
+        warnings.append(f"Skipping surrogate field {key!r}: unable to map length {length} to a grid.")
+        return None
+    src_nx, src_ny = source_size
+    grid = values.reshape(src_ny, src_nx)
+    display_nx, display_ny = display_size
+    if (src_nx, src_ny) != (display_nx, display_ny):
+        grid = _align_grid_to_display(grid, display_nx, display_ny)
+    return grid
 
 
 def _validate_bounds(value: Any) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
@@ -1831,7 +1930,6 @@ def format_nsdf_workflow_display(
 
 def validate_nsdf_surrogate_doc(
     surrogate_doc: Optional[Mapping[str, Any]],
-    expected_len: int,
 ) -> NSDFSurrogateData:
     warnings: List[str] = []
     if surrogate_doc is None:
@@ -1848,9 +1946,9 @@ def validate_nsdf_surrogate_doc(
     bounds = _validate_bounds(surrogate_doc.get("bounds"))
     points = _parse_nsdf_points(surrogate_doc.get("points"))
     return NSDFSurrogateData(
-        surrogate=_numeric_1d_array_or_none(surrogate_doc, "surrogate", warnings),
-        uncertainty=_numeric_1d_array_or_none(surrogate_doc, "uncertainty", warnings),
-        raw_uncertainty=_numeric_1d_array_or_none(
+        surrogate=_numeric_1d_surrogate_array_or_none(surrogate_doc, "surrogate", warnings),
+        uncertainty=_numeric_1d_surrogate_array_or_none(surrogate_doc, "uncertainty", warnings),
+        raw_uncertainty=_numeric_1d_surrogate_array_or_none(
             surrogate_doc,
             "raw_uncertainty",
             warnings,
@@ -1868,7 +1966,7 @@ def list_nsdf_field_headers(
     surrogate_doc: Optional[Mapping[str, Any]] = None,
 ) -> List[str]:
     measurement = validate_nsdf_measurement_doc(data_doc)
-    surrogate = validate_nsdf_surrogate_doc(surrogate_doc, measurement.observed_values.shape[0])
+    surrogate = validate_nsdf_surrogate_doc(surrogate_doc)
     return surrogate.plottable_fields
 
 
@@ -2063,8 +2161,9 @@ def build_strain_field_grids(
     """Build measurement mask, estimate, and variance directly from native NSDF schema."""
     nx, ny = cfg.grid_size[0], cfg.grid_size[1]
     measurement = validate_nsdf_measurement_doc(doc)
-    surrogate = validate_nsdf_surrogate_doc(surrogate_doc, measurement.observed_values.shape[0])
+    surrogate = validate_nsdf_surrogate_doc(surrogate_doc)
     values = measurement.observed_values
+    display_size = (nx, ny)
     gx, gy = _norm_coordinates_to_grid(measurement.coordinates, nx, ny, measurement.bounds)
     mask = np.zeros((ny, nx), dtype=np.float64)
     for x, y in zip(gx, gy):
@@ -2083,17 +2182,32 @@ def build_strain_field_grids(
         "warnings": list(surrogate.warnings),
     }
 
-    if surrogate.surrogate is not None:
-        est = _idw_fill_grid(gx, gy, surrogate.surrogate, nx, ny)
-        meta["estimate_source"] = "surrogate"
+    est_grid = _surrogate_field_to_display_grid(
+        surrogate.surrogate,
+        key="surrogate",
+        surrogate_info=surrogate,
+        surrogate_doc=surrogate_doc,
+        display_size=display_size,
+        warnings=meta["warnings"],
+    )
+    if est_grid is not None:
+        est = est_grid
+        meta["estimate_source"] = "surrogate_grid"
     else:
         est = _idw_fill_grid(gx, gy, values, nx, ny)
         meta["estimate_source"] = "dataset_y_idw"
 
-    if surrogate.uncertainty is not None:
-        var_samples = np.square(np.maximum(surrogate.uncertainty, 0.0))
-        var = _idw_fill_grid(gx, gy, var_samples, nx, ny)
-        meta["variance_source"] = "uncertainty_squared"
+    var_grid = _surrogate_field_to_display_grid(
+        surrogate.uncertainty,
+        key="uncertainty",
+        surrogate_info=surrogate,
+        surrogate_doc=surrogate_doc,
+        display_size=display_size,
+        warnings=meta["warnings"],
+    )
+    if var_grid is not None:
+        var = np.square(np.maximum(var_grid, 0.0))
+        meta["variance_source"] = "uncertainty_squared_grid"
     else:
         scale = float(np.nanmean(np.abs(values)) or 1e-6) * 0.25
         var = _distance_weighted_variance_placeholder(mask, scale)

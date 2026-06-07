@@ -68,13 +68,14 @@ def test_valid_without_surrogate() -> None:
 def test_valid_with_matching_surrogate() -> None:
     cfg = StrainFieldPlotConfig(grid_size=(11, 11))
     surrogate = {
-        "surrogate": [10.0, 20.0, 30.0],
-        "uncertainty": [0.1, 0.2, 0.3],
-        "raw_uncertainty": [0.01, 0.02, 0.03],
+        "dim": [11, 11],
+        "surrogate": [float(i) for i in range(121)],
+        "uncertainty": [0.1 for _ in range(121)],
+        "raw_uncertainty": [0.01 for _ in range(121)],
     }
     grids = build_strain_field_grids(_base_data(), cfg, surrogate)
-    assert grids.meta["estimate_source"] == "surrogate"
-    assert grids.meta["variance_source"] == "uncertainty_squared"
+    assert grids.meta["estimate_source"] == "surrogate_grid"
+    assert grids.meta["variance_source"] == "uncertainty_squared_grid"
     assert list_nsdf_field_headers(_base_data(), surrogate) == [
         "dataset_y",
         "surrogate",
@@ -211,14 +212,13 @@ def test_surrogate_bounds_grid_size() -> None:
     }
     surrogate = {"bounds": [[0, 21], [0, 13]], "points": 273}
     assert resolve_nsdf_grid_size(data, surrogate_doc=surrogate) == ((21, 13), "surrogate bounds")
-    info = validate_nsdf_surrogate_doc(surrogate, expected_len=2)
+    info = validate_nsdf_surrogate_doc(surrogate)
     assert info.points == 273
 
 
 def test_surrogate_workflow_id_display() -> None:
     surrogate = validate_nsdf_surrogate_doc(
         {"workflow_id": "6a24964fbc355556959d697f", "surrogate": [1.0, 2.0]},
-        expected_len=2,
     )
     next_x = validate_nsdf_next_x_doc(
         [{"workflow_id": "other-id", "data": [[0.0, 0.0]]}],
@@ -234,6 +234,30 @@ def test_infer_grid_size_from_dim_formats() -> None:
     assert infer_grid_size_from_dim({"width": 21, "height": 13}) == (21, 13)
     assert infer_grid_size_from_dim({"nx": 21, "ny": 13}) == (21, 13)
     assert infer_grid_size_from_dim("invalid") is None
+
+
+def test_surrogate_model_grid_independent_of_measurement_count() -> None:
+    data = {
+        "dataset_x": [[float(x), float(z)] for z in range(3) for x in range(4)],
+        "dataset_y": [float(i) for i in range(12)],
+        "bounds": [[0, 4], [0, 3]],
+    }
+    surrogate = {
+        "workflow_id": "abc123",
+        "dim": [5, 5],
+        "surrogate": [float(i) for i in range(25)],
+        "uncertainty": [0.1 for _ in range(25)],
+    }
+    info = validate_nsdf_surrogate_doc(surrogate)
+    assert info.surrogate is not None
+    assert info.surrogate.shape[0] == 25
+    cfg = StrainFieldPlotConfig()
+    cfg.grid_size = resolve_nsdf_grid_size(data, surrogate_doc=surrogate)[0]
+    grids = build_strain_field_grids(data, cfg, surrogate)
+    assert cfg.grid_size == (5, 5)
+    assert grids.estimate.shape == (5, 5)
+    assert grids.meta["estimate_source"] == "surrogate_grid"
+    assert grids.meta["variance_source"] == "uncertainty_squared_grid"
 
 
 def test_local_surrogate_sibling_inference() -> None:

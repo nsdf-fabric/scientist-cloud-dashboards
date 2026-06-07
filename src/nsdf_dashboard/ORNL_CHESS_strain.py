@@ -402,10 +402,7 @@ else:
                 env_grid_size=env_grid_size,
                 manual_grid_size=grid_state["manual_grid_size"],
             )
-            surrogate_info = validate_nsdf_surrogate_doc(
-                bundle.surrogate,
-                measurement.observed_values.shape[0],
-            )
+            surrogate_info = validate_nsdf_surrogate_doc(bundle.surrogate)
             next_x_info = validate_nsdf_next_x_doc(bundle.next_x)
         except Exception as e:
             loaded_bundle = None

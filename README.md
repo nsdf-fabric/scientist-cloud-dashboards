@@ -42,14 +42,21 @@ Optional `surrogate.json`:
 ```json
 {
   "workflow_id": "test-workflow",
+  "dim": [24, 24],
+  "bounds": [[0, 24], [0, 24]],
+  "points": 576,
   "surrogate": [69.1, 69.2],
   "uncertainty": [0.1, 0.2],
   "raw_uncertainty": [0.01, 0.02]
 }
 ```
 
-`surrogate`, `uncertainty`, and `raw_uncertainty` are used only when they are numeric
-1D lists matching `len(dataset_y)`. Variance is visualized as `uncertainty ** 2`.
+`surrogate`, `uncertainty`, and `raw_uncertainty` are flattened model grids from the
+learning workflow. They are independent of the sparse measurement count in
+`data.json`. Provide `dim` (or `bounds`) in `surrogate.json` so the dashboard can
+reshape the model field onto the display grid. When the model grid differs from
+the display grid, values are resampled for visualization. Variance is shown as
+`uncertainty ** 2`.
 
 ## Data Sources
 
