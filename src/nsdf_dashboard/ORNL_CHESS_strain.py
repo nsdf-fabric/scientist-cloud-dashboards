@@ -8,10 +8,11 @@ remain aliases for NSDF ``data.json``.
 """
 from __future__ import annotations
 
+import html
 import os
 import sys
 import traceback
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from bokeh.io import curdoc
 from bokeh.layouts import column, row
@@ -145,6 +146,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (  # noqa: E402
     StrainFieldPlotConfig,
     apply_nsdf_version_suffix,
     build_strain_field_grids,
+    collect_nsdf_triplet_load_issues,
     discover_nsdf_version_options,
     enrich_strain_paths_from_dataset_doc,
     find_strain_json_under_dataset_dir,
@@ -352,6 +354,7 @@ else:
     grid_state["active_source"] = "environment" if env_grid_size else "dataset_x"
 
     status_div = Div(text="", sizing_mode="stretch_width", visible=False)
+    triplet_alert_div = Div(text="", sizing_mode="stretch_width", visible=False)
     _workflow_placeholder = (
         '<div style="font-family:monospace;font-size:14px;padding:6px 0;'
         'min-height:1.35em;line-height:1.35em;color:#888;">Workflow ID: —</div>'
@@ -400,11 +403,43 @@ else:
         finally:
             grid_state["updating_controls"] = False
 
+    def _set_triplet_alert(errors: List[str], warnings: List[str]) -> None:
+        if not errors and not warnings:
+            triplet_alert_div.visible = False
+            triplet_alert_div.text = ""
+            return
+        parts: List[str] = []
+        if errors:
+            parts.append(
+                '<div style="color:#a00;font-family:monospace;font-weight:bold;'
+                'margin:6px 0 4px 0;">NSDF triplet errors</div>'
+            )
+            parts.extend(
+                f'<div style="color:#a00;font-family:monospace;margin-left:8px;">'
+                f"• {html.escape(msg)}</div>"
+                for msg in errors
+            )
+        if warnings:
+            parts.append(
+                '<div style="color:#b8860b;font-family:monospace;font-weight:bold;'
+                'margin:8px 0 4px 0;">NSDF triplet warnings</div>'
+            )
+            parts.extend(
+                f'<div style="color:#b8860b;font-family:monospace;margin-left:8px;">'
+                f"• {html.escape(msg)}</div>"
+                for msg in warnings
+            )
+        triplet_alert_div.text = "".join(parts)
+        triplet_alert_div.visible = True
+
     def _set_loaded_status() -> None:
         last_status = grid_state["last_status"]
         if not last_status:
             return
         active_grid_size = plot_cfg.grid_size
+        triplet_errors = list(last_status.get("triplet_errors") or [])
+        triplet_warnings = list(last_status.get("triplet_warnings") or [])
+        _set_triplet_alert(triplet_errors, triplet_warnings)
         msg_parts = [
             f"Loaded NSDF measurement data: {last_status['measurement_count']} points.",
             f"Inferred grid size: {last_status['inferred_grid_size'][0]} x {last_status['inferred_grid_size'][1]}.",
@@ -427,7 +462,12 @@ else:
             msg_parts.insert(0, last_status["source_line"])
         msg_parts.extend(last_status["messages"])
         msg_parts.extend(last_status["warnings"])
-        set_status("\n".join(msg_parts), ok=True)
+        if triplet_errors:
+            msg_parts.insert(0, "See NSDF triplet errors above.")
+        set_status("\n".join(msg_parts), ok=not triplet_errors)
+        if triplet_errors or triplet_warnings:
+            status_div.visible = True
+            btn_toggle_status.label = "Hide status"
         workflow_line = last_status.get("workflow_line") or ""
         if workflow_line:
             workflow_div.text = (
@@ -615,6 +655,7 @@ else:
         version_label = "Latest (data.json)"
         if (p.version_suffix or "").strip():
             version_label = p.version_suffix
+        triplet_errors, triplet_warnings = collect_nsdf_triplet_load_issues(p, bundle)
         grid_state["last_status"] = {
             "measurement_count": measurement.observed_values.shape[0],
             "inferred_grid_size": inferred_grid_size,
@@ -628,8 +669,9 @@ else:
             "warnings": list(surrogate_info.warnings),
             "next_x_summary": next_x_summary,
             "next_x_warnings": list(next_x_info.warnings),
+            "triplet_errors": triplet_errors,
+            "triplet_warnings": triplet_warnings,
         }
-        _set_loaded_status()
 
     def apply_grid_size() -> None:
         plot_cfg.grid_size = _grid_size_from_controls()
@@ -653,9 +695,24 @@ else:
                 active_workflow_id=active_workflow_id,
             )
             figures_column.children = [row(p0, p1, p2, sizing_mode="scale_width")]
+            if grid_state.get("last_status") is not None:
+                resolved = _resolve_paths()
+                triplet_errors, triplet_warnings = collect_nsdf_triplet_load_issues(
+                    resolved,
+                    loaded_bundle,
+                    grid_meta=grids.meta,
+                )
+                grid_state["last_status"]["triplet_errors"] = triplet_errors
+                grid_state["last_status"]["triplet_warnings"] = triplet_warnings
+            _set_loaded_status()
         except Exception as e:
             figures_column.children = [Div(text=f"<pre>NSDF grid build failed: {e}</pre>")]
             traceback.print_exc()
+            if grid_state.get("last_status") is not None:
+                grid_state["last_status"]["triplet_errors"] = [
+                    f"Grid build failed: {e}",
+                ]
+                _set_loaded_status()
 
     def on_version_change(attr: str, old: Any, new: Any) -> None:
         if grid_state["updating_controls"]:
@@ -680,7 +737,6 @@ else:
         grid_state["active_source"] = "manual controls"
         plot_cfg.grid_size = manual_grid_size
         rebuild_figures()
-        _set_loaded_status()
 
     def on_reset_grid() -> None:
         grid_state["manual_grid_size"] = None
@@ -698,7 +754,6 @@ else:
         grid_state["active_source"] = active_grid_source
         _set_grid_controls(active_grid_size)
         rebuild_figures()
-        _set_loaded_status()
 
     def on_toggle_status() -> None:
         status_div.visible = not status_div.visible
@@ -731,7 +786,7 @@ else:
         header = create_header_banner("ORNL CHESS Strain", "ScientistCloud")
     else:
         header = create_header_banner("ORNL CHESS NSDF measurements", "DIAL Dashboard")
-    root = column(header, workflow_div, controls, figures_column, sizing_mode="stretch_width")
+    root = column(header, workflow_div, triplet_alert_div, controls, figures_column, sizing_mode="stretch_width")
     doc.add_root(root)
 
     if paths.local_data_dir or paths.has_s3_source() or paths.local_json_path or paths.json_url:
@@ -753,8 +808,9 @@ else:
             session_context: Any,
             token: int = _refresh_token,
             unregister: Callable[[int], None] = unregister_refresh_callback,
+            stop_playback: Callable[[], None] = _stop_playback,
         ) -> None:
-            _stop_playback()
+            stop_playback()
             unregister(token)
 
         doc.on_session_destroyed(_cleanup_refresh_callback)

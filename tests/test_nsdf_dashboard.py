@@ -14,10 +14,12 @@ from fastapi import HTTPException
 import nsdf_dashboard.ornl_chess_strain_lib as lib
 from nsdf_dashboard import refresh_api, refresh_bus
 from nsdf_dashboard.ornl_chess_strain_lib import (
+    NSDFLoadedBundle,
     StrainDashboardPaths,
     StrainFieldPlotConfig,
     apply_nsdf_version_suffix,
     build_strain_field_grids,
+    collect_nsdf_triplet_load_issues,
     discover_nsdf_version_options,
     enrich_strain_paths_from_dataset_doc,
     infer_nsdf_bounds_grid_size,
@@ -385,7 +387,7 @@ def test_local_surrogate_sibling_inference() -> None:
         with open(data_path, "w", encoding="utf-8") as fh:
             json.dump(_base_data(), fh)
         with open(surrogate_path, "w", encoding="utf-8") as fh:
-            json.dump({"surrogate": [10.0, 20.0, 30.0]}, fh)
+            json.dump({"surrogate": [10.0, 20.0, 30.0, 40.0]}, fh)
 
         bundle = load_nsdf_json_bundle(StrainDashboardPaths(local_json_path=data_path))
         assert bundle.surrogate is not None
@@ -504,6 +506,122 @@ def test_enrich_directory_link_resolves_s3_prefix_for_direct_read() -> None:
     assert paths.s3_bucket == "scientistcloud"
     assert paths.s3_data_key == "test-chess/data.json"
     assert paths.s3_endpoint_url == "https://us-east-1.gw.example.com"
+
+
+def test_collect_triplet_errors_for_stub_surrogate_and_fallback() -> None:
+    data = {
+        "dataset_x": [[0.0, 0.0], [10.0, 10.0], [5.0, 5.0]],
+        "dataset_y": [1.0, 2.0, 3.0],
+        "bounds": [[0.0, 10.0], [0.0, 10.0]],
+    }
+    paths = apply_nsdf_version_suffix(
+        StrainDashboardPaths(
+            s3_bucket="scientistcloud",
+            s3_data_key="chess-data/data.json",
+            version_suffix="",
+        ),
+        "",
+    )
+    loaded_paths = StrainDashboardPaths(
+        s3_bucket="scientistcloud",
+        s3_data_key="chess-data/data.json",
+        s3_surrogate_key="chess-data/surrogate_20260607T151041Z.json",
+        version_suffix="",
+    )
+    bundle = NSDFLoadedBundle(
+        data=data,
+        surrogate={"surrogate": [float(i) for i in range(25)]},
+        messages=[
+            "Loaded NSDF data JSON from s3://scientistcloud/chess-data/data.json",
+            "S3 surrogate JSON skipped (chess-data/surrogate.json): model grid too small for display (2 values for 10x10 grid).",
+            "Loaded surrogate JSON from s3://scientistcloud/chess-data/surrogate_20260607T151041Z.json",
+        ],
+        paths=loaded_paths,
+    )
+    errors, warnings = collect_nsdf_triplet_load_issues(paths, bundle)
+    assert any("surrogate.json" in err for err in errors)
+    assert any("fallback" in err for err in errors)
+
+
+def test_collect_triplet_warning_when_next_x_missing() -> None:
+    paths = apply_nsdf_version_suffix(
+        StrainDashboardPaths(s3_bucket="b", s3_data_key="prefix/data.json"),
+        "",
+    )
+    bundle = NSDFLoadedBundle(
+        data=_base_data(),
+        surrogate={"surrogate": [1.0, 2.0, 3.0, 4.0]},
+        messages=["Loaded NSDF data JSON from s3://b/prefix/data.json"],
+        paths=paths,
+    )
+    errors, warnings = collect_nsdf_triplet_load_issues(paths, bundle)
+    assert not errors
+    assert any("next_x.json" in warn for warn in warnings)
+
+
+def test_stub_surrogate_rejected_and_idw_estimate_used() -> None:
+    data = {
+        "dataset_x": [[0.0, 0.0], [10.0, 10.0], [5.0, 5.0]],
+        "dataset_y": [1.0, 2.0, 3.0],
+        "bounds": [[0.0, 10.0], [0.0, 10.0]],
+    }
+    stub_surrogate = {"surrogate": [0.0, 0.0], "uncertainty": [0.0, 0.0]}
+    cfg = StrainFieldPlotConfig()
+    cfg.grid_size = (10, 10)
+    grids = build_strain_field_grids(data, cfg, stub_surrogate)
+    assert grids.meta["estimate_source"] == "dataset_y_idw"
+    assert grids.meta["variance_source"] == "distance_placeholder"
+    import numpy as np
+    assert np.nanmax(grids.estimate) > 0.0
+
+
+def test_s3_skips_stub_surrogate_and_uses_richer_fallback() -> None:
+    class _StubThenRichClient(_FakeS3Client):
+        def get_object(self, Bucket: str, Key: str) -> dict:  # noqa: N803
+            self.keys_requested.append(Key)
+            if Key == "chess-data/data.json":
+                return {
+                    "Body": _FakeBody(
+                        {
+                            "dataset_x": [[0.0, 0.0], [10.0, 10.0], [5.0, 5.0]],
+                            "dataset_y": [1.0, 2.0, 3.0],
+                            "bounds": [[0.0, 10.0], [0.0, 10.0]],
+                        }
+                    )
+                }
+            if Key == "chess-data/surrogate.json":
+                return {"Body": _FakeBody({"surrogate": [0.0, 0.0], "uncertainty": [0.0, 0.0]})}
+            if Key == "chess-data/surrogate_20260607T151041Z.json":
+                return {
+                    "Body": _FakeBody(
+                        {
+                            "surrogate": [float(i) for i in range(25)],
+                            "uncertainty": [0.1 for _ in range(25)],
+                        }
+                    )
+                }
+            if Key == "chess-data/next_x.json":
+                return {"Body": _FakeBody([])}
+            raise AssertionError(f"unexpected key {Key}")
+
+    fake_client = _StubThenRichClient()
+    fake_client.listed_suffixes = ["20260607T151041Z"]
+    old_make_client = lib._make_nsdf_s3_client
+    try:
+        lib._make_nsdf_s3_client = lambda paths, mongo_s3_auth=None: fake_client
+        paths = apply_nsdf_version_suffix(
+            StrainDashboardPaths(
+                s3_bucket="scientistcloud",
+                s3_data_key="chess-data/data.json",
+            ),
+            "",
+        )
+        bundle = load_nsdf_json_bundle(paths)
+        assert bundle.surrogate is not None
+        assert len(bundle.surrogate["surrogate"]) == 25
+        assert "chess-data/surrogate_20260607T151041Z.json" in fake_client.keys_requested
+    finally:
+        lib._make_nsdf_s3_client = old_make_client
 
 
 def test_gateway_url_promotes_to_s3_for_latest_surrogate_fallback() -> None:
@@ -669,7 +787,7 @@ class _FakeS3Client:
         if Key == "prefix/data.json":
             return {"Body": _FakeBody(_base_data())}
         if Key == "prefix/surrogate.json":
-            return {"Body": _FakeBody({"surrogate": [10.0, 20.0, 30.0]})}
+            return {"Body": _FakeBody({"surrogate": [10.0, 20.0, 30.0, 40.0]})}
         if Key == "prefix/next_x.json":
             return {"Body": _FakeBody([])}
         raise AssertionError(f"unexpected key {Key}")
@@ -693,7 +811,7 @@ def test_s3_bundle_loads_and_infers_surrogate_key() -> None:
         )
         bundle = load_nsdf_json_bundle(paths)
         assert bundle.data["dataset_y"] == [1.0, 2.0, 3.0]
-        assert bundle.surrogate == {"surrogate": [10.0, 20.0, 30.0]}
+        assert bundle.surrogate == {"surrogate": [10.0, 20.0, 30.0, 40.0]}
         assert bundle.paths.s3_surrogate_key == "prefix/surrogate.json"
         assert fake_client.keys_requested == [
             "prefix/data.json",
@@ -851,10 +969,10 @@ def test_local_data_dir_loads_local_surrogate() -> None:
             with open(data_path, "w", encoding="utf-8") as fh:
                 json.dump(_base_data(), fh)
             with open(surrogate_path, "w", encoding="utf-8") as fh:
-                json.dump({"surrogate": [10.0, 20.0, 30.0]}, fh)
+                json.dump({"surrogate": [10.0, 20.0, 30.0, 40.0]}, fh)
             bundle = load_nsdf_json_bundle(StrainDashboardPaths(local_data_dir=tmp))
             assert bundle.data["dataset_y"] == [1.0, 2.0, 3.0]
-            assert bundle.surrogate == {"surrogate": [10.0, 20.0, 30.0]}
+            assert bundle.surrogate == {"surrogate": [10.0, 20.0, 30.0, 40.0]}
             assert bundle.paths.local_json_path == data_path
             assert bundle.paths.surrogate_json_path == surrogate_path
 
@@ -1020,6 +1138,10 @@ def main() -> None:
         test_nsdf_version_suffix_triplet_and_apply,
         test_list_nsdf_version_suffixes_from_directory,
         test_enrich_directory_link_resolves_s3_prefix_for_direct_read,
+        test_collect_triplet_errors_for_stub_surrogate_and_fallback,
+        test_collect_triplet_warning_when_next_x_missing,
+        test_stub_surrogate_rejected_and_idw_estimate_used,
+        test_s3_skips_stub_surrogate_and_uses_richer_fallback,
         test_gateway_url_promotes_to_s3_for_latest_surrogate_fallback,
         test_load_json_from_url_reads_prefix_via_data_json_key,
         test_env_file_parser_and_s3_config_detection,

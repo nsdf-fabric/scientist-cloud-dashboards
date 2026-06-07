@@ -1490,6 +1490,7 @@ def _sibling_surrogate_url(data_url: str) -> str:
 def load_optional_surrogate_json(
     paths: StrainDashboardPaths,
     *,
+    data_doc: Optional[Mapping[str, Any]] = None,
     mongo_s3_auth: Optional[Dict[str, str]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], List[str], StrainDashboardPaths]:
     """
@@ -1536,6 +1537,10 @@ def load_optional_surrogate_json(
                 candidates.append(("url", sur_url, False))
                 tried.add(sur_url)
 
+    display_size: Optional[Tuple[int, int]] = None
+    if isinstance(data_doc, Mapping):
+        display_size, _ = resolve_nsdf_grid_size(data_doc)
+
     for kind, value, explicit in candidates:
         try:
             if kind == "path":
@@ -1544,6 +1549,17 @@ def load_optional_surrogate_json(
             else:
                 doc = load_json_from_url(value, s3_auth_override=mongo_s3_auth)
                 effective.surrogate_json_url = value
+            if display_size is not None and not _surrogate_doc_is_usable_for_display(
+                doc,
+                display_size=display_size,
+            ):
+                length = len((doc or {}).get("surrogate") or [])
+                level = "Configured" if explicit else "Inferred"
+                messages.append(
+                    f"{level} surrogate JSON skipped ({value}): model grid too small "
+                    f"for display ({length} values for {display_size[0]}x{display_size[1]} grid)."
+                )
+                continue
             messages.append(f"Loaded surrogate JSON from {kind}: {value}")
             return doc, messages, effective
         except FileNotFoundError as exc:
@@ -1726,6 +1742,7 @@ def load_nsdf_json_bundle_from_local_data_dir(paths: StrainDashboardPaths) -> Op
         return None
 
     data = load_json_from_local_path(data_path)
+    display_size, _ = resolve_nsdf_grid_size(data)
     surrogate = None
     messages = [f"Loaded NSDF data JSON from local path: {data_path}"]
     effective = StrainDashboardPaths(
@@ -1742,7 +1759,19 @@ def load_nsdf_json_bundle_from_local_data_dir(paths: StrainDashboardPaths) -> Op
         if not os.path.isfile(surrogate_path):
             continue
         try:
-            surrogate = load_json_from_local_path(surrogate_path)
+            candidate_doc = load_json_from_local_path(surrogate_path)
+            if not _surrogate_doc_is_usable_for_display(
+                candidate_doc,
+                display_size=display_size,
+            ):
+                length = len((candidate_doc or {}).get("surrogate") or [])
+                messages.append(
+                    f"Local surrogate JSON skipped ({surrogate_path}): "
+                    f"model grid too small for display ({length} values for "
+                    f"{display_size[0]}x{display_size[1]} grid)."
+                )
+                continue
+            surrogate = candidate_doc
             effective.surrogate_json_path = surrogate_path
             messages.append(f"Loaded surrogate JSON from local path: {surrogate_path}")
             break
@@ -1794,6 +1823,7 @@ def load_nsdf_json_bundle(
     data = load_strain_json(load_paths, mongo_s3_auth=mongo_s3_auth)
     surrogate, messages, effective = load_optional_surrogate_json(
         load_paths,
+        data_doc=data,
         mongo_s3_auth=mongo_s3_auth,
     )
     next_x, next_x_messages, effective = load_optional_next_x_json(
@@ -2018,6 +2048,50 @@ def _s3_missing_error(exc: Exception) -> bool:
     return code in ("NoSuchKey", "NoSuchBucket", "404", "NotFound")
 
 
+def _surrogate_list_is_usable_for_display(
+    surrogate_values: Any,
+    *,
+    display_size: Tuple[int, int],
+) -> bool:
+    """Reject stub surrogate arrays (e.g. two zeros) that flatten estimate/variance heatmaps."""
+    if not isinstance(surrogate_values, list) or len(surrogate_values) < 4:
+        return False
+    for value in surrogate_values:
+        if not _is_number(value):
+            return False
+        if not math.isfinite(float(value)):
+            return False
+    if len(surrogate_values) <= 4 and all(float(value) == 0.0 for value in surrogate_values):
+        return False
+    length = len(surrogate_values)
+    display_nx, display_ny = display_size
+    if length == display_nx * display_ny:
+        return True
+    side = int(round(math.sqrt(length)))
+    if side >= 2 and side * side == length:
+        return True
+    for ny in range(2, int(math.sqrt(length)) + 1):
+        if length % ny != 0:
+            continue
+        nx = length // ny
+        if nx >= ny:
+            return True
+    return False
+
+
+def _surrogate_doc_is_usable_for_display(
+    doc: Optional[Mapping[str, Any]],
+    *,
+    display_size: Tuple[int, int],
+) -> bool:
+    if not isinstance(doc, Mapping):
+        return False
+    return _surrogate_list_is_usable_for_display(
+        doc.get("surrogate"),
+        display_size=display_size,
+    )
+
+
 def load_nsdf_json_bundle_from_s3(
     paths: StrainDashboardPaths,
     *,
@@ -2033,6 +2107,7 @@ def load_nsdf_json_bundle_from_s3(
     client = _make_nsdf_s3_client(paths, mongo_s3_auth=mongo_s3_auth)
     data = _load_json_from_s3_key(client, bucket, data_key)
     messages = [f"Loaded NSDF data JSON from s3://{bucket}/{data_key}"]
+    display_size, _ = resolve_nsdf_grid_size(data)
 
     surrogate = None
     surrogate_key = ""
@@ -2043,7 +2118,19 @@ def load_nsdf_json_bundle_from_s3(
     )
     for candidate_key in surrogate_candidates:
         try:
-            surrogate = _load_json_from_s3_key(client, bucket, candidate_key)
+            candidate_doc = _load_json_from_s3_key(client, bucket, candidate_key)
+            if not _surrogate_doc_is_usable_for_display(
+                candidate_doc,
+                display_size=display_size,
+            ):
+                length = len((candidate_doc or {}).get("surrogate") or [])
+                messages.append(
+                    f"S3 surrogate JSON skipped ({candidate_key}): "
+                    f"model grid too small for display ({length} values for "
+                    f"{display_size[0]}x{display_size[1]} grid)."
+                )
+                continue
+            surrogate = candidate_doc
             surrogate_key = candidate_key
             messages.append(f"Loaded surrogate JSON from s3://{bucket}/{candidate_key}")
             break
@@ -2093,6 +2180,143 @@ def load_nsdf_json_bundle_from_s3(
         )
 
     return NSDFLoadedBundle(data=data, surrogate=surrogate, next_x=next_x, messages=messages, paths=effective)
+
+
+def _location_basename(location: str) -> str:
+    loc = (location or "").strip()
+    if not loc:
+        return ""
+    if _looks_like_http_url(loc):
+        from urllib.parse import urlparse
+
+        path = (urlparse(loc).path or "").strip()
+        return os.path.basename(path) if path else loc
+    return os.path.basename(loc)
+
+
+def primary_nsdf_triplet_locations(paths: StrainDashboardPaths) -> Dict[str, str]:
+    """Expected primary ``data`` / ``surrogate`` / ``next_x`` paths for the active snapshot."""
+    data_fn, sur_fn, nx_fn = nsdf_triplet_basenames(paths.version_suffix or "")
+    loc: Dict[str, str] = {"data": "", "surrogate": "", "next_x": ""}
+
+    if paths.has_s3_source():
+        prefix = _nsdf_key_prefix(paths.s3_data_key)
+        loc["data"] = (paths.s3_data_key or "").strip()
+        loc["surrogate"] = prefix + sur_fn
+        loc["next_x"] = prefix + nx_fn
+        return loc
+
+    if (paths.local_data_dir or "").strip():
+        base = paths.local_data_dir.rstrip("/")
+        loc["data"] = os.path.join(base, data_fn)
+        loc["surrogate"] = os.path.join(base, sur_fn)
+        loc["next_x"] = os.path.join(base, nx_fn)
+        return loc
+
+    if (paths.local_json_path or "").strip() and not _looks_like_http_url(paths.local_json_path):
+        base = os.path.dirname(paths.local_json_path)
+        loc["data"] = os.path.join(base, data_fn)
+        loc["surrogate"] = os.path.join(base, sur_fn)
+        loc["next_x"] = os.path.join(base, nx_fn)
+        return loc
+
+    if (paths.json_url or "").strip():
+        loc["data"] = (paths.json_url or "").strip()
+        loc["surrogate"] = (paths.surrogate_json_url or "").strip() or _sibling_surrogate_url(
+            paths.json_url
+        )
+        loc["next_x"] = (paths.next_x_json_url or "").strip() or _sibling_next_x_url(paths.json_url)
+    return loc
+
+
+def _message_targets_location(message: str, location: str) -> bool:
+    msg = (message or "").strip()
+    loc = (location or "").strip()
+    if not msg or not loc:
+        return False
+    if loc in msg:
+        return True
+    base = _location_basename(loc)
+    return bool(base and base in msg)
+
+
+def collect_nsdf_triplet_load_issues(
+    paths: StrainDashboardPaths,
+    bundle: NSDFLoadedBundle,
+    *,
+    grid_meta: Optional[Mapping[str, Any]] = None,
+) -> Tuple[List[str], List[str]]:
+    """
+    Summarize problems with the primary ``data.json`` / ``surrogate.json`` / ``next_x.json`` triplet.
+
+    Returns ``(errors, warnings)``. Errors indicate the primary snapshot file is missing or unusable
+    (including when a fallback surrogate was used). Warnings cover optional ``next_x.json`` gaps.
+    """
+    errors: List[str] = []
+    warnings: List[str] = []
+    data_fn, sur_fn, nx_fn = nsdf_triplet_basenames(paths.version_suffix or "")
+    primary = primary_nsdf_triplet_locations(paths)
+    loaded_paths = bundle.paths
+
+    loaded_sur = (
+        (loaded_paths.s3_surrogate_key or "").strip()
+        or (loaded_paths.surrogate_json_path or "").strip()
+        or (loaded_paths.surrogate_json_url or "").strip()
+    )
+    loaded_nx = (
+        (loaded_paths.s3_next_x_key or "").strip()
+        or (loaded_paths.next_x_json_path or "").strip()
+        or (loaded_paths.next_x_json_url or "").strip()
+    )
+    primary_sur = (primary.get("surrogate") or "").strip()
+    primary_nx = (primary.get("next_x") or "").strip()
+
+    for msg in bundle.messages:
+        if _message_targets_location(msg, primary_sur) and any(
+            token in msg.lower() for token in ("skipped", "not found", "not loaded", "missing")
+        ):
+            detail = msg.split(":", 1)[-1].strip() if ":" in msg else msg
+            errors.append(f"{sur_fn}: {detail}")
+        elif _message_targets_location(msg, primary_nx) and any(
+            token in msg.lower() for token in ("skipped", "not found", "not loaded", "missing")
+        ):
+            detail = msg.split(":", 1)[-1].strip() if ":" in msg else msg
+            if "expected a json array" in msg.lower():
+                errors.append(f"{nx_fn}: {detail}")
+            else:
+                warnings.append(f"{nx_fn}: {detail}")
+
+    if bundle.surrogate is None:
+        if not any(sur_fn in item for item in errors):
+            errors.append(f"{sur_fn}: not loaded (missing or every fallback failed).")
+    elif primary_sur:
+        primary_base = _location_basename(primary_sur)
+        loaded_base = _location_basename(loaded_sur)
+        if primary_base and loaded_base and primary_base != loaded_base:
+            errors.append(
+                f"{sur_fn}: using fallback {loaded_base} (primary {primary_base} missing or invalid)."
+            )
+
+    if bundle.next_x is None and primary_nx:
+        if not any(nx_fn in item for item in errors + warnings):
+            warnings.append(f"{nx_fn}: not loaded (optional file missing).")
+
+    if isinstance(grid_meta, Mapping):
+        estimate_source = str(grid_meta.get("estimate_source") or "")
+        if estimate_source == "dataset_y_idw":
+            for note in grid_meta.get("warnings") or []:
+                if "Surrogate model grid was empty" in str(note):
+                    if not any(sur_fn in item for item in errors):
+                        errors.append(
+                            f"{sur_fn}: empty or stub model grid; "
+                            "estimate interpolated from measurements."
+                        )
+                    break
+
+    if not bundle.data:
+        errors.append(f"{data_fn}: not loaded.")
+
+    return errors, warnings
 
 
 # ---------------------------------------------------------------------------
@@ -2769,6 +2993,19 @@ def build_strain_field_grids(
     if est_grid is not None:
         est = est_grid
         meta["estimate_source"] = "surrogate_grid"
+        if values.shape[0] > 0:
+            finite_est = est[np.isfinite(est)]
+            if (
+                finite_est.size
+                and np.allclose(finite_est, 0.0)
+                and not np.allclose(values, 0.0)
+            ):
+                est = _idw_fill_grid(gx, gy, values, nx, ny)
+                meta["estimate_source"] = "dataset_y_idw"
+                meta["warnings"].append(
+                    "Surrogate model grid was empty; estimate uses inverse-distance "
+                    "interpolation from measurements."
+                )
     elif values.shape[0] > 0:
         est = _idw_fill_grid(gx, gy, values, nx, ny)
         meta["estimate_source"] = "dataset_y_idw"
@@ -2785,7 +3022,7 @@ def build_strain_field_grids(
         display_size=display_size,
         warnings=meta["warnings"],
     )
-    if var_grid is not None:
+    if var_grid is not None and meta["estimate_source"] != "dataset_y_idw":
         var = np.square(np.maximum(var_grid, 0.0))
         meta["variance_source"] = "uncertainty_squared_grid"
     else:
