@@ -31,6 +31,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (
     load_simple_env_file,
     load_json_from_url,
     load_nsdf_json_bundle,
+    make_strain_triplet_figures,
     normalize_nsdf_gateway_data_url,
     normalize_nsdf_remote_data_link,
     nsdf_triplet_basenames,
@@ -55,6 +56,39 @@ def _base_data() -> dict:
 
 def _assert_mask_at(mask: np.ndarray, x: int, y: int) -> None:
     assert mask[y, x] == 1.0, f"expected measurement mask at ({x}, {y})"
+
+
+def test_empty_measurement_doc_allows_pre_capture_view() -> None:
+    data = {
+        "dataset_x": [],
+        "dataset_y": [],
+        "bounds": [[0, 24], [0, 24]],
+    }
+    surrogate = {
+        "workflow_id": "wf-pre",
+        "dim": [5, 5],
+        "surrogate": [float(i) for i in range(25)],
+        "uncertainty": [0.1 for _ in range(25)],
+    }
+    next_x = [
+        {"workflow_id": "wf-pre", "data": [[12.0, 12.0], [18.0, 18.0]]},
+    ]
+    measurement = validate_nsdf_measurement_doc(data)
+    assert measurement.observed_values.shape == (0,)
+    assert resolve_nsdf_grid_size(data, surrogate_doc=surrogate) == ((5, 5), "surrogate dim")
+    cfg = StrainFieldPlotConfig()
+    cfg.grid_size = (5, 5)
+    grids = build_strain_field_grids(data, cfg, surrogate)
+    assert grids.meta["estimate_source"] == "surrogate_grid"
+    assert grids.meta["n_points"] == 0
+    info = validate_nsdf_next_x_doc(next_x)
+    p0, _, _ = make_strain_triplet_figures(
+        grids,
+        cfg,
+        next_x_info=info,
+        active_workflow_id="wf-pre",
+    )
+    assert p0 is not None
 
 
 def test_valid_without_surrogate() -> None:

@@ -1833,9 +1833,23 @@ def validate_nsdf_measurement_doc(doc: Mapping[str, Any]) -> NSDFMeasurementData
 
     dataset_x = doc.get("dataset_x")
     dataset_y = doc.get("dataset_y")
-    if not isinstance(dataset_x, list) or not dataset_x:
+    if not isinstance(dataset_x, list):
+        raise ValueError("'dataset_x' must be a list of coordinate pairs.")
+    if not isinstance(dataset_y, list):
+        raise ValueError("'dataset_y' must be a numeric 1D list.")
+    if len(dataset_x) == 0 and len(dataset_y) == 0:
+        bounds = _validate_bounds(doc.get("bounds"))
+        metadata = {k: v for k, v in doc.items() if k not in ("dataset_x", "dataset_y")}
+        return NSDFMeasurementData(
+            coordinates=np.zeros((0, 2), dtype=np.float64),
+            observed_values=np.zeros(0, dtype=np.float64),
+            bounds=bounds,
+            bounds_source="bounds" if bounds else "none",
+            metadata=metadata,
+        )
+    if not dataset_x:
         raise ValueError("'dataset_x' must be a non-empty list of coordinate pairs.")
-    if not isinstance(dataset_y, list) or not dataset_y:
+    if not dataset_y:
         raise ValueError("'dataset_y' must be a non-empty numeric 1D list.")
     if len(dataset_x) != len(dataset_y):
         raise ValueError(
@@ -2073,6 +2087,11 @@ def list_nsdf_field_headers(
 def infer_nsdf_grid_size(data_doc: Mapping[str, Any]) -> Tuple[int, int]:
     """Infer grid width/height from unique labx/labz coordinates in ``dataset_x``."""
     measurement = validate_nsdf_measurement_doc(data_doc)
+    if measurement.coordinates.shape[0] == 0:
+        bounds_size = infer_nsdf_bounds_grid_size(data_doc)
+        if bounds_size:
+            return bounds_size
+        return DEFAULT_GRID_SIZE
     unique_x = np.unique(measurement.coordinates[:, 0])
     unique_z = np.unique(measurement.coordinates[:, 1])
     nx = int(unique_x.shape[0])
@@ -2296,9 +2315,13 @@ def build_strain_field_grids(
     if est_grid is not None:
         est = est_grid
         meta["estimate_source"] = "surrogate_grid"
-    else:
+    elif values.shape[0] > 0:
         est = _idw_fill_grid(gx, gy, values, nx, ny)
         meta["estimate_source"] = "dataset_y_idw"
+    else:
+        est = np.full((ny, nx), np.nan, dtype=np.float64)
+        meta["estimate_source"] = "none"
+        meta["warnings"].append("No measurements yet; estimate panel shows surrogate only when available.")
 
     var_grid = _surrogate_field_to_display_grid(
         surrogate.uncertainty,

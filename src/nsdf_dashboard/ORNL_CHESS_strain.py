@@ -408,7 +408,6 @@ else:
         except Exception as e:
             loaded_bundle = None
             set_status(f"NSDF load failed: {e}", ok=False)
-            traceback.print_exc()
             figures_column.children = [Div(text="<i>No NSDF data loaded.</i>")]
             return
 
