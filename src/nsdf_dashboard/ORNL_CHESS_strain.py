@@ -1,27 +1,86 @@
 """
 ORNL / CHESS NSDF measurement dashboard.
 
-Loads native NSDF ``data.json`` plus optional ``surrogate.json`` and renders three heatmaps:
-measurement locations, estimate, and variance. Legacy ``ORNL_STRAIN_JSON_*`` environment
-variables and ``strain_json_*`` query parameters remain aliases for NSDF ``data.json``.
+Loads native NSDF ``data.json``, optional ``surrogate.json``, and optional ``next_x.json``;
+renders three heatmaps: measurement locations, estimate, and variance.
+Legacy ``ORNL_STRAIN_JSON_*`` environment variables and ``strain_json_*`` query parameters
+remain aliases for NSDF ``data.json``.
 """
 from __future__ import annotations
 
+import html
 import os
 import sys
 import traceback
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from bokeh.io import curdoc
 from bokeh.layouts import column, row
-from bokeh.models import Button, Div, Spinner
+from bokeh.models import Button, Div, InlineStyleSheet, Select, Spinner, TextInput
+
+# Match Bokeh titled-widget label + gap so plain buttons line up with inputs.
+_TITLED_WIDGET_LABEL_HEIGHT = 20
+_CONTROL_BTN_HEIGHT = 31
+_FIXED_BTN_STYLE = InlineStyleSheet(
+    css=f"""
+:host {{
+  height: {_CONTROL_BTN_HEIGHT}px !important;
+  min-height: {_CONTROL_BTN_HEIGHT}px !important;
+  max-height: {_CONTROL_BTN_HEIGHT}px !important;
+}}
+:host button {{
+  height: {_CONTROL_BTN_HEIGHT}px !important;
+  min-height: {_CONTROL_BTN_HEIGHT}px !important;
+  max-height: {_CONTROL_BTN_HEIGHT}px !important;
+  white-space: nowrap !important;
+  line-height: 1 !important;
+  box-sizing: border-box !important;
+}}
+"""
+)
+
+
+def _toolbar_button(label: str, *, button_type: str, width: int) -> Button:
+    btn = Button(label=label, button_type=button_type, width=width)
+    btn.stylesheets = [_FIXED_BTN_STYLE]
+    return btn
+
+
+def _bottom_aligned_button(btn: Button) -> column:
+    return column(
+        Div(
+            text="&nbsp;",
+            height=_TITLED_WIDGET_LABEL_HEIGHT,
+            width=1,
+            styles={
+                "padding": "0",
+                "margin": "0",
+                "border": "0",
+                "font-size": "13px",
+                "line-height": "1.35",
+                "overflow": "hidden",
+                "box-sizing": "border-box",
+            },
+        ),
+        btn,
+        sizing_mode="fixed",
+    )
+
+
+def _control_row(*widgets: Any) -> row:
+    return row(
+        *(_bottom_aligned_button(w) if isinstance(w, Button) else w for w in widgets),
+        sizing_mode="scale_width",
+    )
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", ".."))
-SHARED_UTILS_DIR = os.path.join(PROJECT_ROOT, "scientistCloudLib", "SCLib_Dashboards")
-
-if SHARED_UTILS_DIR not in sys.path and os.path.isdir(SHARED_UTILS_DIR):
-    sys.path.insert(0, SHARED_UTILS_DIR)
+for _shared_candidate in (
+    os.path.abspath(os.path.join(SCRIPT_DIR, "..")),
+    os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", "..", "scientistCloudLib", "SCLib_Dashboards")),
+):
+    if os.path.isdir(_shared_candidate) and _shared_candidate not in sys.path:
+        sys.path.insert(0, _shared_candidate)
+        break
 
 
 def _initialize_dashboard_standalone(
@@ -85,18 +144,27 @@ from nsdf_dashboard.ornl_chess_strain_lib import (  # noqa: E402
     NSDFLoadedBundle,
     StrainDashboardPaths,
     StrainFieldPlotConfig,
+    apply_nsdf_version_suffix,
     build_strain_field_grids,
+    collect_nsdf_triplet_load_issues,
+    discover_nsdf_version_options,
     enrich_strain_paths_from_dataset_doc,
     find_strain_json_under_dataset_dir,
     infer_nsdf_grid_size,
+    is_scientistcloud_portal_data_mount_context,
     list_nsdf_field_headers,
     load_simple_env_file,
     load_nsdf_json_bundle,
+    promote_gateway_json_url_to_s3_paths,
     make_strain_triplet_figures,
     infer_nsdf_bounds_grid_size,
+    format_nsdf_workflow_display,
+    resolve_nsdf_workflow_id,
     resolve_strain_paths_for_session,
     resolve_nsdf_grid_size,
+    surrogate_doc_defines_grid_size,
     validate_nsdf_measurement_doc,
+    validate_nsdf_next_x_doc,
     validate_nsdf_surrogate_doc,
 )
 from nsdf_dashboard.refresh_bus import register_refresh_callback, unregister_refresh_callback  # noqa: E402
@@ -170,6 +238,8 @@ else:
     ).strip()
     _query_surrogate_path0 = _first_arg("surrogate_json_path")
     _query_surrogate_url0 = _first_arg("surrogate_json_url")
+    _query_next_x_path0 = _first_arg("next_x_json_path")
+    _query_next_x_url0 = _first_arg("next_x_json_url")
 
     _bd = str(_params.get("base_dir") or "")
     _sd = str(_params.get("save_dir") or "")
@@ -213,6 +283,8 @@ else:
         jurl = (p.json_url or "").strip()
         if loc or not jurl:
             return p
+        if promote_gateway_json_url_to_s3_paths(StrainDashboardPaths(json_url=jurl)).has_s3_source():
+            return p
         mirror = find_strain_json_under_dataset_dir(_bd) or find_strain_json_under_dataset_dir(_sd)
         if mirror:
             return StrainDashboardPaths(
@@ -220,17 +292,34 @@ else:
                 json_url=jurl,
                 surrogate_json_path=p.surrogate_json_path,
                 surrogate_json_url=p.surrogate_json_url,
+                next_x_json_path=p.next_x_json_path,
+                next_x_json_url=p.next_x_json_url,
                 local_data_dir=p.local_data_dir,
                 s3_env_file=p.s3_env_file,
                 s3_bucket=p.s3_bucket,
                 s3_data_key=p.s3_data_key,
                 s3_surrogate_key=p.s3_surrogate_key,
+                s3_next_x_key=p.s3_next_x_key,
                 s3_endpoint_url=p.s3_endpoint_url,
                 s3_region=p.s3_region,
             )
         return p
 
-    def _resolve_paths() -> StrainDashboardPaths:
+    grid_state: Dict[str, Any] = {
+        "manual_grid_size": None,
+        "active_source": "environment",
+        "updating_controls": False,
+        "last_status": {},
+        "version_suffix": "latest",
+        "playback": {
+            "active": False,
+            "order": [],
+            "index": 0,
+            "callback_id": None,
+        },
+    }
+
+    def _resolve_base_paths() -> StrainDashboardPaths:
         return enrich_strain_paths_from_dataset_doc(
             _prefer_upload_mirror_when_url_only(
                 resolve_strain_paths_for_session(
@@ -240,6 +329,8 @@ else:
                     query_strain_json_url=_query_data_url0,
                     query_surrogate_json_path=_query_surrogate_path0,
                     query_surrogate_json_url=_query_surrogate_url0,
+                    query_next_x_json_path=_query_next_x_path0,
+                    query_next_x_json_url=_query_next_x_url0,
                     env=StrainDashboardPaths.from_environ(),
                 )
             ),
@@ -248,33 +339,89 @@ else:
             save_dir=_sd,
         )
 
+    def _resolve_paths() -> StrainDashboardPaths:
+        base = _resolve_base_paths()
+        suffix = str(grid_state.get("version_suffix") or "").strip()
+        if suffix in ("", "latest"):
+            return apply_nsdf_version_suffix(base, "")
+        return apply_nsdf_version_suffix(base, suffix)
+
     paths = _resolve_paths()
     plot_cfg = StrainFieldPlotConfig()
     env_grid_size = _fixed_grid_size_from_env()
     if env_grid_size:
         plot_cfg.grid_size = env_grid_size
+    grid_state["active_source"] = "environment" if env_grid_size else "dataset_x"
 
-    status_div = Div(text="", sizing_mode="stretch_width", visible=False)
+    log_panel_div = Div(text="", sizing_mode="stretch_width", visible=False)
+    _log_scroll_style = (
+        "max-height:220px;overflow-y:auto;overflow-x:hidden;"
+        "border:1px solid #ccc;border-radius:4px;padding:8px 10px;"
+        "background:#fafafa;"
+    )
+    _workflow_placeholder = (
+        '<div style="font-family:monospace;font-size:14px;padding:6px 0;'
+        'min-height:1.35em;line-height:1.35em;color:#888;">Workflow ID: —</div>'
+    )
+    workflow_div = Div(text=_workflow_placeholder, sizing_mode="stretch_width")
+    version_select = Select(
+        title="Snapshot",
+        value="latest",
+        options=[("latest", "Latest (data.json)")],
+        width=240,
+    )
+    _play_btn_width = 90
+    play_interval_input = TextInput(title="Play interval (s)", value="2.0", width=110)
+    btn_play_backward = _toolbar_button("< Play", button_type="success", width=_play_btn_width)
+    btn_play_forward = _toolbar_button("Play >", button_type="success", width=_play_btn_width)
+    btn_play_stop = _toolbar_button("Stop", button_type="warning", width=_play_btn_width)
     grid_w = Spinner(title="Grid width", low=1, high=512, step=1, value=plot_cfg.grid_size[0], width=100)
     grid_h = Spinner(title="Grid height", low=1, high=512, step=1, value=plot_cfg.grid_size[1], width=100)
-    btn_reset_grid = Button(label="Reset", button_type="default", width=80)
-    btn_toggle_status = Button(label="Show status", button_type="default", width=110)
+    btn_reset_grid = _toolbar_button("Reset", button_type="default", width=80)
+    btn_reload = _toolbar_button("Reload", button_type="primary", width=90)
+    btn_toggle_status = _toolbar_button("Show status", button_type="default", width=110)
 
     loaded_bundle: Optional[NSDFLoadedBundle] = None
     figures_column = column(sizing_mode="stretch_width")
-    grid_state: Dict[str, Any] = {
-        "manual_grid_size": None,
-        "active_source": "environment" if env_grid_size else "dataset_x",
-        "updating_controls": False,
-        "last_status": {},
-    }
+
+    def _wrap_log_html(inner_html: str) -> str:
+        return (
+            f'<div style="font-family:monospace;font-size:12px;line-height:1.4;">'
+            f'<div style="{_log_scroll_style}">{inner_html}</div></div>'
+        )
+
+    def _show_log_panel(inner_html: str) -> None:
+        log_panel_div.text = _wrap_log_html(inner_html)
+        log_panel_div.visible = True
+        btn_toggle_status.label = "Hide status"
 
     def set_status(msg: str, ok: bool = True) -> None:
         color = "#0a0" if ok else "#a00"
-        status_div.text = (
-            f'<div style="color:{color};font-family:monospace;line-height:1.35;'
-            f'white-space:pre-wrap;">{msg}</div>'
+        _show_log_panel(
+            f'<div style="color:{color};white-space:pre-wrap;">{html.escape(msg)}</div>'
         )
+
+    def _format_triplet_log_html(errors: List[str], warnings: List[str]) -> str:
+        parts: List[str] = []
+        if errors:
+            parts.append(
+                '<div style="color:#a00;font-weight:bold;margin:0 0 4px 0;">'
+                "NSDF triplet errors</div>"
+            )
+            parts.extend(
+                f'<div style="color:#a00;margin-left:8px;">• {html.escape(msg)}</div>'
+                for msg in errors
+            )
+        if warnings:
+            parts.append(
+                '<div style="color:#b8860b;font-weight:bold;margin:8px 0 4px 0;">'
+                "NSDF triplet warnings</div>"
+            )
+            parts.extend(
+                f'<div style="color:#b8860b;margin-left:8px;">• {html.escape(msg)}</div>'
+                for msg in warnings
+            )
+        return "".join(parts)
 
     def _grid_size_from_controls() -> tuple[int, int]:
         try:
@@ -297,44 +444,178 @@ else:
         if not last_status:
             return
         active_grid_size = plot_cfg.grid_size
+        triplet_errors = list(last_status.get("triplet_errors") or [])
+        triplet_warnings = list(last_status.get("triplet_warnings") or [])
         msg_parts = [
             f"Loaded NSDF measurement data: {last_status['measurement_count']} points.",
-            f"Inferred grid size: {last_status['inferred_grid_size'][0]} x {last_status['inferred_grid_size'][1]}.",
-            f"Active grid size: {active_grid_size[0]} x {active_grid_size[1]}.",
-            f"Grid source: {grid_state['active_source']}.",
+            f"Unique coordinates in data (sparse hint): {last_status['inferred_grid_size'][0]} x {last_status['inferred_grid_size'][1]}.",
+            f"Plot grid size: {active_grid_size[0]} x {active_grid_size[1]}.",
+            f"Grid source: {grid_state['active_source']} (bounds/surrogate define the scan canvas).",
             f"Coordinate normalization: {last_status['bounds_source']}.",
             "Compatible fields: " + ", ".join(last_status["fields"]) + ".",
         ]
+        if last_status.get("surrogate_grid_line"):
+            msg_parts.append(last_status["surrogate_grid_line"])
+        if last_status.get("next_x_summary"):
+            msg_parts.append(last_status["next_x_summary"])
+        if last_status.get("next_x_warnings"):
+            msg_parts.extend(last_status["next_x_warnings"])
+        if last_status.get("version_label"):
+            msg_parts.insert(0, f"Snapshot: {last_status['version_label']}.")
+        if last_status.get("workflow_line"):
+            msg_parts.insert(0, last_status["workflow_line"])
         if last_status["source_line"]:
             msg_parts.insert(0, last_status["source_line"])
         msg_parts.extend(last_status["messages"])
         msg_parts.extend(last_status["warnings"])
-        set_status("\n".join(msg_parts), ok=True)
+
+        status_color = "#a00" if triplet_errors else "#0a0"
+        log_parts: List[str] = []
+        triplet_html = _format_triplet_log_html(triplet_errors, triplet_warnings)
+        if triplet_html:
+            log_parts.append(triplet_html)
+            log_parts.append('<div style="margin:8px 0 4px 0;border-top:1px solid #ddd;"></div>')
+        log_parts.append(
+            f'<div style="color:{status_color};white-space:pre-wrap;">'
+            f"{html.escape(chr(10).join(msg_parts))}</div>"
+        )
+        log_panel_div.text = _wrap_log_html("".join(log_parts))
+        if triplet_errors or triplet_warnings:
+            log_panel_div.visible = True
+            btn_toggle_status.label = "Hide status"
+        else:
+            log_panel_div.visible = False
+            btn_toggle_status.label = "Show status"
+        workflow_line = last_status.get("workflow_line") or ""
+        if workflow_line:
+            workflow_div.text = (
+                f'<div style="font-family:monospace;font-size:14px;padding:6px 0;'
+                f'min-height:1.35em;line-height:1.35em;"><b>{workflow_line}</b></div>'
+            )
+        else:
+            workflow_div.text = _workflow_placeholder
+
+    def _refresh_version_options() -> None:
+        options = discover_nsdf_version_options(
+            _resolve_base_paths(),
+            base_dir=_bd,
+            save_dir=_sd,
+            mongo_s3_auth=_dataset_s3_auth_override(),
+        )
+        current = str(grid_state.get("version_suffix") or "latest")
+        valid_values = {value for value, _label in options}
+        if current not in valid_values:
+            current = "latest"
+            grid_state["version_suffix"] = current
+        grid_state["updating_controls"] = True
+        try:
+            version_select.options = options
+            version_select.value = current
+        finally:
+            grid_state["updating_controls"] = False
+
+    def _snapshot_values_chronological() -> list[str]:
+        """Oldest timestamped snapshot first, ``latest`` last."""
+        values = [str(value) for value, _label in version_select.options]
+        timestamps = sorted(v for v in values if v != "latest")
+        if "latest" in values:
+            timestamps.append("latest")
+        return timestamps
+
+    def _playback_interval_ms() -> int:
+        try:
+            seconds = float(str(play_interval_input.value or "").strip())
+        except ValueError:
+            seconds = 2.0
+        seconds = max(0.5, min(120.0, seconds))
+        return int(seconds * 1000)
+
+    def _stop_playback() -> None:
+        playback = grid_state.get("playback") or {}
+        callback_id = playback.get("callback_id")
+        if callback_id is not None:
+            doc.remove_periodic_callback(callback_id)
+        grid_state["playback"] = {
+            "active": False,
+            "order": [],
+            "index": 0,
+            "callback_id": None,
+        }
+
+    def _apply_snapshot_value(value: str) -> None:
+        grid_state["version_suffix"] = str(value or "latest")
+        grid_state["updating_controls"] = True
+        try:
+            version_select.value = grid_state["version_suffix"]
+        finally:
+            grid_state["updating_controls"] = False
+        on_reload()
+
+    def _advance_playback() -> None:
+        playback = grid_state.get("playback") or {}
+        if not playback.get("active"):
+            return
+        order = playback.get("order") or []
+        if len(order) <= 1:
+            _stop_playback()
+            return
+        next_index = int(playback.get("index", 0)) + 1
+        if next_index >= len(order):
+            _stop_playback()
+            return
+        playback["index"] = next_index
+        grid_state["playback"] = playback
+        _apply_snapshot_value(str(order[next_index]))
+
+    def _start_playback(*, forward: bool) -> None:
+        _stop_playback()
+        chronological = _snapshot_values_chronological()
+        if len(chronological) <= 1:
+            set_status("Need at least two snapshots to play acquisition.", ok=False)
+            return
+        order = chronological if forward else list(reversed(chronological))
+        current = str(version_select.value or "latest")
+        start_index = order.index(current) if current in order else 0
+        callback_id = doc.add_periodic_callback(_advance_playback, _playback_interval_ms())
+        grid_state["playback"] = {
+            "active": True,
+            "order": order,
+            "index": start_index,
+            "callback_id": callback_id,
+        }
+
+    def on_play_forward() -> None:
+        _start_playback(forward=True)
+
+    def on_play_backward() -> None:
+        _start_playback(forward=False)
+
+    def on_play_stop() -> None:
+        _stop_playback()
 
     def load_payload() -> None:
         global loaded_bundle  # noqa: PLW0603
 
+        _refresh_version_options()
         p = _resolve_paths()
         try:
             bundle = load_nsdf_json_bundle(p, mongo_s3_auth=_dataset_s3_auth_override())
             measurement = validate_nsdf_measurement_doc(bundle.data)
             fields = list_nsdf_field_headers(bundle.data, bundle.surrogate)
             inferred_grid_size = infer_nsdf_grid_size(bundle.data)
-            if infer_nsdf_bounds_grid_size(bundle.data):
+            if infer_nsdf_bounds_grid_size(bundle.data) or surrogate_doc_defines_grid_size(bundle.surrogate):
                 grid_state["manual_grid_size"] = None
             active_grid_size, active_grid_source = resolve_nsdf_grid_size(
                 bundle.data,
+                surrogate_doc=bundle.surrogate,
                 env_grid_size=env_grid_size,
                 manual_grid_size=grid_state["manual_grid_size"],
             )
-            surrogate_info = validate_nsdf_surrogate_doc(
-                bundle.surrogate,
-                measurement.observed_values.shape[0],
-            )
+            surrogate_info = validate_nsdf_surrogate_doc(bundle.surrogate)
+            next_x_info = validate_nsdf_next_x_doc(bundle.next_x)
         except Exception as e:
             loaded_bundle = None
             set_status(f"NSDF load failed: {e}", ok=False)
-            traceback.print_exc()
             figures_column.children = [Div(text="<i>No NSDF data loaded.</i>")]
             return
 
@@ -350,16 +631,64 @@ else:
                 f"S3 source: s3://{bundle.paths.s3_bucket}/{bundle.paths.s3_data_key}; "
                 "event-triggered refresh."
             )
+        elif (bundle.paths.local_json_path or "").strip() or (bundle.paths.json_url or "").strip():
+            loc = (bundle.paths.local_json_path or "").strip()
+            source_line = f"Source: {loc or bundle.paths.json_url}"
+        next_x_summary = ""
+        active_workflow_id = resolve_nsdf_workflow_id(surrogate_info, next_x_info)
+        if next_x_info.entries and active_workflow_id:
+            active_points = sum(
+                int(entry.coordinates.shape[0])
+                for entry in next_x_info.entries
+                if entry.workflow_id == active_workflow_id
+            )
+            if active_points:
+                next_x_summary = (
+                    f"next_x: {active_points} proposed point(s) for workflow {active_workflow_id}."
+                )
+        elif next_x_info.entries:
+            next_x_summary = "next_x: loaded but no active non-demo workflow entry."
+        elif bundle.next_x is not None:
+            next_x_summary = "next_x: loaded but no valid workflow entries."
+        workflow_line = format_nsdf_workflow_display(surrogate_info, next_x_info)
+        surrogate_grid_line = ""
+        if surrogate_info.plot_dim:
+            surrogate_grid_line = f"Surrogate plot dim: {surrogate_info.plot_dim}."
+        bounds_size = infer_nsdf_bounds_grid_size(bundle.surrogate or {})
+        if bounds_size:
+            bounds_note = f"Grid size from bounds: {bounds_size[0]} x {bounds_size[1]}."
+            surrogate_grid_line = (
+                f"{surrogate_grid_line} {bounds_note}".strip()
+                if surrogate_grid_line
+                else bounds_note
+            )
+        if surrogate_info.points:
+            points_note = f"Expected points (surrogate): {surrogate_info.points}."
+            surrogate_grid_line = (
+                f"{surrogate_grid_line} {points_note}".strip()
+                if surrogate_grid_line
+                else points_note
+            )
+        version_label = "Latest (data.json)"
+        if (p.version_suffix or "").strip():
+            version_label = p.version_suffix
+        triplet_errors, triplet_warnings = collect_nsdf_triplet_load_issues(p, bundle)
         grid_state["last_status"] = {
             "measurement_count": measurement.observed_values.shape[0],
             "inferred_grid_size": inferred_grid_size,
             "bounds_source": measurement.bounds_source,
             "fields": fields,
             "source_line": source_line,
+            "version_label": version_label,
+            "workflow_line": workflow_line,
+            "surrogate_grid_line": surrogate_grid_line,
             "messages": list(bundle.messages),
             "warnings": list(surrogate_info.warnings),
+            "next_x_summary": next_x_summary,
+            "next_x_warnings": list(next_x_info.warnings),
+            "triplet_errors": triplet_errors,
+            "triplet_warnings": triplet_warnings,
         }
-        _set_loaded_status()
 
     def apply_grid_size() -> None:
         plot_cfg.grid_size = _grid_size_from_controls()
@@ -372,11 +701,43 @@ else:
             return
         try:
             grids = build_strain_field_grids(loaded_bundle.data, plot_cfg, loaded_bundle.surrogate)
-            p0, p1, p2 = make_strain_triplet_figures(grids, plot_cfg, row_subtitle="dataset_y")
-            figures_column.children = [row(p0, p1, p2, sizing_mode="scale_width")]
+            surrogate_info = validate_nsdf_surrogate_doc(loaded_bundle.surrogate)
+            next_x_info = validate_nsdf_next_x_doc(loaded_bundle.next_x)
+            active_workflow_id = resolve_nsdf_workflow_id(surrogate_info, next_x_info)
+            p0, p1, p2 = make_strain_triplet_figures(
+                grids,
+                plot_cfg,
+                row_subtitle="dataset_y",
+                next_x_info=next_x_info,
+                active_workflow_id=active_workflow_id,
+            )
+            figures_column.children = [row(p0, p1, p2, sizing_mode="fixed")]
+            if grid_state.get("last_status") is not None:
+                resolved = _resolve_paths()
+                triplet_errors, triplet_warnings = collect_nsdf_triplet_load_issues(
+                    resolved,
+                    loaded_bundle,
+                    grid_meta=grids.meta,
+                )
+                grid_state["last_status"]["triplet_errors"] = triplet_errors
+                grid_state["last_status"]["triplet_warnings"] = triplet_warnings
+            _set_loaded_status()
         except Exception as e:
             figures_column.children = [Div(text=f"<pre>NSDF grid build failed: {e}</pre>")]
             traceback.print_exc()
+            if grid_state.get("last_status") is not None:
+                grid_state["last_status"]["triplet_errors"] = [
+                    f"Grid build failed: {e}",
+                ]
+                _set_loaded_status()
+
+    def on_version_change(attr: str, old: Any, new: Any) -> None:
+        if grid_state["updating_controls"]:
+            return
+        if (grid_state.get("playback") or {}).get("active"):
+            _stop_playback()
+        grid_state["version_suffix"] = str(new or "latest")
+        on_reload()
 
     def on_reload() -> None:
         load_payload()
@@ -393,7 +754,6 @@ else:
         grid_state["active_source"] = "manual controls"
         plot_cfg.grid_size = manual_grid_size
         rebuild_figures()
-        _set_loaded_status()
 
     def on_reset_grid() -> None:
         grid_state["manual_grid_size"] = None
@@ -403,6 +763,7 @@ else:
         else:
             active_grid_size, active_grid_source = resolve_nsdf_grid_size(
                 loaded_bundle.data,
+                surrogate_doc=loaded_bundle.surrogate,
                 env_grid_size=env_grid_size,
                 manual_grid_size=None,
             )
@@ -410,25 +771,45 @@ else:
         grid_state["active_source"] = active_grid_source
         _set_grid_controls(active_grid_size)
         rebuild_figures()
-        _set_loaded_status()
 
     def on_toggle_status() -> None:
-        status_div.visible = not status_div.visible
-        btn_toggle_status.label = "Hide status" if status_div.visible else "Show status"
+        log_panel_div.visible = not log_panel_div.visible
+        btn_toggle_status.label = "Hide status" if log_panel_div.visible else "Show status"
 
     grid_w.on_change("value", on_grid_control_change)
     grid_h.on_change("value", on_grid_control_change)
+    version_select.on_change("value", on_version_change)
+    btn_play_forward.on_click(on_play_forward)
+    btn_play_backward.on_click(on_play_backward)
+    btn_play_stop.on_click(on_play_stop)
     btn_reset_grid.on_click(on_reset_grid)
+    btn_reload.on_click(on_reload)
     btn_toggle_status.on_click(on_toggle_status)
 
     controls = column(
-        row(grid_w, grid_h, btn_reset_grid, btn_toggle_status, sizing_mode="scale_width"),
-        status_div,
+        row(version_select, sizing_mode="scale_width"),
+        _control_row(grid_w, grid_h, btn_reload, btn_reset_grid, btn_toggle_status),
+        _control_row(
+            play_interval_input,
+            btn_play_backward,
+            btn_play_forward,
+            btn_play_stop,
+        ),
         sizing_mode="stretch_width",
     )
 
-    header = create_header_banner("ORNL CHESS NSDF measurements", "DIAL Dashboard")
-    root = column(header, controls, figures_column, sizing_mode="stretch_width")
+    if is_scientistcloud_portal_data_mount_context(_bd, _sd):
+        header = create_header_banner("ORNL CHESS Strain", "ScientistCloud")
+    else:
+        header = create_header_banner("ORNL CHESS NSDF measurements", "DIAL Dashboard")
+    root = column(
+        header,
+        workflow_div,
+        controls,
+        figures_column,
+        log_panel_div,
+        sizing_mode="stretch_width",
+    )
     doc.add_root(root)
 
     if paths.local_data_dir or paths.has_s3_source() or paths.local_json_path or paths.json_url:
@@ -438,19 +819,21 @@ else:
             Div(
                 text=(
                     "<p>No NSDF data.json resolved yet. Configure <code>LOCAL_DATA_DIR</code> "
-                    "with a local <code>data.json</code>, or configure <code>S3_BUCKET</code> / "
-                    "<code>S3_DATA_KEY</code>.</p>"
+                    "with local <code>data.json</code>, <code>surrogate.json</code>, and "
+                    "<code>next_x.json</code>, or set portal/S3/env paths.</p>"
                 )
             )
         ]
-    if paths.local_data_dir or paths.has_s3_source():
+    if paths.local_data_dir or paths.has_s3_source() or paths.local_json_path or paths.json_url:
         _refresh_token = register_refresh_callback(on_external_refresh)
 
         def _cleanup_refresh_callback(
             session_context: Any,
             token: int = _refresh_token,
             unregister: Callable[[int], None] = unregister_refresh_callback,
+            stop_playback: Callable[[], None] = _stop_playback,
         ) -> None:
+            stop_playback()
             unregister(token)
 
         doc.on_session_destroyed(_cleanup_refresh_callback)

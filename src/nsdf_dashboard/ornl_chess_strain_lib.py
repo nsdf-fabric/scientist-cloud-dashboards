@@ -51,6 +51,12 @@ _LOG = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DEFAULT_GRID_SIZE: Tuple[int, int] = (26, 26)
+NSDF_DATA_JSON_BASENAME = "data.json"
+NSDF_VERSION_SUFFIX_RE = re.compile(r"^\d{8}T\d{6}Z$", re.IGNORECASE)
+NSDF_DATA_FILENAME_RE = re.compile(
+    r"^data(?:_(?P<suffix>\d{8}T\d{6}Z))?\.json$",
+    re.IGNORECASE,
+)
 
 
 def _strip_env_quotes(value: str) -> str:
@@ -82,6 +88,35 @@ def load_simple_env_file(path: str) -> Dict[str, str]:
     return out
 
 
+def _find_optional_env_file() -> str:
+    """Return a repo/cwd ``.env`` path when ``ORNL_S3_ENV_FILE`` is not set."""
+    candidates: List[str] = []
+    cwd = os.getcwd()
+    if cwd:
+        candidates.append(os.path.join(cwd, ".env"))
+    pkg_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    candidates.append(os.path.join(pkg_root, ".env"))
+    seen: set[str] = set()
+    for candidate in candidates:
+        norm = os.path.abspath(candidate)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        if os.path.isfile(norm):
+            return norm
+    return ""
+
+
+def local_files_first_for_testing() -> bool:
+    """True when ``LOCAL_FILES_FIRST_FOR_TESTING`` enables ``LOCAL_DATA_DIR`` routing."""
+    raw = (os.environ.get("LOCAL_FILES_FIRST_FOR_TESTING") or "").strip()
+    if not raw:
+        env_file = os.environ.get("ORNL_S3_ENV_FILE", "").strip() or _find_optional_env_file()
+        if env_file:
+            raw = (load_simple_env_file(env_file).get("LOCAL_FILES_FIRST_FOR_TESTING") or "").strip()
+    return raw.lower() in ("1", "true", "yes")
+
+
 @dataclass
 class StrainDashboardPaths:
     """Where to load NSDF data and optional surrogate JSON."""
@@ -90,17 +125,22 @@ class StrainDashboardPaths:
     json_url: str = ""
     surrogate_json_path: str = ""
     surrogate_json_url: str = ""
+    next_x_json_path: str = ""
+    next_x_json_url: str = ""
     local_data_dir: str = ""
     s3_env_file: str = ""
     s3_bucket: str = ""
     s3_data_key: str = ""
     s3_surrogate_key: str = ""
+    s3_next_x_key: str = ""
     s3_endpoint_url: str = ""
     s3_region: str = "us-east-1"
+    version_suffix: str = ""
 
     @classmethod
     def from_environ(cls) -> "StrainDashboardPaths":
-        env_file_values = load_simple_env_file(os.environ.get("ORNL_S3_ENV_FILE", "").strip())
+        env_file = os.environ.get("ORNL_S3_ENV_FILE", "").strip() or _find_optional_env_file()
+        env_file_values = load_simple_env_file(env_file)
 
         def env_value(name: str, default: str = "") -> str:
             return (os.environ.get(name) or env_file_values.get(name) or default).strip()
@@ -118,11 +158,14 @@ class StrainDashboardPaths:
             ).strip(),
             surrogate_json_path=os.environ.get("ORNL_SURROGATE_JSON_PATH", "").strip(),
             surrogate_json_url=os.environ.get("ORNL_SURROGATE_JSON_URL", "").strip(),
+            next_x_json_path=os.environ.get("ORNL_NEXT_X_JSON_PATH", "").strip(),
+            next_x_json_url=os.environ.get("ORNL_NEXT_X_JSON_URL", "").strip(),
             local_data_dir=env_value("LOCAL_DATA_DIR"),
-            s3_env_file=os.environ.get("ORNL_S3_ENV_FILE", "").strip(),
+            s3_env_file=env_file,
             s3_bucket=env_value("S3_BUCKET"),
             s3_data_key=env_value("S3_DATA_KEY"),
             s3_surrogate_key=env_value("S3_SURROGATE_KEY"),
+            s3_next_x_key=env_value("S3_NEXT_X_KEY"),
             s3_endpoint_url=env_value("S3_ENDPOINT_URL"),
             s3_region=env_value("S3_REGION", "us-east-1") or "us-east-1",
         )
@@ -137,6 +180,7 @@ def _copy_s3_fields(src: StrainDashboardPaths, dst: StrainDashboardPaths) -> Str
     dst.s3_bucket = src.s3_bucket
     dst.s3_data_key = src.s3_data_key
     dst.s3_surrogate_key = src.s3_surrogate_key
+    dst.s3_next_x_key = src.s3_next_x_key
     dst.s3_endpoint_url = src.s3_endpoint_url
     dst.s3_region = src.s3_region
     return dst
@@ -244,6 +288,8 @@ def resolve_strain_paths_for_session(
     query_strain_json_url: str = "",
     query_surrogate_json_path: str = "",
     query_surrogate_json_url: str = "",
+    query_next_x_json_path: str = "",
+    query_next_x_json_url: str = "",
     env: Optional[StrainDashboardPaths] = None,
 ) -> StrainDashboardPaths:
     """
@@ -255,23 +301,28 @@ def resolve_strain_paths_for_session(
     """
     env = env or StrainDashboardPaths.from_environ()
     order = _strain_effective_source_order(base_dir, save_dir)
-    q_path = (query_strain_json_path or "").strip()
-    q_url = (query_strain_json_url or "").strip()
+    q_path = normalize_nsdf_remote_data_link((query_strain_json_path or "").strip())
+    q_url = normalize_nsdf_remote_data_link((query_strain_json_url or "").strip())
     env_path = (env.local_json_path or "").strip()
-    env_url = (env.json_url or "").strip()
+    env_url = normalize_nsdf_remote_data_link((env.json_url or "").strip())
     surrogate_path = (query_surrogate_json_path or "").strip() or (env.surrogate_json_path or "").strip()
     surrogate_url = (query_surrogate_json_url or "").strip() or (env.surrogate_json_url or "").strip()
+    next_x_path = (query_next_x_json_path or "").strip() or (env.next_x_json_path or "").strip()
+    next_x_url = (query_next_x_json_url or "").strip() or (env.next_x_json_url or "").strip()
     bd = (base_dir or "").strip()
     sd = (save_dir or "").strip()
 
-    def with_surrogate(p: StrainDashboardPaths) -> StrainDashboardPaths:
+    def with_auxiliary(p: StrainDashboardPaths) -> StrainDashboardPaths:
         p.surrogate_json_path = surrogate_path
         p.surrogate_json_url = surrogate_url
+        p.next_x_json_path = next_x_path
+        p.next_x_json_url = next_x_url
         p.local_data_dir = env.local_data_dir
         p.s3_env_file = env.s3_env_file
         p.s3_bucket = env.s3_bucket
         p.s3_data_key = env.s3_data_key
         p.s3_surrogate_key = env.s3_surrogate_key
+        p.s3_next_x_key = env.s3_next_x_key
         p.s3_endpoint_url = env.s3_endpoint_url
         p.s3_region = env.s3_region
         return p
@@ -283,33 +334,33 @@ def resolve_strain_paths_for_session(
         if token == "upload":
             p = find_strain_json_under_dataset_dir(bd)
             if p:
-                return with_surrogate(StrainDashboardPaths(local_json_path=p, json_url=display_url()))
+                return with_auxiliary(StrainDashboardPaths(local_json_path=p, json_url=display_url()))
         elif token == "converted":
             p = find_strain_json_under_dataset_dir(sd)
             if p:
-                return with_surrogate(StrainDashboardPaths(local_json_path=p, json_url=display_url()))
+                return with_auxiliary(StrainDashboardPaths(local_json_path=p, json_url=display_url()))
         elif token == "query_path":
             if not q_path:
                 continue
             if _looks_like_http_url(q_path):
-                return with_surrogate(StrainDashboardPaths(local_json_path="", json_url=q_path))
+                return with_auxiliary(StrainDashboardPaths(local_json_path="", json_url=q_path))
             if os.path.isfile(q_path):
-                return with_surrogate(StrainDashboardPaths(local_json_path=q_path, json_url=display_url()))
+                return with_auxiliary(StrainDashboardPaths(local_json_path=q_path, json_url=display_url()))
         elif token == "query_url":
             if q_url:
-                return with_surrogate(StrainDashboardPaths(local_json_path="", json_url=q_url))
+                return with_auxiliary(StrainDashboardPaths(local_json_path="", json_url=q_url))
         elif token == "env_path":
             if not env_path:
                 continue
             if _looks_like_http_url(env_path):
-                return with_surrogate(StrainDashboardPaths(local_json_path="", json_url=env_path))
+                return with_auxiliary(StrainDashboardPaths(local_json_path="", json_url=env_path))
             if os.path.isfile(env_path):
-                return with_surrogate(StrainDashboardPaths(local_json_path=env_path, json_url=display_url()))
+                return with_auxiliary(StrainDashboardPaths(local_json_path=env_path, json_url=display_url()))
         elif token == "env_url":
             if env_url:
-                return with_surrogate(StrainDashboardPaths(local_json_path="", json_url=env_url))
+                return with_auxiliary(StrainDashboardPaths(local_json_path="", json_url=env_url))
 
-    return with_surrogate(StrainDashboardPaths(local_json_path="", json_url=""))
+    return with_auxiliary(StrainDashboardPaths(local_json_path="", json_url=""))
 
 
 @dataclass
@@ -320,12 +371,12 @@ class StrainFieldPlotConfig:
     x_axis_label: str = "labx"
     y_axis_label: str = "labz"
     title_measurements: str = "Measurement locations"
-    title_estimate: str = "Estimate"
-    title_variance: str = "Variance"
+    title_estimate: str = "Prediction"
+    title_variance: str = "Uncertainty"
     flip_y_for_display: bool = True
-    colormap_estimate: str = "Viridis256"
+    colormap_estimate: str = "Coolwarm256"
     colormap_variance: str = "Viridis256"
-    colormap_mask: Tuple[str, str] = ("#2d1b4e", "#fde724")
+    colormap_mask: Tuple[str, str] = ("#ffffff", "#ffffff")
 
 
 @dataclass
@@ -351,11 +402,15 @@ class NSDFMeasurementData:
 
 @dataclass
 class NSDFSurrogateData:
-    """Validated length-compatible optional surrogate arrays."""
+    """Validated optional surrogate model arrays and grid metadata."""
 
     surrogate: Optional[np.ndarray] = None
     uncertainty: Optional[np.ndarray] = None
     raw_uncertainty: Optional[np.ndarray] = None
+    workflow_id: Optional[str] = None
+    plot_dim: Optional[str] = None
+    bounds: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None
+    points: Optional[int] = None
     warnings: List[str] = field(default_factory=list)
     source: str = ""
 
@@ -372,11 +427,32 @@ class NSDFSurrogateData:
 
 
 @dataclass
+class NSDFNextXEntry:
+    """One workflow block from ``next_x.json``."""
+
+    workflow_id: str
+    coordinates: np.ndarray
+
+
+@dataclass
+class NSDFNextXData:
+    """Validated optional ``next_x.json`` entries."""
+
+    entries: List[NSDFNextXEntry] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+    @property
+    def total_points(self) -> int:
+        return sum(int(entry.coordinates.shape[0]) for entry in self.entries)
+
+
+@dataclass
 class NSDFLoadedBundle:
-    """Loaded NSDF data and optional surrogate metadata for the UI."""
+    """Loaded NSDF data and optional surrogate / next_x metadata for the UI."""
 
     data: Dict[str, Any]
     surrogate: Optional[Dict[str, Any]] = None
+    next_x: Optional[List[Dict[str, Any]]] = None
     messages: List[str] = field(default_factory=list)
     paths: StrainDashboardPaths = field(default_factory=StrainDashboardPaths)
 
@@ -389,6 +465,615 @@ class NSDFLoadedBundle:
 def _looks_like_http_url(value: str) -> bool:
     v = (value or "").strip().lower()
     return v.startswith("http://") or v.startswith("https://")
+
+
+def _object_key_needs_nsdf_data_json(key: str) -> bool:
+    """True when an S3 object key is a folder prefix, not an explicit JSON object."""
+    normalized = (key or "").strip().strip("/")
+    if not normalized:
+        return True
+    leaf = normalized.rsplit("/", 1)[-1].lower()
+    if leaf == NSDF_DATA_JSON_BASENAME:
+        return False
+    if leaf.endswith(".json"):
+        return False
+    return True
+
+
+def normalize_nsdf_data_object_key(key: str) -> str:
+    """Append ``data.json`` when *key* names an NSDF folder prefix (direct S3 read, no mirror)."""
+    raw = (key or "").strip().lstrip("/")
+    if not _object_key_needs_nsdf_data_json(raw):
+        return raw
+    prefix = raw.rstrip("/")
+    return f"{prefix}/{NSDF_DATA_JSON_BASENAME}" if prefix else NSDF_DATA_JSON_BASENAME
+
+
+def normalize_nsdf_gateway_data_url(url: str) -> str:
+    """
+    When a gateway HTTPS URL points at an S3 prefix (e.g. ``…/test-chess/``), rewrite it to
+    ``…/test-chess/data.json`` so SigV4 ``GetObject`` reads the NSDF file directly.
+    """
+    from urllib.parse import urlunparse, urlparse
+
+    u = (url or "").strip()
+    if not _looks_like_http_url(u):
+        return u
+
+    parts = urlparse(u)
+    segments = [x for x in (parts.path or "").split("/") if x]
+    if len(segments) < 2:
+        return u
+
+    bucket = segments[0]
+    key = "/".join(segments[1:])
+    new_key = normalize_nsdf_data_object_key(key)
+    if new_key == key:
+        return u
+
+    new_path = "/" + "/".join([bucket, *new_key.split("/")])
+    return urlunparse((parts.scheme, parts.netloc, new_path, parts.params, parts.query, parts.fragment))
+
+
+def normalize_nsdf_remote_data_link(link: str) -> str:
+    """Normalize portal/S3 remote links so strain JSON loads via direct object read."""
+    u = (link or "").strip()
+    if not u:
+        return u
+    low = u.lower()
+    if low.startswith("s3://"):
+        body = u[5:].strip()
+        slash = body.find("/")
+        if slash == -1:
+            return u
+        bucket = body[:slash]
+        key = normalize_nsdf_data_object_key(body[slash + 1 :])
+        return f"s3://{bucket}/{key}"
+    if _looks_like_http_url(u):
+        return normalize_nsdf_gateway_data_url(u)
+    return u
+
+
+def parse_s3_uri(link: str) -> Tuple[str, str]:
+    """Return ``(bucket, object_key)`` from an ``s3://`` URI (key may be empty)."""
+    u = normalize_nsdf_remote_data_link((link or "").strip())
+    if not u.lower().startswith("s3://"):
+        return "", ""
+    body = u[5:].strip()
+    slash = body.find("/")
+    if slash == -1:
+        return body, ""
+    return body[:slash], body[slash + 1 :].lstrip("/")
+
+
+def nsdf_triplet_basenames(version_suffix: str = "") -> Tuple[str, str, str]:
+    """Return ``(data, surrogate, next_x)`` basenames for a version suffix (empty = latest)."""
+    suffix = (version_suffix or "").strip()
+    if not suffix:
+        return "data.json", "surrogate.json", "next_x.json"
+    if not NSDF_VERSION_SUFFIX_RE.fullmatch(suffix):
+        raise ValueError(f"Invalid NSDF version suffix: {suffix!r}")
+    return (
+        f"data_{suffix}.json",
+        f"surrogate_{suffix}.json",
+        f"next_x_{suffix}.json",
+    )
+
+
+def parse_nsdf_data_filename(name: str) -> Optional[str]:
+    """Parse ``data.json`` or ``data_<suffix>.json``; return suffix or ``None`` for latest."""
+    m = NSDF_DATA_FILENAME_RE.match((name or "").strip())
+    if not m:
+        return None
+    return (m.group("suffix") or "").strip() or None
+
+
+def _replace_path_basename(path: str, new_basename: str) -> str:
+    p = (path or "").strip()
+    if not p:
+        return p
+    return os.path.join(os.path.dirname(p), new_basename)
+
+
+def _replace_s3_key_basename(key: str, new_basename: str) -> str:
+    k = (key or "").strip()
+    if not k:
+        return k
+    if "/" in k:
+        return k.rsplit("/", 1)[0] + "/" + new_basename
+    return new_basename
+
+
+def _replace_url_basename(url: str, new_basename: str) -> str:
+    from urllib.parse import urlparse, urlunparse
+
+    u = (url or "").strip()
+    if not _looks_like_http_url(u):
+        return u
+    parts = urlparse(u)
+    segments = [x for x in (parts.path or "").split("/") if x]
+    if not segments:
+        return u
+    if parse_nsdf_data_filename(segments[-1]) is None and segments[-1].lower() != "data.json":
+        return u
+    segments[-1] = new_basename
+    new_path = "/" + "/".join(segments)
+    return urlunparse((parts.scheme, parts.netloc, new_path, parts.params, parts.query, parts.fragment))
+
+
+def apply_nsdf_version_suffix(
+    paths: StrainDashboardPaths,
+    version_suffix: str = "",
+) -> StrainDashboardPaths:
+    """
+    Point resolved paths at a timestamped triplet (``data_<ts>.json``, etc.).
+
+    Empty suffix keeps the default latest files (``data.json``, ``surrogate.json``, ``next_x.json``).
+    """
+    suffix = (version_suffix or "").strip()
+    data_fn, sur_fn, nx_fn = nsdf_triplet_basenames(suffix)
+    out = StrainDashboardPaths(
+        local_json_path=paths.local_json_path,
+        json_url=paths.json_url,
+        surrogate_json_path=paths.surrogate_json_path,
+        surrogate_json_url=paths.surrogate_json_url,
+        next_x_json_path=paths.next_x_json_path,
+        next_x_json_url=paths.next_x_json_url,
+        local_data_dir=paths.local_data_dir,
+        s3_env_file=paths.s3_env_file,
+        s3_bucket=paths.s3_bucket,
+        s3_data_key=paths.s3_data_key,
+        s3_surrogate_key=paths.s3_surrogate_key,
+        s3_next_x_key=paths.s3_next_x_key,
+        s3_endpoint_url=paths.s3_endpoint_url,
+        s3_region=paths.s3_region,
+        version_suffix=suffix,
+    )
+
+    if out.local_data_dir and local_files_first_for_testing():
+        base = out.local_data_dir.rstrip("/")
+        out.local_json_path = os.path.join(base, data_fn)
+        out.surrogate_json_path = os.path.join(base, sur_fn)
+        out.next_x_json_path = os.path.join(base, nx_fn)
+        return out
+
+    if out.local_json_path and not _looks_like_http_url(out.local_json_path):
+        base = os.path.dirname(out.local_json_path)
+        out.local_json_path = os.path.join(base, data_fn)
+        out.surrogate_json_path = os.path.join(base, sur_fn)
+        out.next_x_json_path = os.path.join(base, nx_fn)
+        return out
+
+    if out.json_url:
+        out.json_url = _replace_url_basename(out.json_url, data_fn)
+        out.surrogate_json_url = _replace_url_basename(out.json_url, sur_fn)
+        out.next_x_json_url = _replace_url_basename(out.json_url, nx_fn)
+
+    if out.s3_data_key:
+        out.s3_data_key = _replace_s3_key_basename(out.s3_data_key, data_fn)
+        out.s3_surrogate_key = _replace_s3_key_basename(out.s3_data_key, sur_fn)
+        out.s3_next_x_key = _replace_s3_key_basename(out.s3_data_key, nx_fn)
+
+    return out
+
+
+def nsdf_listing_directory(
+    paths: StrainDashboardPaths,
+    *,
+    base_dir: str = "",
+    save_dir: str = "",
+) -> str:
+    """Best-effort local directory for discovering timestamped NSDF JSON backups."""
+    candidates: List[str] = []
+    if (paths.local_data_dir or "").strip() and local_files_first_for_testing():
+        candidates.append((paths.local_data_dir or "").strip())
+    loc = (paths.local_json_path or "").strip()
+    if loc and not _looks_like_http_url(loc):
+        candidates.append(os.path.dirname(loc))
+    for dataset_dir in ((base_dir or "").strip(), (save_dir or "").strip()):
+        if not dataset_dir:
+            continue
+        found = find_strain_json_under_dataset_dir(dataset_dir)
+        if found:
+            candidates.append(os.path.dirname(found))
+        elif os.path.isdir(dataset_dir):
+            candidates.append(dataset_dir)
+    for candidate in candidates:
+        if candidate and os.path.isdir(candidate):
+            return candidate
+    return ""
+
+
+def _local_data_dir_active(paths: StrainDashboardPaths) -> bool:
+    """True when ``LOCAL_DATA_DIR`` is the exclusive data source (testing mode)."""
+    local_dir = (paths.local_data_dir or "").strip()
+    return bool(local_dir and os.path.isdir(local_dir) and local_files_first_for_testing())
+
+
+def _strip_local_data_dir_paths(paths: StrainDashboardPaths) -> StrainDashboardPaths:
+    """Remove ``LOCAL_DATA_DIR`` routing unless testing mode is enabled."""
+    if local_files_first_for_testing():
+        return paths
+    local_dir = os.path.abspath((paths.local_data_dir or "").strip())
+    if not local_dir:
+        return paths
+
+    def under_local(p: str) -> bool:
+        p = (p or "").strip()
+        if not p or _looks_like_http_url(p):
+            return False
+        try:
+            return os.path.commonpath([local_dir, os.path.abspath(p)]) == local_dir
+        except ValueError:
+            return False
+
+    return StrainDashboardPaths(
+        local_json_path="" if under_local(paths.local_json_path) else paths.local_json_path,
+        json_url=paths.json_url,
+        surrogate_json_path="" if under_local(paths.surrogate_json_path) else paths.surrogate_json_path,
+        surrogate_json_url=paths.surrogate_json_url,
+        next_x_json_path="" if under_local(paths.next_x_json_path) else paths.next_x_json_path,
+        next_x_json_url=paths.next_x_json_url,
+        local_data_dir="",
+        s3_env_file=paths.s3_env_file,
+        s3_bucket=paths.s3_bucket,
+        s3_data_key=paths.s3_data_key,
+        s3_surrogate_key=paths.s3_surrogate_key,
+        s3_next_x_key=paths.s3_next_x_key,
+        s3_endpoint_url=paths.s3_endpoint_url,
+        s3_region=paths.s3_region,
+        version_suffix=paths.version_suffix,
+    )
+
+
+def _remote_snapshot_listing_enabled(paths: StrainDashboardPaths) -> bool:
+    """True when snapshots should be discovered from S3 / gateway URL."""
+    if _local_data_dir_active(paths):
+        return False
+    if paths.has_s3_source():
+        return True
+    return bool((paths.json_url or "").strip())
+
+
+def list_nsdf_version_suffixes_from_directory(directory: str) -> List[str]:
+    """List timestamp suffixes from ``data_<suffix>.json`` files (newest first)."""
+    d = (directory or "").strip()
+    if not d or not os.path.isdir(d):
+        return []
+    suffixes: List[str] = []
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return []
+    for name in names:
+        parsed = parse_nsdf_data_filename(name)
+        if parsed:
+            suffixes.append(parsed)
+    return sorted(set(suffixes), reverse=True)
+
+
+def list_nsdf_surrogate_suffixes_from_directory(directory: str) -> List[str]:
+    """List timestamp suffixes from ``surrogate_<suffix>.json`` files (newest first)."""
+    d = (directory or "").strip()
+    if not d or not os.path.isdir(d):
+        return []
+    suffixes: List[str] = []
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return []
+    for name in names:
+        if not (name.startswith("surrogate_") and name.endswith(".json")):
+            continue
+        parsed = parse_nsdf_surrogate_filename(name)
+        if parsed:
+            suffixes.append(parsed)
+    return sorted(set(suffixes), reverse=True)
+
+
+def list_nsdf_next_x_suffixes_from_directory(directory: str) -> List[str]:
+    """List timestamp suffixes from ``next_x_<suffix>.json`` files (newest first)."""
+    d = (directory or "").strip()
+    if not d or not os.path.isdir(d):
+        return []
+    suffixes: List[str] = []
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return []
+    for name in names:
+        parsed = parse_nsdf_next_x_filename(name)
+        if parsed:
+            suffixes.append(parsed)
+    return sorted(set(suffixes), reverse=True)
+
+
+def list_nsdf_version_suffixes_from_s3(
+    paths: StrainDashboardPaths,
+    *,
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """List timestamp suffixes under the resolved S3 prefix (newest first)."""
+    bucket = (paths.s3_bucket or "").strip()
+    data_key = (paths.s3_data_key or "").strip()
+    if not bucket and (paths.json_url or "").strip():
+        cfg = _parse_gateway_url_with_query_keys((paths.json_url or "").strip())
+        if cfg:
+            bucket = (cfg.get("bucket") or "").strip()
+            data_key = (cfg.get("key") or "").strip()
+    if not bucket:
+        return []
+
+    prefix = ""
+    if data_key:
+        if "/" in data_key:
+            prefix = data_key.rsplit("/", 1)[0] + "/"
+        elif parse_nsdf_data_filename(data_key) is None:
+            prefix = data_key.rstrip("/") + "/"
+
+    list_paths = StrainDashboardPaths(
+        s3_bucket=bucket,
+        s3_data_key=data_key or "data.json",
+        s3_endpoint_url=paths.s3_endpoint_url,
+        s3_region=paths.s3_region,
+        s3_env_file=paths.s3_env_file,
+        json_url=paths.json_url,
+    )
+    try:
+        client = _make_nsdf_s3_client(list_paths, mongo_s3_auth=mongo_s3_auth)
+    except Exception:
+        return []
+
+    suffixes: List[str] = []
+    continuation: Optional[str] = None
+    try:
+        while True:
+            params: Dict[str, Any] = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": 1000}
+            if continuation:
+                params["ContinuationToken"] = continuation
+            result = client.list_objects_v2(**params)
+            for obj in result.get("Contents") or []:
+                name = os.path.basename(str(obj.get("Key") or ""))
+                parsed = parse_nsdf_data_filename(name)
+                if parsed:
+                    suffixes.append(parsed)
+            if not result.get("IsTruncated"):
+                break
+            continuation = result.get("NextContinuationToken")
+            if not continuation:
+                break
+    except Exception:
+        return []
+    return sorted(set(suffixes), reverse=True)
+
+
+def parse_nsdf_surrogate_filename(name: str) -> Optional[str]:
+    """Parse ``surrogate_<suffix>.json``; return suffix or ``None`` for ``surrogate.json``."""
+    base = os.path.basename((name or "").strip())
+    if base == "surrogate.json":
+        return None
+    if not (base.startswith("surrogate_") and base.endswith(".json")):
+        return None
+    middle = base[len("surrogate_") : -len(".json")]
+    return middle or None
+
+
+def parse_nsdf_next_x_filename(name: str) -> Optional[str]:
+    """Parse ``next_x_<suffix>.json``; return suffix or ``None`` for ``next_x.json``."""
+    base = os.path.basename((name or "").strip())
+    if base == "next_x.json":
+        return None
+    if not (base.startswith("next_x_") and base.endswith(".json")):
+        return None
+    middle = base[len("next_x_") : -len(".json")]
+    return middle or None
+
+
+def _nsdf_reference_data_suffix(
+    data_name: str,
+    *,
+    data_suffixes: Optional[Sequence[str]] = None,
+) -> Optional[str]:
+    """
+    Timestamp floor for auxiliary fallbacks.
+
+    For ``data_<ts>.json`` returns ``ts``. For latest ``data.json`` uses the newest
+    ``data_<ts>.json`` suffix in the directory when present.
+    """
+    parsed = parse_nsdf_data_filename(os.path.basename((data_name or "").strip()))
+    if parsed:
+        return parsed
+    if data_suffixes:
+        ordered = sorted(set(data_suffixes), reverse=True)
+        if ordered:
+            return ordered[0]
+    return None
+
+
+def _nsdf_suffixes_after_reference(
+    suffixes: Sequence[str],
+    reference_suffix: Optional[str],
+) -> List[str]:
+    """Newest-first auxiliary suffixes strictly after ``reference_suffix``."""
+    ordered = sorted(set(suffixes), reverse=True)
+    if not reference_suffix:
+        return ordered
+    ref = reference_suffix.strip().upper()
+    return [suffix for suffix in ordered if suffix.strip().upper() > ref]
+
+
+def list_nsdf_surrogate_suffixes_from_s3(
+    paths: StrainDashboardPaths,
+    *,
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """List timestamp suffixes from ``surrogate_<suffix>.json`` under the S3 prefix."""
+    bucket = (paths.s3_bucket or "").strip()
+    data_key = (paths.s3_data_key or "").strip()
+    if not bucket and (paths.json_url or "").strip():
+        cfg = _parse_gateway_url_with_query_keys((paths.json_url or "").strip())
+        if cfg:
+            bucket = (cfg.get("bucket") or "").strip()
+            data_key = (cfg.get("key") or "").strip()
+    if not bucket:
+        return []
+
+    prefix = ""
+    if data_key:
+        if "/" in data_key:
+            prefix = data_key.rsplit("/", 1)[0] + "/"
+        elif parse_nsdf_data_filename(data_key) is None:
+            prefix = data_key.rstrip("/") + "/"
+
+    list_paths = StrainDashboardPaths(
+        s3_bucket=bucket,
+        s3_data_key=data_key or "data.json",
+        s3_endpoint_url=paths.s3_endpoint_url,
+        s3_region=paths.s3_region,
+        s3_env_file=paths.s3_env_file,
+        json_url=paths.json_url,
+    )
+    try:
+        client = _make_nsdf_s3_client(list_paths, mongo_s3_auth=mongo_s3_auth)
+    except Exception:
+        return []
+
+    suffixes: List[str] = []
+    continuation: Optional[str] = None
+    try:
+        while True:
+            params: Dict[str, Any] = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": 1000}
+            if continuation:
+                params["ContinuationToken"] = continuation
+            result = client.list_objects_v2(**params)
+            for obj in result.get("Contents") or []:
+                name = os.path.basename(str(obj.get("Key") or ""))
+                parsed = parse_nsdf_surrogate_filename(name)
+                if parsed:
+                    suffixes.append(parsed)
+            if not result.get("IsTruncated"):
+                break
+            continuation = result.get("NextContinuationToken")
+            if not continuation:
+                break
+    except Exception:
+        return []
+    return sorted(set(suffixes), reverse=True)
+
+
+def list_nsdf_next_x_suffixes_from_s3(
+    paths: StrainDashboardPaths,
+    *,
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """List timestamp suffixes from ``next_x_<suffix>.json`` under the S3 prefix."""
+    bucket = (paths.s3_bucket or "").strip()
+    data_key = (paths.s3_data_key or "").strip()
+    if not bucket and (paths.json_url or "").strip():
+        cfg = _parse_gateway_url_with_query_keys((paths.json_url or "").strip())
+        if cfg:
+            bucket = (cfg.get("bucket") or "").strip()
+            data_key = (cfg.get("key") or "").strip()
+    if not bucket:
+        return []
+
+    prefix = ""
+    if data_key:
+        if "/" in data_key:
+            prefix = data_key.rsplit("/", 1)[0] + "/"
+        elif parse_nsdf_data_filename(data_key) is None:
+            prefix = data_key.rstrip("/") + "/"
+
+    list_paths = StrainDashboardPaths(
+        s3_bucket=bucket,
+        s3_data_key=data_key or "data.json",
+        s3_endpoint_url=paths.s3_endpoint_url,
+        s3_region=paths.s3_region,
+        s3_env_file=paths.s3_env_file,
+        json_url=paths.json_url,
+    )
+    try:
+        client = _make_nsdf_s3_client(list_paths, mongo_s3_auth=mongo_s3_auth)
+    except Exception:
+        return []
+
+    suffixes: List[str] = []
+    continuation: Optional[str] = None
+    try:
+        while True:
+            params: Dict[str, Any] = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": 1000}
+            if continuation:
+                params["ContinuationToken"] = continuation
+            result = client.list_objects_v2(**params)
+            for obj in result.get("Contents") or []:
+                name = os.path.basename(str(obj.get("Key") or ""))
+                parsed = parse_nsdf_next_x_filename(name)
+                if parsed:
+                    suffixes.append(parsed)
+            if not result.get("IsTruncated"):
+                break
+            continuation = result.get("NextContinuationToken")
+            if not continuation:
+                break
+    except Exception:
+        return []
+    return sorted(set(suffixes), reverse=True)
+
+
+def _merged_snapshot_suffixes_from_directory(directory: str) -> List[str]:
+    return sorted(
+        set(list_nsdf_version_suffixes_from_directory(directory))
+        | set(list_nsdf_surrogate_suffixes_from_directory(directory)),
+        reverse=True,
+    )
+
+
+def _merged_snapshot_suffixes_from_s3(
+    paths: StrainDashboardPaths,
+    *,
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    return sorted(
+        set(list_nsdf_version_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth))
+        | set(list_nsdf_surrogate_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth)),
+        reverse=True,
+    )
+
+
+def discover_nsdf_version_options(
+    paths: StrainDashboardPaths,
+    *,
+    base_dir: str = "",
+    save_dir: str = "",
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+) -> List[Tuple[str, str]]:
+    """
+    Return ``(value, label)`` pairs for a version selector.
+
+    ``latest`` is always first; values are ISO-like suffixes such as ``20260606T223505Z``.
+
+    With ``LOCAL_FILES_FIRST_FOR_TESTING=1``, ``LOCAL_DATA_DIR`` runs list only that
+    folder. Otherwise S3 / gateway runs list only the resolved remote prefix. The two
+    sources are never merged.
+    """
+    options: List[Tuple[str, str]] = [("latest", "Latest (data.json)")]
+    seen: set[str] = set()
+
+    local_dir = nsdf_listing_directory(paths, base_dir=base_dir, save_dir=save_dir)
+    for suffix in list_nsdf_version_suffixes_from_directory(local_dir):
+        if suffix not in seen:
+            seen.add(suffix)
+            options.append((suffix, suffix))
+
+    if not _remote_snapshot_listing_enabled(paths):
+        return options
+
+    for suffix in list_nsdf_version_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth):
+        if suffix not in seen:
+            seen.add(suffix)
+            options.append((suffix, suffix))
+
+    return options
 
 
 def _credential_is_placeholder(value: str) -> bool:
@@ -446,7 +1131,7 @@ def apply_gateway_credentials_to_url(url: str, access_key: str, secret_key: str)
 
 def resolve_strain_json_remote_link_from_dataset(doc: Mapping[str, Any]) -> str:
     """Remote strain JSON URL with real gateway credentials when stored on the dataset."""
-    link = pick_strain_json_link_from_dataset_doc(doc)
+    link = normalize_nsdf_remote_data_link(pick_strain_json_link_from_dataset_doc(doc))
     if not link:
         return ""
     ak = str(doc.get("s3_access_key_id") or doc.get("accesskey") or "").strip()
@@ -458,6 +1143,48 @@ def resolve_strain_json_remote_link_from_dataset(doc: Mapping[str, Any]) -> str:
     if ak and sk and _looks_like_http_url(link):
         return apply_gateway_credentials_to_url(link, ak, sk)
     return link
+
+
+def promote_gateway_json_url_to_s3_paths(paths: StrainDashboardPaths) -> StrainDashboardPaths:
+    """
+    When ``json_url`` is a ScientistCloud gateway link, populate ``s3_bucket`` / ``s3_data_key``.
+
+    Portal datasets usually pass gateway HTTPS URLs without explicit S3 fields. Promoting
+    enables direct S3 reads and timestamped surrogate fallback for ``data.json`` / latest.
+    """
+    if paths.has_s3_source():
+        return paths
+    url = normalize_nsdf_gateway_data_url((paths.json_url or "").strip())
+    if not url:
+        return paths
+    cfg = _parse_gateway_url_with_query_keys(url)
+    if not cfg:
+        return paths
+    bucket = (cfg.get("bucket") or "").strip()
+    key = normalize_nsdf_data_object_key((cfg.get("key") or "").strip())
+    if not bucket or not key:
+        return paths
+    return StrainDashboardPaths(
+        local_json_path=paths.local_json_path,
+        json_url=url,
+        surrogate_json_path=paths.surrogate_json_path,
+        surrogate_json_url=paths.surrogate_json_url,
+        next_x_json_path=paths.next_x_json_path,
+        next_x_json_url=paths.next_x_json_url,
+        local_data_dir=paths.local_data_dir,
+        s3_env_file=paths.s3_env_file,
+        s3_bucket=bucket,
+        s3_data_key=key,
+        s3_surrogate_key=paths.s3_surrogate_key,
+        s3_next_x_key=paths.s3_next_x_key,
+        s3_endpoint_url=(cfg.get("endpoint_url") or paths.s3_endpoint_url or "").strip(),
+        s3_region=(cfg.get("region_name") or paths.s3_region or "us-east-1").strip() or "us-east-1",
+        version_suffix=paths.version_suffix,
+    )
+
+
+def _finalize_strain_paths(paths: StrainDashboardPaths) -> StrainDashboardPaths:
+    return promote_gateway_json_url_to_s3_paths(paths)
 
 
 def enrich_strain_paths_from_dataset_doc(
@@ -472,54 +1199,92 @@ def enrich_strain_paths_from_dataset_doc(
     (same fields as portal dashboard share links).
     """
     if (paths.local_json_path or "").strip() or (paths.json_url or "").strip():
-        return paths
+        return _finalize_strain_paths(paths)
     bd = (base_dir or "").strip()
     sd = (save_dir or "").strip()
     mirror = find_strain_json_under_dataset_dir(bd) or find_strain_json_under_dataset_dir(sd)
     if mirror:
-        return _copy_s3_fields(
-            paths,
-            StrainDashboardPaths(
-                local_json_path=mirror,
-                json_url="",
-                surrogate_json_path=paths.surrogate_json_path,
-                surrogate_json_url=paths.surrogate_json_url,
-            ),
+        return _finalize_strain_paths(
+            _copy_s3_fields(
+                paths,
+                StrainDashboardPaths(
+                    local_json_path=mirror,
+                    json_url="",
+                    surrogate_json_path=paths.surrogate_json_path,
+                    surrogate_json_url=paths.surrogate_json_url,
+                    next_x_json_path=paths.next_x_json_path,
+                    next_x_json_url=paths.next_x_json_url,
+                ),
+            )
         )
     if not doc:
-        return paths
+        return _finalize_strain_paths(paths)
     link = resolve_strain_json_remote_link_from_dataset(doc)
     if not link:
-        return paths
+        return _finalize_strain_paths(paths)
+    if link.lower().startswith("s3://"):
+        bucket, data_key = parse_s3_uri(link)
+        if bucket and data_key:
+            ep = str(doc.get("s3_endpoint_url") or "").strip()
+            reg = str(doc.get("s3_region_name") or "us-east-1").strip() or "us-east-1"
+            return _finalize_strain_paths(
+                _copy_s3_fields(
+                    paths,
+                    StrainDashboardPaths(
+                        local_json_path="",
+                        json_url="",
+                        surrogate_json_path=paths.surrogate_json_path,
+                        surrogate_json_url=paths.surrogate_json_url,
+                        next_x_json_path=paths.next_x_json_path,
+                        next_x_json_url=paths.next_x_json_url,
+                        s3_bucket=bucket,
+                        s3_data_key=data_key,
+                        s3_endpoint_url=ep,
+                        s3_region=reg,
+                    ),
+                )
+            )
     if _looks_like_http_url(link):
-        return _copy_s3_fields(
+        return _finalize_strain_paths(
+            _copy_s3_fields(
+                paths,
+                StrainDashboardPaths(
+                    local_json_path="",
+                    json_url=link,
+                    surrogate_json_path=paths.surrogate_json_path,
+                    surrogate_json_url=paths.surrogate_json_url,
+                    next_x_json_path=paths.next_x_json_path,
+                    next_x_json_url=paths.next_x_json_url,
+                ),
+            )
+        )
+    if os.path.isfile(link):
+        return _finalize_strain_paths(
+            _copy_s3_fields(
+                paths,
+                StrainDashboardPaths(
+                    local_json_path=link,
+                    json_url="",
+                    surrogate_json_path=paths.surrogate_json_path,
+                    surrogate_json_url=paths.surrogate_json_url,
+                    next_x_json_path=paths.next_x_json_path,
+                    next_x_json_url=paths.next_x_json_url,
+                ),
+            )
+        )
+    # s3:// and other schemes: pass as URL for downstream loaders
+    return _finalize_strain_paths(
+        _copy_s3_fields(
             paths,
             StrainDashboardPaths(
                 local_json_path="",
                 json_url=link,
                 surrogate_json_path=paths.surrogate_json_path,
                 surrogate_json_url=paths.surrogate_json_url,
+                next_x_json_path=paths.next_x_json_path,
+                next_x_json_url=paths.next_x_json_url,
             ),
         )
-    if os.path.isfile(link):
-        return _copy_s3_fields(
-            paths,
-            StrainDashboardPaths(
-                local_json_path=link,
-                json_url="",
-                surrogate_json_path=paths.surrogate_json_path,
-                surrogate_json_url=paths.surrogate_json_url,
-            ),
-        )
-    # s3:// and other schemes: pass as URL for downstream loaders
-    return _copy_s3_fields(
-        paths,
-        StrainDashboardPaths(
-            local_json_path="",
-            json_url=link,
-            surrogate_json_path=paths.surrogate_json_path,
-            surrogate_json_url=paths.surrogate_json_url,
-        ),
     )
 
 
@@ -717,7 +1482,7 @@ def load_json_from_url(
     from urllib.error import HTTPError, URLError
     from urllib.request import Request, urlopen
 
-    u = (url or "").strip()
+    u = normalize_nsdf_gateway_data_url((url or "").strip())
     if not u.lower().startswith(("http://", "https://")):
         raise ValueError("JSON URL must start with http:// or https://")
 
@@ -816,8 +1581,11 @@ def _sibling_surrogate_path(data_path: str) -> str:
     p = (data_path or "").strip()
     if not p or _looks_like_http_url(p):
         return ""
-    if os.path.basename(p).lower() != "data.json":
+    suffix = parse_nsdf_data_filename(os.path.basename(p))
+    if suffix is None and os.path.basename(p).lower() != "data.json":
         return ""
+    if suffix:
+        return os.path.join(os.path.dirname(p), f"surrogate_{suffix}.json")
     return os.path.join(os.path.dirname(p), "surrogate.json")
 
 
@@ -828,15 +1596,21 @@ def _sibling_surrogate_url(data_url: str) -> str:
     if not _looks_like_http_url(u):
         return ""
     parts = urlparse(u)
-    if not parts.path.lower().endswith("/data.json"):
+    segments = [x for x in (parts.path or "").split("/") if x]
+    if not segments:
         return ""
-    new_path = parts.path[: -len("data.json")] + "surrogate.json"
+    suffix = parse_nsdf_data_filename(segments[-1])
+    if suffix is None and segments[-1].lower() != "data.json":
+        return ""
+    segments[-1] = f"surrogate_{suffix}.json" if suffix else "surrogate.json"
+    new_path = "/" + "/".join(segments)
     return urlunparse((parts.scheme, parts.netloc, new_path, parts.params, parts.query, parts.fragment))
 
 
 def load_optional_surrogate_json(
     paths: StrainDashboardPaths,
     *,
+    data_doc: Optional[Mapping[str, Any]] = None,
     mongo_s3_auth: Optional[Dict[str, str]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], List[str], StrainDashboardPaths]:
     """
@@ -870,6 +1644,33 @@ def load_optional_surrogate_json(
             if sib_url:
                 candidates.append(("url", sib_url, False))
 
+    tried = {value for _, value, _ in candidates}
+    for path in _iter_surrogate_path_candidates(paths):
+        if path not in tried:
+            candidates.append(("path", path, False))
+            tried.add(path)
+    if paths.json_url:
+        from urllib.parse import urlparse
+
+        data_name = (
+            os.path.basename(urlparse(paths.json_url).path or "")
+            if _looks_like_http_url(paths.json_url)
+            else ""
+        )
+        data_suffixes = list_nsdf_version_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth)
+        reference = _nsdf_reference_data_suffix(data_name, data_suffixes=data_suffixes)
+        sur_suffixes = list_nsdf_surrogate_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth)
+        for suffix in _nsdf_suffixes_after_reference(sur_suffixes, reference):
+            _, sur_fn, _ = nsdf_triplet_basenames(suffix)
+            sur_url = _replace_url_basename(paths.json_url, sur_fn)
+            if sur_url not in tried:
+                candidates.append(("url", sur_url, False))
+                tried.add(sur_url)
+
+    display_size: Optional[Tuple[int, int]] = None
+    if isinstance(data_doc, Mapping):
+        display_size, _ = resolve_nsdf_grid_size(data_doc)
+
     for kind, value, explicit in candidates:
         try:
             if kind == "path":
@@ -878,6 +1679,17 @@ def load_optional_surrogate_json(
             else:
                 doc = load_json_from_url(value, s3_auth_override=mongo_s3_auth)
                 effective.surrogate_json_url = value
+            if display_size is not None and not _surrogate_doc_is_usable_for_display(
+                doc,
+                display_size=display_size,
+            ):
+                length = len((doc or {}).get("surrogate") or [])
+                level = "Configured" if explicit else "Inferred"
+                messages.append(
+                    f"{level} surrogate JSON skipped ({value}): model grid too small "
+                    f"for display ({length} values for {display_size[0]}x{display_size[1]} grid)."
+                )
+                continue
             messages.append(f"Loaded surrogate JSON from {kind}: {value}")
             return doc, messages, effective
         except FileNotFoundError as exc:
@@ -890,32 +1702,253 @@ def load_optional_surrogate_json(
     return None, messages, effective
 
 
+def _sibling_next_x_path(data_path: str) -> str:
+    p = (data_path or "").strip()
+    if not p or _looks_like_http_url(p):
+        return ""
+    suffix = parse_nsdf_data_filename(os.path.basename(p))
+    if suffix is None and os.path.basename(p).lower() != "data.json":
+        return ""
+    if suffix:
+        return os.path.join(os.path.dirname(p), f"next_x_{suffix}.json")
+    return os.path.join(os.path.dirname(p), "next_x.json")
+
+
+def _sibling_next_x_url(data_url: str) -> str:
+    from urllib.parse import urlparse, urlunparse
+
+    u = (data_url or "").strip()
+    if not _looks_like_http_url(u):
+        return ""
+    parts = urlparse(u)
+    segments = [x for x in (parts.path or "").split("/") if x]
+    if not segments:
+        return ""
+    suffix = parse_nsdf_data_filename(segments[-1])
+    if suffix is None and segments[-1].lower() != "data.json":
+        return ""
+    segments[-1] = f"next_x_{suffix}.json" if suffix else "next_x.json"
+    new_path = "/" + "/".join(segments)
+    return urlunparse((parts.scheme, parts.netloc, new_path, parts.params, parts.query, parts.fragment))
+
+
+def _sibling_next_x_s3_key(data_key: str) -> str:
+    key = (data_key or "").strip()
+    if not key:
+        return ""
+    basename = key.rsplit("/", 1)[-1]
+    suffix = parse_nsdf_data_filename(basename)
+    if suffix is None and basename.lower() != "data.json":
+        return ""
+    prefix = key[: -len(basename)]
+    if suffix:
+        return prefix + f"next_x_{suffix}.json"
+    return prefix + "next_x.json"
+
+
+def validate_nsdf_next_x_doc(value: Any) -> NSDFNextXData:
+    """Validate ``next_x.json``: a list of workflow blocks with coordinate pairs."""
+    warnings: List[str] = []
+    if value is None:
+        return NSDFNextXData(warnings=warnings)
+    if not isinstance(value, list):
+        return NSDFNextXData(warnings=["Skipping next_x JSON: expected a JSON array."])
+
+    entries: List[NSDFNextXEntry] = []
+    for i, item in enumerate(value):
+        if not isinstance(item, dict):
+            warnings.append(f"Skipping next_x[{i}]: expected a JSON object.")
+            continue
+        workflow_id = str(item.get("workflow_id") or "").strip()
+        if not workflow_id:
+            warnings.append(f"Skipping next_x[{i}]: missing workflow_id.")
+            continue
+        data = item.get("data")
+        if not isinstance(data, list) or not data:
+            warnings.append(f"Skipping next_x[{i}] ({workflow_id!r}): data must be a non-empty list.")
+            continue
+        coords: List[Tuple[float, float]] = []
+        bad_row = False
+        for j, row_value in enumerate(data):
+            if not isinstance(row_value, list) or len(row_value) < 2:
+                warnings.append(
+                    f"Skipping next_x[{i}] ({workflow_id!r}): data[{j}] must contain labx/labz values."
+                )
+                bad_row = True
+                break
+            x, z = row_value[0], row_value[1]
+            if not (_is_number(x) and _is_number(z)):
+                warnings.append(
+                    f"Skipping next_x[{i}] ({workflow_id!r}): data[{j}] must contain numeric values."
+                )
+                bad_row = True
+                break
+            fx, fz = float(x), float(z)
+            if not (math.isfinite(fx) and math.isfinite(fz)):
+                warnings.append(
+                    f"Skipping next_x[{i}] ({workflow_id!r}): data[{j}] values must be finite."
+                )
+                bad_row = True
+                break
+            coords.append((fx, fz))
+        if bad_row:
+            continue
+        entries.append(
+            NSDFNextXEntry(
+                workflow_id=workflow_id,
+                coordinates=np.asarray(coords, dtype=np.float64),
+            )
+        )
+    return NSDFNextXData(entries=entries, warnings=warnings)
+
+
+def load_optional_next_x_json(
+    paths: StrainDashboardPaths,
+    *,
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+) -> Tuple[Optional[List[Dict[str, Any]]], List[str], StrainDashboardPaths]:
+    """
+    Load optional ``next_x.json`` from explicit path/URL or inferred sibling.
+
+    Missing inferred siblings are non-fatal.
+    """
+    messages: List[str] = []
+    explicit_path = (paths.next_x_json_path or "").strip()
+    explicit_url = (paths.next_x_json_url or "").strip()
+    effective = StrainDashboardPaths(
+        local_json_path=paths.local_json_path,
+        json_url=paths.json_url,
+        surrogate_json_path=paths.surrogate_json_path,
+        surrogate_json_url=paths.surrogate_json_url,
+        next_x_json_path=explicit_path,
+        next_x_json_url=explicit_url,
+        local_data_dir=paths.local_data_dir,
+    )
+
+    candidates: List[Tuple[str, str, bool]] = []
+    if explicit_path:
+        candidates.append(("path", explicit_path, True))
+    if explicit_url:
+        candidates.append(("url", explicit_url, True))
+    if not candidates:
+        sib_path = _sibling_next_x_path(paths.local_json_path)
+        if sib_path:
+            candidates.append(("path", sib_path, False))
+        else:
+            sib_url = _sibling_next_x_url(paths.json_url)
+            if sib_url:
+                candidates.append(("url", sib_url, False))
+
+    tried = {value for _, value, _ in candidates}
+    for path in _iter_next_x_path_candidates(paths):
+        if path not in tried:
+            candidates.append(("path", path, False))
+            tried.add(path)
+    if paths.json_url:
+        from urllib.parse import urlparse
+
+        data_name = (
+            os.path.basename(urlparse(paths.json_url).path or "")
+            if _looks_like_http_url(paths.json_url)
+            else ""
+        )
+        data_suffixes = list_nsdf_version_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth)
+        reference = _nsdf_reference_data_suffix(data_name, data_suffixes=data_suffixes)
+        nx_suffixes = list_nsdf_next_x_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth)
+        for suffix in _nsdf_suffixes_after_reference(nx_suffixes, reference):
+            _, _, nx_fn = nsdf_triplet_basenames(suffix)
+            nx_url = _replace_url_basename(paths.json_url, nx_fn)
+            if nx_url not in tried:
+                candidates.append(("url", nx_url, False))
+                tried.add(nx_url)
+
+    for kind, value, explicit in candidates:
+        try:
+            if kind == "path":
+                doc = load_json_from_local_path(value)
+                effective.next_x_json_path = value
+            else:
+                doc = load_json_from_url(value, s3_auth_override=mongo_s3_auth)
+                effective.next_x_json_url = value
+            if not isinstance(doc, list):
+                raise ValueError("next_x.json must be a JSON array.")
+            messages.append(f"Loaded next_x JSON from {kind}: {value}")
+            return doc, messages, effective
+        except FileNotFoundError as exc:
+            level = "Configured" if explicit else "Inferred"
+            messages.append(f"{level} next_x JSON not loaded: {exc}")
+        except Exception as exc:
+            level = "Configured" if explicit else "Inferred"
+            messages.append(f"{level} next_x JSON skipped: {exc}")
+
+    return None, messages, effective
+
+
 def load_nsdf_json_bundle_from_local_data_dir(paths: StrainDashboardPaths) -> Optional[NSDFLoadedBundle]:
     """Load fixed-name data/surrogate JSON files from LOCAL_DATA_DIR when present."""
     local_dir = (paths.local_data_dir or "").strip()
     if not local_dir:
         return None
-    data_path = os.path.join(local_dir, "data.json")
+    data_fn, sur_fn, nx_fn = nsdf_triplet_basenames(paths.version_suffix or "")
+    data_path = os.path.join(local_dir, data_fn)
     if not os.path.isfile(data_path):
         return None
 
     data = load_json_from_local_path(data_path)
+    display_size, _ = resolve_nsdf_grid_size(data)
     surrogate = None
     messages = [f"Loaded NSDF data JSON from local path: {data_path}"]
-    surrogate_path = os.path.join(local_dir, "surrogate.json")
     effective = StrainDashboardPaths(
         local_json_path=data_path,
         surrogate_json_path="",
         local_data_dir=local_dir,
+        version_suffix=paths.version_suffix,
     )
-    if os.path.isfile(surrogate_path):
+    for surrogate_path in _iter_surrogate_path_candidates(
+        paths,
+        data_path=data_path,
+        local_dir=local_dir,
+    ):
+        if not os.path.isfile(surrogate_path):
+            continue
         try:
-            surrogate = load_json_from_local_path(surrogate_path)
+            candidate_doc = load_json_from_local_path(surrogate_path)
+            if not _surrogate_doc_is_usable_for_display(
+                candidate_doc,
+                display_size=display_size,
+            ):
+                length = len((candidate_doc or {}).get("surrogate") or [])
+                messages.append(
+                    f"Local surrogate JSON skipped ({surrogate_path}): "
+                    f"model grid too small for display ({length} values for "
+                    f"{display_size[0]}x{display_size[1]} grid)."
+                )
+                continue
+            surrogate = candidate_doc
             effective.surrogate_json_path = surrogate_path
             messages.append(f"Loaded surrogate JSON from local path: {surrogate_path}")
+            break
         except Exception as exc:
-            messages.append(f"Local surrogate JSON skipped: {exc}")
-    return NSDFLoadedBundle(data=data, surrogate=surrogate, messages=messages, paths=effective)
+            messages.append(f"Local surrogate JSON skipped ({surrogate_path}): {exc}")
+    next_x = None
+    for next_x_path in _iter_next_x_path_candidates(
+        paths,
+        data_path=data_path,
+        local_dir=local_dir,
+    ):
+        if not os.path.isfile(next_x_path):
+            continue
+        try:
+            next_x_doc = load_json_from_local_path(next_x_path)
+            if isinstance(next_x_doc, list):
+                next_x = next_x_doc
+                effective.next_x_json_path = next_x_path
+                messages.append(f"Loaded next_x JSON from local path: {next_x_path}")
+                break
+            messages.append(f"Local next_x JSON skipped ({next_x_path}): expected a JSON array.")
+        except Exception as exc:
+            messages.append(f"Local next_x JSON skipped ({next_x_path}): {exc}")
+    return NSDFLoadedBundle(data=data, surrogate=surrogate, next_x=next_x, messages=messages, paths=effective)
 
 
 def load_nsdf_json_bundle(
@@ -923,24 +1956,195 @@ def load_nsdf_json_bundle(
     *,
     mongo_s3_auth: Optional[Dict[str, str]] = None,
 ) -> NSDFLoadedBundle:
-    local_bundle = load_nsdf_json_bundle_from_local_data_dir(paths)
-    if local_bundle is not None:
-        return local_bundle
-    if paths.has_s3_source():
-        return load_nsdf_json_bundle_from_s3(paths)
-    data = load_strain_json(paths, mongo_s3_auth=mongo_s3_auth)
+    if _local_data_dir_active(paths):
+        local_bundle = load_nsdf_json_bundle_from_local_data_dir(paths)
+        if local_bundle is not None:
+            return local_bundle
+        data_fn, _, _ = nsdf_triplet_basenames(paths.version_suffix or "")
+        local_dir = (paths.local_data_dir or "").strip()
+        raise FileNotFoundError(
+            f"Local NSDF file not found: {os.path.join(local_dir, data_fn)} "
+            f"(LOCAL_DATA_DIR={local_dir!r})"
+        )
+
+    load_paths = promote_gateway_json_url_to_s3_paths(_strip_local_data_dir_paths(paths))
+    if load_paths.has_s3_source():
+        load_paths.local_json_path = ""
+        load_paths.surrogate_json_path = ""
+        load_paths.next_x_json_path = ""
+        return load_nsdf_json_bundle_from_s3(load_paths, mongo_s3_auth=mongo_s3_auth)
+    data = load_strain_json(load_paths, mongo_s3_auth=mongo_s3_auth)
     surrogate, messages, effective = load_optional_surrogate_json(
-        paths,
+        load_paths,
+        data_doc=data,
         mongo_s3_auth=mongo_s3_auth,
     )
-    return NSDFLoadedBundle(data=data, surrogate=surrogate, messages=messages, paths=effective)
+    next_x, next_x_messages, effective = load_optional_next_x_json(
+        effective,
+        mongo_s3_auth=mongo_s3_auth,
+    )
+    messages.extend(next_x_messages)
+    return NSDFLoadedBundle(
+        data=data,
+        surrogate=surrogate,
+        next_x=next_x,
+        messages=messages,
+        paths=effective,
+    )
+
+
+def _nsdf_key_prefix(key: str) -> str:
+    key = (key or "").strip()
+    if not key:
+        return ""
+    basename = key.rsplit("/", 1)[-1]
+    return key[: -len(basename)] if basename else ""
+
+
+def _iter_surrogate_path_candidates(
+    paths: StrainDashboardPaths,
+    *,
+    data_path: str = "",
+    local_dir: str = "",
+) -> List[str]:
+    """Ordered surrogate.json paths to try, including timestamped fallbacks."""
+    candidates: List[str] = []
+    seen: set[str] = set()
+
+    def add(path: str) -> None:
+        p = (path or "").strip()
+        if p and p not in seen:
+            seen.add(p)
+            candidates.append(p)
+
+    data_path = (data_path or paths.local_json_path or "").strip()
+    local_dir = (local_dir or paths.local_data_dir or "").strip()
+    directory = local_dir or (os.path.dirname(data_path) if data_path else "")
+
+    add((paths.surrogate_json_path or "").strip())
+    add(_sibling_surrogate_path(data_path))
+
+    data_basename = os.path.basename(data_path) if data_path else ""
+    data_suffixes = list_nsdf_version_suffixes_from_directory(directory)
+    reference = _nsdf_reference_data_suffix(data_basename, data_suffixes=data_suffixes)
+    sur_suffixes = list_nsdf_surrogate_suffixes_from_directory(directory)
+    for listed_suffix in _nsdf_suffixes_after_reference(sur_suffixes, reference):
+        _, sur_fn, _ = nsdf_triplet_basenames(listed_suffix)
+        if directory:
+            add(os.path.join(directory, sur_fn))
+    return candidates
+
+
+def _iter_next_x_path_candidates(
+    paths: StrainDashboardPaths,
+    *,
+    data_path: str = "",
+    local_dir: str = "",
+) -> List[str]:
+    """Ordered next_x.json paths to try, including timestamped fallbacks."""
+    candidates: List[str] = []
+    seen: set[str] = set()
+
+    def add(path: str) -> None:
+        p = (path or "").strip()
+        if p and p not in seen:
+            seen.add(p)
+            candidates.append(p)
+
+    data_path = (data_path or paths.local_json_path or "").strip()
+    local_dir = (local_dir or paths.local_data_dir or "").strip()
+    directory = local_dir or (os.path.dirname(data_path) if data_path else "")
+
+    add((paths.next_x_json_path or "").strip())
+    add(_sibling_next_x_path(data_path))
+
+    data_basename = os.path.basename(data_path) if data_path else ""
+    data_suffixes = list_nsdf_version_suffixes_from_directory(directory)
+    reference = _nsdf_reference_data_suffix(data_basename, data_suffixes=data_suffixes)
+    nx_suffixes = list_nsdf_next_x_suffixes_from_directory(directory)
+    for listed_suffix in _nsdf_suffixes_after_reference(nx_suffixes, reference):
+        _, _, nx_fn = nsdf_triplet_basenames(listed_suffix)
+        if directory:
+            add(os.path.join(directory, nx_fn))
+    return candidates
+
+
+def _iter_surrogate_s3_key_candidates(
+    paths: StrainDashboardPaths,
+    data_key: str,
+    *,
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """Ordered surrogate S3 keys to try, including timestamped fallbacks."""
+    candidates: List[str] = []
+    seen: set[str] = set()
+
+    def add(key: str) -> None:
+        k = (key or "").strip()
+        if k and k not in seen:
+            seen.add(k)
+            candidates.append(k)
+
+    data_key = (data_key or "").strip()
+    prefix = _nsdf_key_prefix(data_key)
+
+    add((paths.s3_surrogate_key or "").strip())
+    add(_sibling_surrogate_s3_key(data_key))
+
+    data_basename = data_key.rsplit("/", 1)[-1] if data_key else ""
+    data_suffixes = list_nsdf_version_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth)
+    reference = _nsdf_reference_data_suffix(data_basename, data_suffixes=data_suffixes)
+    sur_suffixes = list_nsdf_surrogate_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth)
+    for listed_suffix in _nsdf_suffixes_after_reference(sur_suffixes, reference):
+        _, sur_fn, _ = nsdf_triplet_basenames(listed_suffix)
+        add(prefix + sur_fn)
+    return candidates
+
+
+def _iter_next_x_s3_key_candidates(
+    paths: StrainDashboardPaths,
+    data_key: str,
+    *,
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """Ordered next_x S3 keys to try, including timestamped fallbacks."""
+    candidates: List[str] = []
+    seen: set[str] = set()
+
+    def add(key: str) -> None:
+        k = (key or "").strip()
+        if k and k not in seen:
+            seen.add(k)
+            candidates.append(k)
+
+    data_key = (data_key or "").strip()
+    prefix = _nsdf_key_prefix(data_key)
+
+    add((paths.s3_next_x_key or "").strip())
+    add(_sibling_next_x_s3_key(data_key))
+
+    data_basename = data_key.rsplit("/", 1)[-1] if data_key else ""
+    data_suffixes = list_nsdf_version_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth)
+    reference = _nsdf_reference_data_suffix(data_basename, data_suffixes=data_suffixes)
+    nx_suffixes = list_nsdf_next_x_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth)
+    for listed_suffix in _nsdf_suffixes_after_reference(nx_suffixes, reference):
+        _, _, nx_fn = nsdf_triplet_basenames(listed_suffix)
+        add(prefix + nx_fn)
+    return candidates
 
 
 def _sibling_surrogate_s3_key(data_key: str) -> str:
     key = (data_key or "").strip()
-    if not key.lower().endswith("data.json"):
+    if not key:
         return ""
-    return key[: -len("data.json")] + "surrogate.json"
+    basename = key.rsplit("/", 1)[-1]
+    suffix = parse_nsdf_data_filename(basename)
+    if suffix is None and basename.lower() != "data.json":
+        return ""
+    prefix = key[: -len(basename)]
+    if suffix:
+        return prefix + f"surrogate_{suffix}.json"
+    return prefix + "surrogate.json"
 
 
 def _s3_env_values(paths: StrainDashboardPaths) -> Dict[str, str]:
@@ -958,12 +2162,33 @@ def _s3_env_values(paths: StrainDashboardPaths) -> Dict[str, str]:
     }
 
 
-def _make_nsdf_s3_client(paths: StrainDashboardPaths):
+def _make_nsdf_s3_client(
+    paths: StrainDashboardPaths,
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+):
     import boto3
+    from botocore.config import Config as BotoConfig
 
     cfg = _s3_env_values(paths)
+    if mongo_s3_auth:
+        ak = (mongo_s3_auth.get("access_key_id") or "").strip()
+        sk = (mongo_s3_auth.get("secret_access_key") or "").strip()
+        if ak and sk:
+            cfg["aws_access_key_id"] = ak
+            cfg["aws_secret_access_key"] = sk
+        ep = (mongo_s3_auth.get("endpoint_url") or "").strip()
+        if ep:
+            cfg["endpoint_url"] = ep.rstrip("/")
+        reg = (mongo_s3_auth.get("region_name") or "").strip()
+        if reg:
+            cfg["region_name"] = reg
+        tok = (mongo_s3_auth.get("aws_session_token") or "").strip()
+        if tok:
+            cfg["aws_session_token"] = tok
+
     kwargs: Dict[str, Any] = {
         "region_name": cfg["region_name"],
+        "config": BotoConfig(signature_version="s3v4", s3={"addressing_style": "path"}),
     }
     if cfg["endpoint_url"]:
         kwargs["endpoint_url"] = cfg["endpoint_url"]
@@ -975,7 +2200,7 @@ def _make_nsdf_s3_client(paths: StrainDashboardPaths):
     return boto3.client("s3", **kwargs)
 
 
-def _load_json_from_s3_key(client: Any, bucket: str, key: str) -> Dict[str, Any]:
+def _load_json_from_s3_key(client: Any, bucket: str, key: str) -> Any:
     resp = client.get_object(Bucket=bucket, Key=key)
     raw = resp["Body"].read()
     return json.loads(raw.decode("utf-8"))
@@ -992,7 +2217,55 @@ def _s3_missing_error(exc: Exception) -> bool:
     return code in ("NoSuchKey", "NoSuchBucket", "404", "NotFound")
 
 
-def load_nsdf_json_bundle_from_s3(paths: StrainDashboardPaths) -> NSDFLoadedBundle:
+def _surrogate_list_is_usable_for_display(
+    surrogate_values: Any,
+    *,
+    display_size: Tuple[int, int],
+) -> bool:
+    """Reject stub surrogate arrays (e.g. two zeros) that flatten estimate/variance heatmaps."""
+    if not isinstance(surrogate_values, list) or len(surrogate_values) < 4:
+        return False
+    for value in surrogate_values:
+        if not _is_number(value):
+            return False
+        if not math.isfinite(float(value)):
+            return False
+    if len(surrogate_values) <= 4 and all(float(value) == 0.0 for value in surrogate_values):
+        return False
+    length = len(surrogate_values)
+    display_nx, display_ny = display_size
+    if length == display_nx * display_ny:
+        return True
+    side = int(round(math.sqrt(length)))
+    if side >= 2 and side * side == length:
+        return True
+    for ny in range(2, int(math.sqrt(length)) + 1):
+        if length % ny != 0:
+            continue
+        nx = length // ny
+        if nx >= ny:
+            return True
+    return False
+
+
+def _surrogate_doc_is_usable_for_display(
+    doc: Optional[Mapping[str, Any]],
+    *,
+    display_size: Tuple[int, int],
+) -> bool:
+    if not isinstance(doc, Mapping):
+        return False
+    return _surrogate_list_is_usable_for_display(
+        doc.get("surrogate"),
+        display_size=display_size,
+    )
+
+
+def load_nsdf_json_bundle_from_s3(
+    paths: StrainDashboardPaths,
+    *,
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+) -> NSDFLoadedBundle:
     bucket = (paths.s3_bucket or "").strip()
     data_key = (paths.s3_data_key or "").strip()
     if not bucket or not data_key:
@@ -1000,32 +2273,219 @@ def load_nsdf_json_bundle_from_s3(paths: StrainDashboardPaths) -> NSDFLoadedBund
             "Set S3_BUCKET and S3_DATA_KEY to load NSDF data from S3."
         )
 
-    client = _make_nsdf_s3_client(paths)
+    client = _make_nsdf_s3_client(paths, mongo_s3_auth=mongo_s3_auth)
     data = _load_json_from_s3_key(client, bucket, data_key)
     messages = [f"Loaded NSDF data JSON from s3://{bucket}/{data_key}"]
+    display_size, _ = resolve_nsdf_grid_size(data)
 
     surrogate = None
-    surrogate_key = (paths.s3_surrogate_key or "").strip() or _sibling_surrogate_s3_key(data_key)
+    surrogate_key = ""
+    surrogate_candidates = _iter_surrogate_s3_key_candidates(
+        paths,
+        data_key,
+        mongo_s3_auth=mongo_s3_auth,
+    )
+    for candidate_key in surrogate_candidates:
+        try:
+            candidate_doc = _load_json_from_s3_key(client, bucket, candidate_key)
+            if not _surrogate_doc_is_usable_for_display(
+                candidate_doc,
+                display_size=display_size,
+            ):
+                length = len((candidate_doc or {}).get("surrogate") or [])
+                messages.append(
+                    f"S3 surrogate JSON skipped ({candidate_key}): "
+                    f"model grid too small for display ({length} values for "
+                    f"{display_size[0]}x{display_size[1]} grid)."
+                )
+                continue
+            surrogate = candidate_doc
+            surrogate_key = candidate_key
+            messages.append(f"Loaded surrogate JSON from s3://{bucket}/{candidate_key}")
+            break
+        except Exception as exc:
+            if _s3_missing_error(exc):
+                continue
+            messages.append(f"S3 surrogate JSON skipped ({candidate_key}): {exc}")
+            break
+
+    next_x = None
+    next_x_key = ""
+    for candidate_key in _iter_next_x_s3_key_candidates(
+        paths,
+        data_key,
+        mongo_s3_auth=mongo_s3_auth,
+    ):
+        try:
+            next_x_doc = _load_json_from_s3_key(client, bucket, candidate_key)
+            if isinstance(next_x_doc, list):
+                next_x = next_x_doc
+                next_x_key = candidate_key
+                messages.append(f"Loaded next_x JSON from s3://{bucket}/{candidate_key}")
+                break
+            messages.append(
+                f"S3 next_x JSON skipped ({candidate_key}): expected a JSON array."
+            )
+        except Exception as exc:
+            if _s3_missing_error(exc):
+                continue
+            messages.append(f"S3 next_x JSON skipped ({candidate_key}): {exc}")
+            break
+
     effective = StrainDashboardPaths(
         s3_env_file=paths.s3_env_file,
         local_data_dir=paths.local_data_dir,
         s3_bucket=bucket,
         s3_data_key=data_key,
         s3_surrogate_key=surrogate_key,
+        s3_next_x_key=next_x_key,
         s3_endpoint_url=paths.s3_endpoint_url,
         s3_region=paths.s3_region,
+        version_suffix=paths.version_suffix,
     )
-    if surrogate_key:
-        try:
-            surrogate = _load_json_from_s3_key(client, bucket, surrogate_key)
-            messages.append(f"Loaded surrogate JSON from s3://{bucket}/{surrogate_key}")
-        except Exception as exc:
-            if _s3_missing_error(exc):
-                messages.append(f"S3 surrogate JSON not found: s3://{bucket}/{surrogate_key}")
-            else:
-                messages.append(f"S3 surrogate JSON skipped: {exc}")
+    if not surrogate and surrogate_candidates:
+        messages.append(
+            "S3 surrogate JSON not found for latest triplet or timestamped fallbacks."
+        )
 
-    return NSDFLoadedBundle(data=data, surrogate=surrogate, messages=messages, paths=effective)
+    return NSDFLoadedBundle(data=data, surrogate=surrogate, next_x=next_x, messages=messages, paths=effective)
+
+
+def _location_basename(location: str) -> str:
+    loc = (location or "").strip()
+    if not loc:
+        return ""
+    if _looks_like_http_url(loc):
+        from urllib.parse import urlparse
+
+        path = (urlparse(loc).path or "").strip()
+        return os.path.basename(path) if path else loc
+    return os.path.basename(loc)
+
+
+def primary_nsdf_triplet_locations(paths: StrainDashboardPaths) -> Dict[str, str]:
+    """Expected primary ``data`` / ``surrogate`` / ``next_x`` paths for the active snapshot."""
+    data_fn, sur_fn, nx_fn = nsdf_triplet_basenames(paths.version_suffix or "")
+    loc: Dict[str, str] = {"data": "", "surrogate": "", "next_x": ""}
+
+    if paths.has_s3_source():
+        prefix = _nsdf_key_prefix(paths.s3_data_key)
+        loc["data"] = (paths.s3_data_key or "").strip()
+        loc["surrogate"] = prefix + sur_fn
+        loc["next_x"] = prefix + nx_fn
+        return loc
+
+    if (paths.local_data_dir or "").strip():
+        base = paths.local_data_dir.rstrip("/")
+        loc["data"] = os.path.join(base, data_fn)
+        loc["surrogate"] = os.path.join(base, sur_fn)
+        loc["next_x"] = os.path.join(base, nx_fn)
+        return loc
+
+    if (paths.local_json_path or "").strip() and not _looks_like_http_url(paths.local_json_path):
+        base = os.path.dirname(paths.local_json_path)
+        loc["data"] = os.path.join(base, data_fn)
+        loc["surrogate"] = os.path.join(base, sur_fn)
+        loc["next_x"] = os.path.join(base, nx_fn)
+        return loc
+
+    if (paths.json_url or "").strip():
+        loc["data"] = (paths.json_url or "").strip()
+        loc["surrogate"] = (paths.surrogate_json_url or "").strip() or _sibling_surrogate_url(
+            paths.json_url
+        )
+        loc["next_x"] = (paths.next_x_json_url or "").strip() or _sibling_next_x_url(paths.json_url)
+    return loc
+
+
+def _message_targets_location(message: str, location: str) -> bool:
+    msg = (message or "").strip()
+    loc = (location or "").strip()
+    if not msg or not loc:
+        return False
+    if loc in msg:
+        return True
+    base = _location_basename(loc)
+    return bool(base and base in msg)
+
+
+def collect_nsdf_triplet_load_issues(
+    paths: StrainDashboardPaths,
+    bundle: NSDFLoadedBundle,
+    *,
+    grid_meta: Optional[Mapping[str, Any]] = None,
+) -> Tuple[List[str], List[str]]:
+    """
+    Summarize problems with the primary ``data.json`` / ``surrogate.json`` / ``next_x.json`` triplet.
+
+    Returns ``(errors, warnings)``. Errors indicate the primary snapshot file is missing or unusable
+    (including when a fallback surrogate was used). Warnings cover optional ``next_x.json`` gaps.
+    """
+    errors: List[str] = []
+    warnings: List[str] = []
+    data_fn, sur_fn, nx_fn = nsdf_triplet_basenames(paths.version_suffix or "")
+    primary = primary_nsdf_triplet_locations(paths)
+    loaded_paths = bundle.paths
+
+    loaded_sur = (
+        (loaded_paths.s3_surrogate_key or "").strip()
+        or (loaded_paths.surrogate_json_path or "").strip()
+        or (loaded_paths.surrogate_json_url or "").strip()
+    )
+    loaded_nx = (
+        (loaded_paths.s3_next_x_key or "").strip()
+        or (loaded_paths.next_x_json_path or "").strip()
+        or (loaded_paths.next_x_json_url or "").strip()
+    )
+    primary_sur = (primary.get("surrogate") or "").strip()
+    primary_nx = (primary.get("next_x") or "").strip()
+
+    for msg in bundle.messages:
+        if _message_targets_location(msg, primary_sur) and any(
+            token in msg.lower() for token in ("skipped", "not found", "not loaded", "missing")
+        ):
+            detail = msg.split(":", 1)[-1].strip() if ":" in msg else msg
+            errors.append(f"{sur_fn}: {detail}")
+        elif _message_targets_location(msg, primary_nx) and any(
+            token in msg.lower() for token in ("skipped", "not found", "not loaded", "missing")
+        ):
+            detail = msg.split(":", 1)[-1].strip() if ":" in msg else msg
+            if "expected a json array" in msg.lower():
+                errors.append(f"{nx_fn}: {detail}")
+            else:
+                warnings.append(f"{nx_fn}: {detail}")
+
+    if bundle.surrogate is None:
+        if not any(sur_fn in item for item in errors):
+            errors.append(f"{sur_fn}: not loaded (missing or every fallback failed).")
+    elif primary_sur:
+        primary_base = _location_basename(primary_sur)
+        loaded_base = _location_basename(loaded_sur)
+        if primary_base and loaded_base and primary_base != loaded_base:
+            errors.append(
+                f"{sur_fn}: using fallback {loaded_base} (primary {primary_base} missing or invalid)."
+            )
+
+    if bundle.next_x is None and primary_nx:
+        if not any(nx_fn in item for item in errors + warnings):
+            warnings.append(f"{nx_fn}: not loaded (optional file missing).")
+
+    if isinstance(grid_meta, Mapping):
+        estimate_source = str(grid_meta.get("estimate_source") or "")
+        if estimate_source == "dataset_y_idw":
+            for note in grid_meta.get("warnings") or []:
+                if "Surrogate model grid was empty" in str(note):
+                    if not any(sur_fn in item for item in errors):
+                        errors.append(
+                            f"{sur_fn}: empty or stub model grid; "
+                            "estimate interpolated from measurements."
+                        )
+                    break
+
+    if not bundle.data:
+        errors.append(f"{data_fn}: not loaded.")
+
+    return errors, warnings
 
 
 # ---------------------------------------------------------------------------
@@ -1037,11 +2497,12 @@ def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def _numeric_1d_array_or_none(
+def _numeric_1d_surrogate_array_or_none(
     doc: Optional[Mapping[str, Any]],
     key: str,
     warnings: List[str],
 ) -> Optional[np.ndarray]:
+    """Parse a surrogate model 1D field (length independent of measurement count)."""
     if not doc or key not in doc:
         return None
     value = doc.get(key)
@@ -1056,6 +2517,101 @@ def _numeric_1d_array_or_none(
         warnings.append(f"Skipping surrogate field {key!r}: values must be finite.")
         return None
     return arr
+
+
+def _surrogate_source_grid_size(
+    length: int,
+    surrogate_info: NSDFSurrogateData,
+    surrogate_doc: Optional[Mapping[str, Any]],
+    display_size: Tuple[int, int],
+    warnings: List[str],
+) -> Optional[Tuple[int, int]]:
+    """Infer the model grid shape for a flattened surrogate field."""
+    if surrogate_info.bounds:
+        bounds_size = infer_nsdf_bounds_grid_size({"bounds": list(surrogate_info.bounds)})
+        if bounds_size and bounds_size[0] * bounds_size[1] == length:
+            return bounds_size
+    if isinstance(surrogate_doc, Mapping):
+        bounds_size = infer_nsdf_bounds_grid_size(surrogate_doc)
+        if bounds_size and bounds_size[0] * bounds_size[1] == length:
+            return bounds_size
+    display_nx, display_ny = display_size
+    if length == display_nx * display_ny:
+        return display_nx, display_ny
+    side = int(round(math.sqrt(length)))
+    if side > 0 and side * side == length:
+        return side, side
+    for ny in range(1, int(math.sqrt(length)) + 1):
+        if length % ny != 0:
+            continue
+        nx = length // ny
+        if nx >= ny:
+            return nx, ny
+    warnings.append(
+        f"Could not infer surrogate grid shape for field length {length}; "
+        "provide surrogate bounds."
+    )
+    return None
+
+
+def _align_grid_to_display(
+    grid: np.ndarray,
+    target_nx: int,
+    target_ny: int,
+) -> np.ndarray:
+    """Resize a model grid onto the dashboard display grid."""
+    src_ny, src_nx = grid.shape
+    if src_nx == target_nx and src_ny == target_ny:
+        return grid
+    try:
+        from scipy import ndimage  # type: ignore
+
+        zoom_y = target_ny / float(src_ny)
+        zoom_x = target_nx / float(src_nx)
+        return ndimage.zoom(grid, (zoom_y, zoom_x), order=1)
+    except Exception:
+        y_idx = np.clip(
+            np.rint(np.linspace(0, src_ny - 1, target_ny)).astype(int),
+            0,
+            src_ny - 1,
+        )
+        x_idx = np.clip(
+            np.rint(np.linspace(0, src_nx - 1, target_nx)).astype(int),
+            0,
+            src_nx - 1,
+        )
+        return grid[np.ix_(y_idx, x_idx)]
+
+
+def _surrogate_field_to_display_grid(
+    values: Optional[np.ndarray],
+    *,
+    key: str,
+    surrogate_info: NSDFSurrogateData,
+    surrogate_doc: Optional[Mapping[str, Any]],
+    display_size: Tuple[int, int],
+    warnings: List[str],
+) -> Optional[np.ndarray]:
+    """Reshape a flattened surrogate model field and align it to the display grid."""
+    if values is None:
+        return None
+    length = int(values.shape[0])
+    source_size = _surrogate_source_grid_size(
+        length,
+        surrogate_info,
+        surrogate_doc,
+        display_size,
+        warnings,
+    )
+    if source_size is None:
+        warnings.append(f"Skipping surrogate field {key!r}: unable to map length {length} to a grid.")
+        return None
+    src_nx, src_ny = source_size
+    grid = values.reshape(src_ny, src_nx)
+    display_nx, display_ny = display_size
+    if (src_nx, src_ny) != (display_nx, display_ny):
+        grid = _align_grid_to_display(grid, display_nx, display_ny)
+    return grid
 
 
 def _validate_bounds(value: Any) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
@@ -1087,9 +2643,23 @@ def validate_nsdf_measurement_doc(doc: Mapping[str, Any]) -> NSDFMeasurementData
 
     dataset_x = doc.get("dataset_x")
     dataset_y = doc.get("dataset_y")
-    if not isinstance(dataset_x, list) or not dataset_x:
+    if not isinstance(dataset_x, list):
+        raise ValueError("'dataset_x' must be a list of coordinate pairs.")
+    if not isinstance(dataset_y, list):
+        raise ValueError("'dataset_y' must be a numeric 1D list.")
+    if len(dataset_x) == 0 and len(dataset_y) == 0:
+        bounds = _validate_bounds(doc.get("bounds"))
+        metadata = {k: v for k, v in doc.items() if k not in ("dataset_x", "dataset_y")}
+        return NSDFMeasurementData(
+            coordinates=np.zeros((0, 2), dtype=np.float64),
+            observed_values=np.zeros(0, dtype=np.float64),
+            bounds=bounds,
+            bounds_source="bounds" if bounds else "none",
+            metadata=metadata,
+        )
+    if not dataset_x:
         raise ValueError("'dataset_x' must be a non-empty list of coordinate pairs.")
-    if not isinstance(dataset_y, list) or not dataset_y:
+    if not dataset_y:
         raise ValueError("'dataset_y' must be a non-empty numeric 1D list.")
     if len(dataset_x) != len(dataset_y):
         raise ValueError(
@@ -1125,73 +2695,14 @@ def validate_nsdf_measurement_doc(doc: Mapping[str, Any]) -> NSDFMeasurementData
     )
 
 
-def validate_nsdf_surrogate_doc(
-    surrogate_doc: Optional[Mapping[str, Any]],
-    expected_len: int,
-) -> NSDFSurrogateData:
-    warnings: List[str] = []
-    if surrogate_doc is None:
-        return NSDFSurrogateData(warnings=warnings)
-    if not isinstance(surrogate_doc, Mapping):
-        return NSDFSurrogateData(warnings=["Skipping surrogate JSON: expected a JSON object."])
-    return NSDFSurrogateData(
-        surrogate=_numeric_1d_array_or_none(surrogate_doc, "surrogate", warnings),
-        uncertainty=_numeric_1d_array_or_none(surrogate_doc, "uncertainty", warnings),
-        raw_uncertainty=_numeric_1d_array_or_none(
-            surrogate_doc,
-            "raw_uncertainty",
-            warnings,
-        ),
-        warnings=warnings,
-    )
-
-
-def list_nsdf_field_headers(
-    data_doc: Mapping[str, Any],
-    surrogate_doc: Optional[Mapping[str, Any]] = None,
-) -> List[str]:
-    measurement = validate_nsdf_measurement_doc(data_doc)
-    surrogate = validate_nsdf_surrogate_doc(surrogate_doc, measurement.observed_values.shape[0])
-    return surrogate.plottable_fields
-
-
-def infer_nsdf_grid_size(data_doc: Mapping[str, Any]) -> Tuple[int, int]:
-    """Infer grid width/height from unique labx/labz coordinates in ``dataset_x``."""
-    measurement = validate_nsdf_measurement_doc(data_doc)
-    unique_x = np.unique(measurement.coordinates[:, 0])
-    unique_z = np.unique(measurement.coordinates[:, 1])
-    nx = int(unique_x.shape[0])
-    ny = int(unique_z.shape[0])
-    if nx <= 0 or ny <= 0:
-        return DEFAULT_GRID_SIZE
-    return nx, ny
-
-
-def infer_nsdf_bounds_grid_size(data_doc: Mapping[str, Any]) -> Optional[Tuple[int, int]]:
-    """Read explicit grid width/height from ``bounds=[[0, width], [0, height]]``."""
-    if not isinstance(data_doc, Mapping):
-        return None
-    bounds = data_doc.get("bounds")
-    if not isinstance(bounds, list) or len(bounds) < 2:
-        return None
-
-    out: List[int] = []
-    for axis in bounds[:2]:
-        if not isinstance(axis, list) or len(axis) < 2:
-            return None
-        lo, hi = axis[0], axis[1]
-        if not (_is_number(lo) and _is_number(hi)):
-            return None
-        flo, fhi = float(lo), float(hi)
-        if not (math.isfinite(flo) and math.isfinite(fhi)):
-            return None
-        if abs(flo) > 1e-9 or fhi <= 0:
-            return None
-        rounded = int(round(fhi))
-        if abs(fhi - rounded) > 1e-9 or rounded <= 0:
-            return None
-        out.append(rounded)
-    return out[0], out[1]
+def _parse_nsdf_points(value: Any) -> Optional[int]:
+    if isinstance(value, int) and value > 0:
+        return value
+    if _is_number(value):
+        parsed = int(value)
+        if parsed > 0:
+            return parsed
+    return None
 
 
 def _valid_grid_size(value: Optional[Tuple[int, int]]) -> Optional[Tuple[int, int]]:
@@ -1207,19 +2718,493 @@ def _valid_grid_size(value: Optional[Tuple[int, int]]) -> Optional[Tuple[int, in
     return width, height
 
 
+def parse_nsdf_plot_dim(value: Any) -> Tuple[Optional[str], Optional[str]]:
+    """Parse ``dim`` as a plot type string (``1D``, ``2D``, ``3D``)."""
+    if value is None:
+        return None, None
+    if isinstance(value, str):
+        normalized = value.strip().upper()
+        if normalized in {"1D", "2D", "3D"}:
+            return normalized, None
+        return None, f"Skipping surrogate 'dim': expected '1D', '2D', or '3D', got {value!r}."
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        return None, (
+            "surrogate 'dim' as [width, height] is deprecated; use dim: \"2D\" "
+            "and bounds for grid size."
+        )
+    if isinstance(value, Mapping):
+        return None, (
+            "surrogate 'dim' as {width, height} is deprecated; use dim: \"2D\" "
+            "and bounds for grid size."
+        )
+    return None, f"Skipping surrogate 'dim': expected a plot type string, got {type(value).__name__}."
+
+
+def _legacy_grid_size_from_dim_array(value: Any) -> Optional[Tuple[int, int]]:
+    """Deprecated fallback: grid width/height encoded as a two-element ``dim`` array."""
+    if isinstance(value, Mapping):
+        for width_key, height_key in (
+            ("width", "height"),
+            ("grid_width", "grid_height"),
+            ("nx", "ny"),
+        ):
+            if width_key in value and height_key in value:
+                return _valid_grid_size((value[width_key], value[height_key]))
+        return None
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        return _valid_grid_size((value[0], value[1]))
+    return None
+
+
+def infer_grid_size_from_dim(value: Any) -> Optional[Tuple[int, int]]:
+    """Deprecated alias for legacy ``dim: [width, height]`` grid metadata."""
+    return _legacy_grid_size_from_dim_array(value)
+
+
+def _is_demo_workflow_id(workflow_id: str) -> bool:
+    normalized = str(workflow_id or "").strip().lower()
+    if not normalized:
+        return True
+    if normalized in {"dashboard-demo", "demo", "test", "test-workflow"}:
+        return True
+    return normalized.startswith("dashboard-demo")
+
+
+def resolve_nsdf_workflow_id(
+    surrogate_info: NSDFSurrogateData,
+    next_x_info: NSDFNextXData,
+) -> Optional[str]:
+    """Return the active workflow id (surrogate first, then first real next_x entry)."""
+    if surrogate_info.workflow_id and not _is_demo_workflow_id(surrogate_info.workflow_id):
+        return surrogate_info.workflow_id
+    for entry in next_x_info.entries:
+        if entry.workflow_id and not _is_demo_workflow_id(entry.workflow_id):
+            return entry.workflow_id
+    return None
+
+
+def next_x_grid_coords_for_workflow(
+    next_x_info: NSDFNextXData,
+    workflow_id: Optional[str],
+    nx: int,
+    ny: int,
+    bounds: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Map proposed next-scan coordinates onto the dashboard grid for one workflow."""
+    if not workflow_id:
+        return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
+    coords: List[Tuple[float, float]] = []
+    for entry in next_x_info.entries:
+        if entry.workflow_id != workflow_id:
+            continue
+        for row in entry.coordinates:
+            coords.append((float(row[0]), float(row[1])))
+    if not coords:
+        return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
+    arr = np.asarray(coords, dtype=np.float64)
+    return _norm_positions_to_grid(arr[:, 0], arr[:, 1], nx, ny, bounds)
+
+
+def _grid_display_coords(
+    gx: np.ndarray,
+    gy: np.ndarray,
+    nx: int,
+    ny: int,
+    flip_y: bool,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Convert normalized grid indices to Bokeh figure coordinates (cell centers)."""
+    if gx.size == 0:
+        return gx, gy
+    ix = np.clip(np.rint(gx).astype(int), 0, nx - 1)
+    iy = np.clip(np.rint(gy).astype(int), 0, ny - 1)
+    px = ix.astype(np.float64) + 0.5
+    py = (ny - 1 - iy + 0.5).astype(np.float64) if flip_y else iy.astype(np.float64) + 0.5
+    return px, py
+
+
+def _attach_point_legend_below(
+    figure: Any,
+    legend_items: List[Tuple[str, Any]],
+) -> None:
+    """Place marker legend below the plot frame; always reserve footer space."""
+    from bokeh.models import Legend, LegendItem
+
+    if legend_items:
+        legend = Legend(
+            items=[LegendItem(label=label, renderers=[renderer]) for label, renderer in legend_items],
+            location="center",
+            orientation="horizontal",
+            click_policy="hide",
+            background_fill_alpha=0.92,
+            border_line_alpha=0.0,
+            label_text_font_size="9pt",
+            spacing=14,
+            margin=0,
+            padding=6,
+        )
+        figure.add_layout(legend, "below")
+    figure.min_border_bottom = 40
+
+
+def _add_grid_point_overlay(
+    figure: Any,
+    gx: np.ndarray,
+    gy: np.ndarray,
+    nx: int,
+    ny: int,
+    flip_y: bool,
+    *,
+    color: str,
+    marker: str,
+    size: int,
+    line_color: Optional[str] = None,
+    line_width: float = 1.5,
+    fill_alpha: float = 0.95,
+) -> Optional[Any]:
+    if gx.size == 0:
+        return None
+    px, py = _grid_display_coords(gx, gy, nx, ny, flip_y)
+    scatter_kwargs: Dict[str, Any] = {
+        "size": size,
+        "marker": marker,
+        "color": color,
+        "line_color": line_color or color,
+        "line_width": line_width,
+        "fill_alpha": fill_alpha,
+        "line_alpha": 1.0,
+    }
+    return figure.scatter(px, py, **scatter_kwargs)
+
+
+def _hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
+    value = hex_color.lstrip("#")
+    return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+
+
+def _rgb_to_hex(red: int, green: int, blue: int) -> str:
+    return f"#{red:02x}{green:02x}{blue:02x}"
+
+
+def _lerp_rgb(
+    start: Tuple[int, int, int],
+    end: Tuple[int, int, int],
+    t: float,
+) -> Tuple[int, int, int]:
+    return tuple(int(round(start[i] + (end[i] - start[i]) * t)) for i in range(3))  # type: ignore[return-value]
+
+
+def _sample_three_stop_diverging_palette(
+    low_hex: str,
+    mid_hex: str,
+    high_hex: str,
+    *,
+    steps: int = 256,
+) -> List[str]:
+    """Smooth diverging palette (low -> mid -> high), matplotlib coolwarm-style."""
+    low = _hex_to_rgb(low_hex)
+    mid = _hex_to_rgb(mid_hex)
+    high = _hex_to_rgb(high_hex)
+    if steps <= 1:
+        return [_rgb_to_hex(*mid)]
+    colors: List[str] = []
+    for index in range(steps):
+        t = index / (steps - 1)
+        if t <= 0.5:
+            rgb = _lerp_rgb(low, mid, t / 0.5)
+        else:
+            rgb = _lerp_rgb(mid, high, (t - 0.5) / 0.5)
+        colors.append(_rgb_to_hex(*rgb))
+    return colors
+
+
+def _continuous_palette_generators() -> Dict[str, Any]:
+    """Named smooth palettes not bundled as flat lists in Bokeh."""
+    return {
+        "coolwarm256": lambda: _sample_three_stop_diverging_palette("#3b4cc0", "#f7f7f7", "#b40426"),
+        "coolwarm": lambda: _sample_three_stop_diverging_palette("#3b4cc0", "#f7f7f7", "#b40426"),
+    }
+
+
+def _resolve_bokeh_palette(palette_name: str) -> List[Any]:
+    """Resolve a Bokeh palette name (e.g. Coolwarm256, Viridis256) to a color list."""
+    import re
+
+    import bokeh.palettes as palettes_module
+    from bokeh.palettes import Viridis256
+
+    custom = _continuous_palette_generators().get(palette_name.lower())
+    if custom is not None:
+        return custom()
+
+    direct = getattr(palettes_module, palette_name, None)
+    if isinstance(direct, (list, tuple)):
+        return list(direct)
+
+    try:
+        from bokeh.palettes import all_palettes  # type: ignore
+
+        palette = all_palettes.get(palette_name)
+        if isinstance(palette, (list, tuple)):
+            return list(palette)
+        match = re.fullmatch(r"([A-Za-z]+)(\d+)", palette_name)
+        if match:
+            family, size_str = match.group(1), match.group(2)
+            family_palette = all_palettes.get(family)
+            if isinstance(family_palette, dict):
+                sized = family_palette.get(int(size_str))
+                if isinstance(sized, (list, tuple)):
+                    return list(sized)
+    except Exception:
+        pass
+    return list(Viridis256)
+
+
+def _symmetric_rdbu_limits(
+    *arrays: np.ndarray,
+    fallback: Tuple[float, float] = (-1.0, 1.0),
+) -> Tuple[float, float]:
+    """Symmetric limits centered at zero for diverging RdBu maps."""
+    chunks: List[np.ndarray] = []
+    for arr in arrays:
+        if arr is None:
+            continue
+        finite = np.asarray(arr, dtype=np.float64)[np.isfinite(arr)]
+        if finite.size:
+            chunks.append(finite)
+    if not chunks:
+        return fallback
+    combined = np.concatenate(chunks)
+    abs_max = max(float(np.max(np.abs(combined))), 1e-12)
+    return -abs_max, abs_max
+
+
+_STRAIN_COLORBAR_MARGIN = 72
+_STRAIN_FRAME_BASE = 320
+
+
+def _strain_plot_figure(
+    title: str,
+    nx: int,
+    ny: int,
+    cfg: StrainFieldPlotConfig,
+) -> Any:
+    """Shared Bokeh figure: equal lab-unit aspect, fixed frame, colorbar gutter."""
+    from bokeh.models import FixedTicker
+    from bokeh.plotting import figure
+
+    frame_w, frame_h = _proportional_frame_size(nx, ny, base=_STRAIN_FRAME_BASE)
+    p = figure(
+        title=title,
+        x_range=(0, nx),
+        y_range=(0, ny),
+        frame_width=frame_w,
+        frame_height=frame_h,
+        width=frame_w + _STRAIN_COLORBAR_MARGIN,
+        height=frame_h,
+        min_border_right=_STRAIN_COLORBAR_MARGIN,
+        tools="pan,wheel_zoom,box_zoom,reset,save",
+        match_aspect=True,
+        aspect_scale=1,
+        sizing_mode="fixed",
+        background_fill_color="#ffffff",
+        border_fill_color="#ffffff",
+    )
+    p.xaxis.axis_label = cfg.x_axis_label
+    p.yaxis.axis_label = cfg.y_axis_label
+    p.xaxis.ticker = FixedTicker(ticks=list(range(0, nx + 1, max(1, nx // 5))))
+    p.yaxis.ticker = FixedTicker(ticks=list(range(0, ny + 1, max(1, ny // 5))))
+    return p
+
+
+def _attach_heatmap_colorbar(
+    figure: Any,
+    mapper: Any,
+    lo: float,
+    hi: float,
+) -> None:
+    from bokeh.models import BasicTicker, ColorBar, NumeralTickFormatter
+
+    span = abs(hi - lo)
+    if span >= 100 or max(abs(lo), abs(hi)) >= 1000:
+        tick_format = "0.00e0"
+    elif span >= 1:
+        tick_format = "0.00"
+    elif span >= 0.01:
+        tick_format = "0.0000"
+    else:
+        tick_format = "0.00e0"
+    color_bar = ColorBar(
+        color_mapper=mapper,
+        ticker=BasicTicker(),
+        formatter=NumeralTickFormatter(format=tick_format),
+        label_standoff=8,
+        border_line_color=None,
+        location=(0, 0),
+        width=12,
+    )
+    figure.add_layout(color_bar, "right")
+
+
+def _add_colored_square_overlay(
+    figure: Any,
+    gx: np.ndarray,
+    gy: np.ndarray,
+    values: np.ndarray,
+    nx: int,
+    ny: int,
+    flip_y: bool,
+    mapper: Any,
+    *,
+    size: int = 11,
+) -> Optional[Any]:
+    if gx.size == 0:
+        return None
+    from bokeh.models import ColumnDataSource
+
+    px, py = _grid_display_coords(gx, gy, nx, ny, flip_y)
+    source = ColumnDataSource(data={"x": px, "y": py, "value": np.asarray(values, dtype=np.float64)})
+    return figure.scatter(
+        "x",
+        "y",
+        source=source,
+        marker="square",
+        size=size,
+        line_color="#333333",
+        line_width=0.8,
+        fill_alpha=0.95,
+        color={"field": "value", "transform": mapper},
+    )
+
+
+def format_nsdf_workflow_display(
+    surrogate_info: NSDFSurrogateData,
+    next_x_info: "NSDFNextXData",
+) -> str:
+    """Show the single active workflow id for the dashboard banner."""
+    workflow_id = resolve_nsdf_workflow_id(surrogate_info, next_x_info)
+    if not workflow_id:
+        return ""
+    return f"Workflow ID: {workflow_id}"
+
+
+def validate_nsdf_surrogate_doc(
+    surrogate_doc: Optional[Mapping[str, Any]],
+) -> NSDFSurrogateData:
+    warnings: List[str] = []
+    if surrogate_doc is None:
+        return NSDFSurrogateData(warnings=warnings)
+    if not isinstance(surrogate_doc, Mapping):
+        return NSDFSurrogateData(warnings=["Skipping surrogate JSON: expected a JSON object."])
+    workflow_id: Optional[str] = None
+    raw_workflow_id = surrogate_doc.get("workflow_id")
+    if isinstance(raw_workflow_id, str) and raw_workflow_id.strip():
+        workflow_id = raw_workflow_id.strip()
+    plot_dim, plot_dim_warning = parse_nsdf_plot_dim(surrogate_doc.get("dim"))
+    if plot_dim_warning:
+        warnings.append(plot_dim_warning)
+    bounds = _validate_bounds(surrogate_doc.get("bounds"))
+    points = _parse_nsdf_points(surrogate_doc.get("points"))
+    return NSDFSurrogateData(
+        surrogate=_numeric_1d_surrogate_array_or_none(surrogate_doc, "surrogate", warnings),
+        uncertainty=_numeric_1d_surrogate_array_or_none(surrogate_doc, "uncertainty", warnings),
+        raw_uncertainty=_numeric_1d_surrogate_array_or_none(
+            surrogate_doc,
+            "raw_uncertainty",
+            warnings,
+        ),
+        workflow_id=workflow_id,
+        plot_dim=plot_dim,
+        bounds=bounds,
+        points=points,
+        warnings=warnings,
+    )
+
+
+def list_nsdf_field_headers(
+    data_doc: Mapping[str, Any],
+    surrogate_doc: Optional[Mapping[str, Any]] = None,
+) -> List[str]:
+    measurement = validate_nsdf_measurement_doc(data_doc)
+    surrogate = validate_nsdf_surrogate_doc(surrogate_doc)
+    return surrogate.plottable_fields
+
+
+def infer_nsdf_grid_size(data_doc: Mapping[str, Any]) -> Tuple[int, int]:
+    """Infer grid width/height from unique labx/labz coordinates in ``dataset_x``."""
+    measurement = validate_nsdf_measurement_doc(data_doc)
+    if measurement.coordinates.shape[0] == 0:
+        bounds_size = infer_nsdf_bounds_grid_size(data_doc)
+        if bounds_size:
+            return bounds_size
+        return DEFAULT_GRID_SIZE
+    unique_x = np.unique(measurement.coordinates[:, 0])
+    unique_z = np.unique(measurement.coordinates[:, 1])
+    nx = int(unique_x.shape[0])
+    ny = int(unique_z.shape[0])
+    if nx <= 0 or ny <= 0:
+        return DEFAULT_GRID_SIZE
+    return nx, ny
+
+
+def infer_nsdf_bounds_grid_size(data_doc: Mapping[str, Any]) -> Optional[Tuple[int, int]]:
+    """Read grid width/height from ``bounds=[[0, width], [0, height], ...]``."""
+    if not isinstance(data_doc, Mapping):
+        return None
+    bounds = data_doc.get("bounds")
+    if not isinstance(bounds, list) or len(bounds) < 1:
+        return None
+
+    out: List[int] = []
+    for axis in bounds:
+        if not isinstance(axis, list) or len(axis) < 2:
+            return None
+        lo, hi = axis[0], axis[1]
+        if not (_is_number(lo) and _is_number(hi)):
+            return None
+        flo, fhi = float(lo), float(hi)
+        if not (math.isfinite(flo) and math.isfinite(fhi)):
+            return None
+        if abs(flo) > 1e-9 or fhi <= 0:
+            return None
+        rounded = int(round(fhi))
+        if abs(fhi - rounded) > 1e-9 or rounded <= 0:
+            return None
+        out.append(rounded)
+    if len(out) == 1:
+        return out[0], 1
+    return out[0], out[1]
+
+
+def surrogate_doc_defines_grid_size(surrogate_doc: Optional[Mapping[str, Any]]) -> bool:
+    """Return True when surrogate JSON carries pre-capture grid metadata."""
+    if not isinstance(surrogate_doc, Mapping):
+        return False
+    if infer_nsdf_bounds_grid_size(surrogate_doc) is not None:
+        return True
+    return _legacy_grid_size_from_dim_array(surrogate_doc.get("dim")) is not None
+
+
 def resolve_nsdf_grid_size(
     data_doc: Mapping[str, Any],
     *,
+    surrogate_doc: Optional[Mapping[str, Any]] = None,
     env_grid_size: Optional[Tuple[int, int]] = None,
     manual_grid_size: Optional[Tuple[int, int]] = None,
 ) -> Tuple[Tuple[int, int], str]:
-    """Resolve grid size and source using bounds, manual controls, env, then dataset_x."""
-    bounds_size = infer_nsdf_bounds_grid_size(data_doc)
-    if bounds_size:
-        return bounds_size, "bounds"
+    """Resolve grid size from manual controls, surrogate metadata, data bounds, env, dataset_x."""
     manual_size = _valid_grid_size(manual_grid_size)
     if manual_size:
         return manual_size, "manual controls"
+    if isinstance(surrogate_doc, Mapping):
+        surrogate_bounds_size = infer_nsdf_bounds_grid_size(surrogate_doc)
+        if surrogate_bounds_size:
+            return surrogate_bounds_size, "surrogate bounds"
+        legacy_dim_size = _legacy_grid_size_from_dim_array(surrogate_doc.get("dim"))
+        if legacy_dim_size:
+            return legacy_dim_size, "surrogate dim (deprecated)"
+    bounds_size = infer_nsdf_bounds_grid_size(data_doc)
+    if bounds_size:
+        return bounds_size, "bounds"
     env_size = _valid_grid_size(env_grid_size)
     if env_size:
         return env_size, "environment"
@@ -1342,8 +3327,9 @@ def build_strain_field_grids(
     """Build measurement mask, estimate, and variance directly from native NSDF schema."""
     nx, ny = cfg.grid_size[0], cfg.grid_size[1]
     measurement = validate_nsdf_measurement_doc(doc)
-    surrogate = validate_nsdf_surrogate_doc(surrogate_doc, measurement.observed_values.shape[0])
+    surrogate = validate_nsdf_surrogate_doc(surrogate_doc)
     values = measurement.observed_values
+    display_size = (nx, ny)
     gx, gy = _norm_coordinates_to_grid(measurement.coordinates, nx, ny, measurement.bounds)
     mask = np.zeros((ny, nx), dtype=np.float64)
     for x, y in zip(gx, gy):
@@ -1358,21 +3344,57 @@ def build_strain_field_grids(
         "mode": "nsdf_sparse",
         "n_points": int(values.shape[0]),
         "bounds_source": measurement.bounds_source,
+        "measurement_bounds": measurement.bounds,
+        "measurement_gx": gx,
+        "measurement_gy": gy,
+        "measurement_values": values.copy(),
         "plottable_fields": surrogate.plottable_fields,
         "warnings": list(surrogate.warnings),
     }
 
-    if surrogate.surrogate is not None:
-        est = _idw_fill_grid(gx, gy, surrogate.surrogate, nx, ny)
-        meta["estimate_source"] = "surrogate"
-    else:
+    est_grid = _surrogate_field_to_display_grid(
+        surrogate.surrogate,
+        key="surrogate",
+        surrogate_info=surrogate,
+        surrogate_doc=surrogate_doc,
+        display_size=display_size,
+        warnings=meta["warnings"],
+    )
+    if est_grid is not None:
+        est = est_grid
+        meta["estimate_source"] = "surrogate_grid"
+        if values.shape[0] > 0:
+            finite_est = est[np.isfinite(est)]
+            if (
+                finite_est.size
+                and np.allclose(finite_est, 0.0)
+                and not np.allclose(values, 0.0)
+            ):
+                est = _idw_fill_grid(gx, gy, values, nx, ny)
+                meta["estimate_source"] = "dataset_y_idw"
+                meta["warnings"].append(
+                    "Surrogate model grid was empty; estimate uses inverse-distance "
+                    "interpolation from measurements."
+                )
+    elif values.shape[0] > 0:
         est = _idw_fill_grid(gx, gy, values, nx, ny)
         meta["estimate_source"] = "dataset_y_idw"
+    else:
+        est = np.full((ny, nx), np.nan, dtype=np.float64)
+        meta["estimate_source"] = "none"
+        meta["warnings"].append("No measurements yet; estimate panel shows surrogate only when available.")
 
-    if surrogate.uncertainty is not None:
-        var_samples = np.square(np.maximum(surrogate.uncertainty, 0.0))
-        var = _idw_fill_grid(gx, gy, var_samples, nx, ny)
-        meta["variance_source"] = "uncertainty_squared"
+    var_grid = _surrogate_field_to_display_grid(
+        surrogate.uncertainty,
+        key="uncertainty",
+        surrogate_info=surrogate,
+        surrogate_doc=surrogate_doc,
+        display_size=display_size,
+        warnings=meta["warnings"],
+    )
+    if var_grid is not None and meta["estimate_source"] != "dataset_y_idw":
+        var = np.square(np.maximum(var_grid, 0.0))
+        meta["variance_source"] = "uncertainty_squared_grid"
     else:
         scale = float(np.nanmean(np.abs(values)) or 1e-6) * 0.25
         var = _distance_weighted_variance_placeholder(mask, scale)
@@ -1390,60 +3412,82 @@ def _maybe_flip_y(arr: np.ndarray, flip: bool) -> np.ndarray:
     return np.flipud(arr) if flip else arr
 
 
+def _proportional_frame_size(
+    nx: int,
+    ny: int,
+    *,
+    base: int = 320,
+) -> Tuple[int, int]:
+    """Data-frame width/height preserving nx:ny aspect (longest axis = base pixels)."""
+    if nx <= 0 or ny <= 0:
+        return base, base
+    if nx >= ny:
+        frame_width = base
+        frame_height = max(120, int(round(base * ny / nx)))
+    else:
+        frame_height = base
+        frame_width = max(120, int(round(base * nx / ny)))
+    return frame_width, frame_height
+
+
 def make_strain_heatmap_figure(
     title: str,
     z: np.ndarray,
     cfg: StrainFieldPlotConfig,
     *,
     palette_name: str = "Viridis256",
-    discrete_mask: bool = False,
     low_high: Optional[Tuple[float, float]] = None,
+    show_colorbar: bool = False,
 ):
-    from bokeh.models import FixedTicker, LinearColorMapper
-    from bokeh.palettes import Viridis256
-    from bokeh.plotting import figure
+    from bokeh.models import LinearColorMapper
 
     nx, ny = cfg.grid_size
     zd = _maybe_flip_y(np.asarray(z, dtype=np.float64), cfg.flip_y_for_display)
 
-    if discrete_mask:
-        lo_c, hi_c = cfg.colormap_mask
-        palette = [lo_c, hi_c]
-        mapper = LinearColorMapper(palette=palette, low=0.0, high=1.0)
+    palette = _resolve_bokeh_palette(palette_name)
+    if low_high is not None:
+        lo, hi = low_high
     else:
-        try:
-            from bokeh.palettes import all_palettes  # type: ignore
+        finite = zd[np.isfinite(zd)]
+        lo = float(np.nanmin(finite)) if finite.size else 0.0
+        hi = float(np.nanmax(finite)) if finite.size else 1.0
+        if lo == hi:
+            hi = lo + 1e-12
+    mapper = LinearColorMapper(palette=palette, low=lo, high=hi)
 
-            palette = all_palettes.get(palette_name) or Viridis256
-        except Exception:
-            palette = Viridis256
-        if low_high is not None:
-            lo, hi = low_high
-        else:
-            finite = zd[np.isfinite(zd)]
-            lo = float(np.nanmin(finite)) if finite.size else 0.0
-            hi = float(np.nanmax(finite)) if finite.size else 1.0
-            if lo == hi:
-                hi = lo + 1e-12
-        mapper = LinearColorMapper(palette=palette, low=lo, high=hi)
-
-    p = figure(
-        title=title,
-        x_range=(0, nx),
-        y_range=(0, ny),
-        width=320,
-        height=320,
-        tools="pan,wheel_zoom,box_zoom,reset,save",
-        match_aspect=True,
-        aspect_scale=1,
-    )
-    p.xaxis.axis_label = cfg.x_axis_label
-    p.yaxis.axis_label = cfg.y_axis_label
-    p.xaxis.ticker = FixedTicker(ticks=list(range(0, nx + 1, max(1, nx // 5))))
-    p.yaxis.ticker = FixedTicker(ticks=list(range(0, ny + 1, max(1, ny // 5))))
-
+    p = _strain_plot_figure(title, nx, ny, cfg)
     p.image(image=[zd], x=0, y=0, dw=nx, dh=ny, color_mapper=mapper)
+    if show_colorbar:
+        _attach_heatmap_colorbar(p, mapper, lo, hi)
     return p
+
+
+def make_strain_measurement_figure(
+    title: str,
+    cfg: StrainFieldPlotConfig,
+    *,
+    gx: np.ndarray,
+    gy: np.ndarray,
+    values: np.ndarray,
+    mapper: Any,
+    lo: float,
+    hi: float,
+) -> Tuple[Any, Optional[Any]]:
+    """White canvas with square markers colored by dataset_y (RdBu) and matching colorbar."""
+    nx, ny = cfg.grid_size
+    p = _strain_plot_figure(title, nx, ny, cfg)
+    renderer = _add_colored_square_overlay(
+        p,
+        gx,
+        gy,
+        values,
+        nx,
+        ny,
+        cfg.flip_y_for_display,
+        mapper,
+    )
+    _attach_heatmap_colorbar(p, mapper, lo, hi)
+    return p, renderer
 
 
 def make_strain_triplet_figures(
@@ -1451,29 +3495,85 @@ def make_strain_triplet_figures(
     cfg: StrainFieldPlotConfig,
     *,
     row_subtitle: str = "",
+    next_x_info: Optional[NSDFNextXData] = None,
+    active_workflow_id: Optional[str] = None,
 ):
+    from bokeh.models import LinearColorMapper
+
     sub = f" — {row_subtitle}" if row_subtitle else ""
     est = grids.estimate
-    finite = est[np.isfinite(est)]
-    lo = float(np.nanmin(finite)) if finite.size else 0.0
-    hi = float(np.nanmax(finite)) if finite.size else 1.0
-    if lo == hi:
-        hi = lo + 1e-12
+    nx, ny = cfg.grid_size
+    bounds = grids.meta.get("measurement_bounds")
+    if not isinstance(bounds, tuple):
+        bounds = None
 
-    p0 = make_strain_heatmap_figure(
-        f"{cfg.title_measurements}{sub}",
-        grids.measurements,
-        cfg,
-        palette_name=cfg.colormap_estimate,
-        discrete_mask=True,
-        low_high=(0.0, 1.0),
-    )
+    measured_gx = grids.meta.get("measurement_gx")
+    measured_gy = grids.meta.get("measurement_gy")
+    measured_vals = grids.meta.get("measurement_values")
+    if not isinstance(measured_gx, np.ndarray):
+        measured_gx = np.array([], dtype=np.int64)
+    if not isinstance(measured_gy, np.ndarray):
+        measured_gy = np.array([], dtype=np.int64)
+    if not isinstance(measured_vals, np.ndarray):
+        measured_vals = np.array([], dtype=np.float64)
+
+    rdbu_palette = _resolve_bokeh_palette(cfg.colormap_estimate)
+    rdbu_lo, rdbu_hi = _symmetric_rdbu_limits(est, measured_vals)
+    rdbu_mapper = LinearColorMapper(palette=rdbu_palette, low=rdbu_lo, high=rdbu_hi)
+
+    if measured_gx.size:
+        p0, sampled_renderer = make_strain_measurement_figure(
+            f"{cfg.title_measurements}{sub}",
+            cfg,
+            gx=measured_gx,
+            gy=measured_gy,
+            values=measured_vals,
+            mapper=rdbu_mapper,
+            lo=rdbu_lo,
+            hi=rdbu_hi,
+        )
+    else:
+        p0 = _strain_plot_figure(f"{cfg.title_measurements}{sub}", nx, ny, cfg)
+        _attach_heatmap_colorbar(p0, rdbu_mapper, rdbu_lo, rdbu_hi)
+        sampled_renderer = None
+
+    point_legend_items: List[Tuple[str, Any]] = []
+    if sampled_renderer is not None:
+        point_legend_items.append(("Sampled", sampled_renderer))
+    if next_x_info is not None and active_workflow_id:
+        nx_gx, nx_gy = next_x_grid_coords_for_workflow(
+            next_x_info,
+            active_workflow_id,
+            nx,
+            ny,
+            bounds,
+        )
+        if nx_gx.size:
+            proposed_renderer = _add_grid_point_overlay(
+                p0,
+                nx_gx,
+                nx_gy,
+                nx,
+                ny,
+                cfg.flip_y_for_display,
+                color="#ff6600",
+                marker="cross",
+                size=16,
+                line_color="#ff6600",
+                line_width=2.5,
+                fill_alpha=0.0,
+            )
+            if proposed_renderer is not None:
+                point_legend_items.append(("Proposed next scan", proposed_renderer))
+    _attach_point_legend_below(p0, point_legend_items)
+
     p1 = make_strain_heatmap_figure(
         f"{cfg.title_estimate}{sub}",
         grids.estimate,
         cfg,
         palette_name=cfg.colormap_estimate,
-        low_high=(lo, hi),
+        low_high=(rdbu_lo, rdbu_hi),
+        show_colorbar=True,
     )
     var = grids.variance
     vf = var[np.isfinite(var)]
@@ -1487,5 +3587,6 @@ def make_strain_triplet_figures(
         cfg,
         palette_name=cfg.colormap_variance,
         low_high=(vlo, vhi),
+        show_colorbar=True,
     )
     return p0, p1, p2
