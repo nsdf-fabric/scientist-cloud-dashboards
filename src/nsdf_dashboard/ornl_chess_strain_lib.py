@@ -52,6 +52,11 @@ _LOG = logging.getLogger(__name__)
 
 DEFAULT_GRID_SIZE: Tuple[int, int] = (26, 26)
 NSDF_DATA_JSON_BASENAME = "data.json"
+NSDF_VERSION_SUFFIX_RE = re.compile(r"^\d{8}T\d{6}Z$", re.IGNORECASE)
+NSDF_DATA_FILENAME_RE = re.compile(
+    r"^data(?:_(?P<suffix>\d{8}T\d{6}Z))?\.json$",
+    re.IGNORECASE,
+)
 
 
 def _strip_env_quotes(value: str) -> str:
@@ -101,6 +106,7 @@ class StrainDashboardPaths:
     s3_next_x_key: str = ""
     s3_endpoint_url: str = ""
     s3_region: str = "us-east-1"
+    version_suffix: str = ""
 
     @classmethod
     def from_environ(cls) -> "StrainDashboardPaths":
@@ -371,6 +377,10 @@ class NSDFSurrogateData:
     surrogate: Optional[np.ndarray] = None
     uncertainty: Optional[np.ndarray] = None
     raw_uncertainty: Optional[np.ndarray] = None
+    workflow_id: Optional[str] = None
+    dim: Optional[Tuple[int, int]] = None
+    bounds: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None
+    points: Optional[int] = None
     warnings: List[str] = field(default_factory=list)
     source: str = ""
 
@@ -504,6 +514,258 @@ def parse_s3_uri(link: str) -> Tuple[str, str]:
     if slash == -1:
         return body, ""
     return body[:slash], body[slash + 1 :].lstrip("/")
+
+
+def nsdf_triplet_basenames(version_suffix: str = "") -> Tuple[str, str, str]:
+    """Return ``(data, surrogate, next_x)`` basenames for a version suffix (empty = latest)."""
+    suffix = (version_suffix or "").strip()
+    if not suffix:
+        return "data.json", "surrogate.json", "next_x.json"
+    if not NSDF_VERSION_SUFFIX_RE.fullmatch(suffix):
+        raise ValueError(f"Invalid NSDF version suffix: {suffix!r}")
+    return (
+        f"data_{suffix}.json",
+        f"surrogate_{suffix}.json",
+        f"next_x_{suffix}.json",
+    )
+
+
+def parse_nsdf_data_filename(name: str) -> Optional[str]:
+    """Parse ``data.json`` or ``data_<suffix>.json``; return suffix or ``None`` for latest."""
+    m = NSDF_DATA_FILENAME_RE.match((name or "").strip())
+    if not m:
+        return None
+    return (m.group("suffix") or "").strip() or None
+
+
+def _replace_path_basename(path: str, new_basename: str) -> str:
+    p = (path or "").strip()
+    if not p:
+        return p
+    return os.path.join(os.path.dirname(p), new_basename)
+
+
+def _replace_s3_key_basename(key: str, new_basename: str) -> str:
+    k = (key or "").strip()
+    if not k:
+        return k
+    if "/" in k:
+        return k.rsplit("/", 1)[0] + "/" + new_basename
+    return new_basename
+
+
+def _replace_url_basename(url: str, new_basename: str) -> str:
+    from urllib.parse import urlparse, urlunparse
+
+    u = (url or "").strip()
+    if not _looks_like_http_url(u):
+        return u
+    parts = urlparse(u)
+    segments = [x for x in (parts.path or "").split("/") if x]
+    if not segments:
+        return u
+    if parse_nsdf_data_filename(segments[-1]) is None and segments[-1].lower() != "data.json":
+        return u
+    segments[-1] = new_basename
+    new_path = "/" + "/".join(segments)
+    return urlunparse((parts.scheme, parts.netloc, new_path, parts.params, parts.query, parts.fragment))
+
+
+def apply_nsdf_version_suffix(
+    paths: StrainDashboardPaths,
+    version_suffix: str = "",
+) -> StrainDashboardPaths:
+    """
+    Point resolved paths at a timestamped triplet (``data_<ts>.json``, etc.).
+
+    Empty suffix keeps the default latest files (``data.json``, ``surrogate.json``, ``next_x.json``).
+    """
+    suffix = (version_suffix or "").strip()
+    data_fn, sur_fn, nx_fn = nsdf_triplet_basenames(suffix)
+    out = StrainDashboardPaths(
+        local_json_path=paths.local_json_path,
+        json_url=paths.json_url,
+        surrogate_json_path=paths.surrogate_json_path,
+        surrogate_json_url=paths.surrogate_json_url,
+        next_x_json_path=paths.next_x_json_path,
+        next_x_json_url=paths.next_x_json_url,
+        local_data_dir=paths.local_data_dir,
+        s3_env_file=paths.s3_env_file,
+        s3_bucket=paths.s3_bucket,
+        s3_data_key=paths.s3_data_key,
+        s3_surrogate_key=paths.s3_surrogate_key,
+        s3_next_x_key=paths.s3_next_x_key,
+        s3_endpoint_url=paths.s3_endpoint_url,
+        s3_region=paths.s3_region,
+        version_suffix=suffix,
+    )
+
+    if out.local_data_dir:
+        base = out.local_data_dir.rstrip("/")
+        out.local_json_path = os.path.join(base, data_fn)
+        if suffix:
+            out.surrogate_json_path = os.path.join(base, sur_fn)
+            out.next_x_json_path = os.path.join(base, nx_fn)
+        return out
+
+    if out.local_json_path and not _looks_like_http_url(out.local_json_path):
+        base = os.path.dirname(out.local_json_path)
+        out.local_json_path = os.path.join(base, data_fn)
+        if suffix:
+            out.surrogate_json_path = os.path.join(base, sur_fn)
+            out.next_x_json_path = os.path.join(base, nx_fn)
+        return out
+
+    if out.json_url:
+        out.json_url = _replace_url_basename(out.json_url, data_fn)
+        if suffix:
+            out.surrogate_json_url = _replace_url_basename(out.json_url, sur_fn)
+            out.next_x_json_url = _replace_url_basename(out.json_url, nx_fn)
+
+    if out.s3_data_key:
+        out.s3_data_key = _replace_s3_key_basename(out.s3_data_key, data_fn)
+        if suffix:
+            out.s3_surrogate_key = _replace_s3_key_basename(out.s3_data_key, sur_fn)
+            out.s3_next_x_key = _replace_s3_key_basename(out.s3_data_key, nx_fn)
+        else:
+            out.s3_surrogate_key = (paths.s3_surrogate_key or "").strip() or _sibling_surrogate_s3_key(
+                out.s3_data_key
+            )
+            out.s3_next_x_key = (paths.s3_next_x_key or "").strip() or _sibling_next_x_s3_key(out.s3_data_key)
+
+    return out
+
+
+def nsdf_listing_directory(
+    paths: StrainDashboardPaths,
+    *,
+    base_dir: str = "",
+    save_dir: str = "",
+) -> str:
+    """Best-effort local directory for discovering timestamped NSDF JSON backups."""
+    candidates: List[str] = []
+    if (paths.local_data_dir or "").strip():
+        candidates.append((paths.local_data_dir or "").strip())
+    loc = (paths.local_json_path or "").strip()
+    if loc and not _looks_like_http_url(loc):
+        candidates.append(os.path.dirname(loc))
+    for dataset_dir in ((base_dir or "").strip(), (save_dir or "").strip()):
+        if not dataset_dir:
+            continue
+        found = find_strain_json_under_dataset_dir(dataset_dir)
+        if found:
+            candidates.append(os.path.dirname(found))
+        elif os.path.isdir(dataset_dir):
+            candidates.append(dataset_dir)
+    for candidate in candidates:
+        if candidate and os.path.isdir(candidate):
+            return candidate
+    return ""
+
+
+def list_nsdf_version_suffixes_from_directory(directory: str) -> List[str]:
+    """List timestamp suffixes from ``data_<suffix>.json`` files (newest first)."""
+    d = (directory or "").strip()
+    if not d or not os.path.isdir(d):
+        return []
+    suffixes: List[str] = []
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return []
+    for name in names:
+        parsed = parse_nsdf_data_filename(name)
+        if parsed:
+            suffixes.append(parsed)
+    return sorted(set(suffixes), reverse=True)
+
+
+def list_nsdf_version_suffixes_from_s3(
+    paths: StrainDashboardPaths,
+    *,
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """List timestamp suffixes under the resolved S3 prefix (newest first)."""
+    bucket = (paths.s3_bucket or "").strip()
+    data_key = (paths.s3_data_key or "").strip()
+    if not bucket and (paths.json_url or "").strip():
+        cfg = _parse_gateway_url_with_query_keys((paths.json_url or "").strip())
+        if cfg:
+            bucket = (cfg.get("bucket") or "").strip()
+            data_key = (cfg.get("key") or "").strip()
+    if not bucket:
+        return []
+
+    prefix = ""
+    if data_key:
+        if "/" in data_key:
+            prefix = data_key.rsplit("/", 1)[0] + "/"
+        elif parse_nsdf_data_filename(data_key) is None:
+            prefix = data_key.rstrip("/") + "/"
+
+    list_paths = StrainDashboardPaths(
+        s3_bucket=bucket,
+        s3_data_key=data_key or "data.json",
+        s3_endpoint_url=paths.s3_endpoint_url,
+        s3_region=paths.s3_region,
+        s3_env_file=paths.s3_env_file,
+        json_url=paths.json_url,
+    )
+    try:
+        client = _make_nsdf_s3_client(list_paths, mongo_s3_auth=mongo_s3_auth)
+    except Exception:
+        return []
+
+    suffixes: List[str] = []
+    continuation: Optional[str] = None
+    try:
+        while True:
+            params: Dict[str, Any] = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": 1000}
+            if continuation:
+                params["ContinuationToken"] = continuation
+            result = client.list_objects_v2(**params)
+            for obj in result.get("Contents") or []:
+                name = os.path.basename(str(obj.get("Key") or ""))
+                parsed = parse_nsdf_data_filename(name)
+                if parsed:
+                    suffixes.append(parsed)
+            if not result.get("IsTruncated"):
+                break
+            continuation = result.get("NextContinuationToken")
+            if not continuation:
+                break
+    except Exception:
+        return []
+    return sorted(set(suffixes), reverse=True)
+
+
+def discover_nsdf_version_options(
+    paths: StrainDashboardPaths,
+    *,
+    base_dir: str = "",
+    save_dir: str = "",
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+) -> List[Tuple[str, str]]:
+    """
+    Return ``(value, label)`` pairs for a version selector.
+
+    ``latest`` is always first; values are ISO-like suffixes such as ``20260606T223505Z``.
+    """
+    options: List[Tuple[str, str]] = [("latest", "Latest (data.json)")]
+    seen: set[str] = set()
+
+    local_dir = nsdf_listing_directory(paths, base_dir=base_dir, save_dir=save_dir)
+    for suffix in list_nsdf_version_suffixes_from_directory(local_dir):
+        if suffix not in seen:
+            seen.add(suffix)
+            options.append((suffix, suffix))
+
+    for suffix in list_nsdf_version_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth):
+        if suffix not in seen:
+            seen.add(suffix)
+            options.append((suffix, suffix))
+
+    return options
 
 
 def _credential_is_placeholder(value: str) -> bool:
@@ -959,8 +1221,11 @@ def _sibling_surrogate_path(data_path: str) -> str:
     p = (data_path or "").strip()
     if not p or _looks_like_http_url(p):
         return ""
-    if os.path.basename(p).lower() != "data.json":
+    suffix = parse_nsdf_data_filename(os.path.basename(p))
+    if suffix is None and os.path.basename(p).lower() != "data.json":
         return ""
+    if suffix:
+        return os.path.join(os.path.dirname(p), f"surrogate_{suffix}.json")
     return os.path.join(os.path.dirname(p), "surrogate.json")
 
 
@@ -971,9 +1236,14 @@ def _sibling_surrogate_url(data_url: str) -> str:
     if not _looks_like_http_url(u):
         return ""
     parts = urlparse(u)
-    if not parts.path.lower().endswith("/data.json"):
+    segments = [x for x in (parts.path or "").split("/") if x]
+    if not segments:
         return ""
-    new_path = parts.path[: -len("data.json")] + "surrogate.json"
+    suffix = parse_nsdf_data_filename(segments[-1])
+    if suffix is None and segments[-1].lower() != "data.json":
+        return ""
+    segments[-1] = f"surrogate_{suffix}.json" if suffix else "surrogate.json"
+    new_path = "/" + "/".join(segments)
     return urlunparse((parts.scheme, parts.netloc, new_path, parts.params, parts.query, parts.fragment))
 
 
@@ -1037,8 +1307,11 @@ def _sibling_next_x_path(data_path: str) -> str:
     p = (data_path or "").strip()
     if not p or _looks_like_http_url(p):
         return ""
-    if os.path.basename(p).lower() != "data.json":
+    suffix = parse_nsdf_data_filename(os.path.basename(p))
+    if suffix is None and os.path.basename(p).lower() != "data.json":
         return ""
+    if suffix:
+        return os.path.join(os.path.dirname(p), f"next_x_{suffix}.json")
     return os.path.join(os.path.dirname(p), "next_x.json")
 
 
@@ -1049,17 +1322,29 @@ def _sibling_next_x_url(data_url: str) -> str:
     if not _looks_like_http_url(u):
         return ""
     parts = urlparse(u)
-    if not parts.path.lower().endswith("/data.json"):
+    segments = [x for x in (parts.path or "").split("/") if x]
+    if not segments:
         return ""
-    new_path = parts.path[: -len("data.json")] + "next_x.json"
+    suffix = parse_nsdf_data_filename(segments[-1])
+    if suffix is None and segments[-1].lower() != "data.json":
+        return ""
+    segments[-1] = f"next_x_{suffix}.json" if suffix else "next_x.json"
+    new_path = "/" + "/".join(segments)
     return urlunparse((parts.scheme, parts.netloc, new_path, parts.params, parts.query, parts.fragment))
 
 
 def _sibling_next_x_s3_key(data_key: str) -> str:
     key = (data_key or "").strip()
-    if not key.lower().endswith("data.json"):
+    if not key:
         return ""
-    return key[: -len("data.json")] + "next_x.json"
+    basename = key.rsplit("/", 1)[-1]
+    suffix = parse_nsdf_data_filename(basename)
+    if suffix is None and basename.lower() != "data.json":
+        return ""
+    prefix = key[: -len(basename)]
+    if suffix:
+        return prefix + f"next_x_{suffix}.json"
+    return prefix + "next_x.json"
 
 
 def validate_nsdf_next_x_doc(value: Any) -> NSDFNextXData:
@@ -1182,18 +1467,20 @@ def load_nsdf_json_bundle_from_local_data_dir(paths: StrainDashboardPaths) -> Op
     local_dir = (paths.local_data_dir or "").strip()
     if not local_dir:
         return None
-    data_path = os.path.join(local_dir, "data.json")
+    data_fn, sur_fn, nx_fn = nsdf_triplet_basenames(paths.version_suffix or "")
+    data_path = os.path.join(local_dir, data_fn)
     if not os.path.isfile(data_path):
         return None
 
     data = load_json_from_local_path(data_path)
     surrogate = None
     messages = [f"Loaded NSDF data JSON from local path: {data_path}"]
-    surrogate_path = os.path.join(local_dir, "surrogate.json")
+    surrogate_path = os.path.join(local_dir, sur_fn)
     effective = StrainDashboardPaths(
         local_json_path=data_path,
         surrogate_json_path="",
         local_data_dir=local_dir,
+        version_suffix=paths.version_suffix,
     )
     if os.path.isfile(surrogate_path):
         try:
@@ -1203,7 +1490,7 @@ def load_nsdf_json_bundle_from_local_data_dir(paths: StrainDashboardPaths) -> Op
         except Exception as exc:
             messages.append(f"Local surrogate JSON skipped: {exc}")
     next_x = None
-    next_x_path = os.path.join(local_dir, "next_x.json")
+    next_x_path = os.path.join(local_dir, nx_fn)
     if os.path.isfile(next_x_path):
         try:
             next_x_doc = load_json_from_local_path(next_x_path)
@@ -1249,9 +1536,16 @@ def load_nsdf_json_bundle(
 
 def _sibling_surrogate_s3_key(data_key: str) -> str:
     key = (data_key or "").strip()
-    if not key.lower().endswith("data.json"):
+    if not key:
         return ""
-    return key[: -len("data.json")] + "surrogate.json"
+    basename = key.rsplit("/", 1)[-1]
+    suffix = parse_nsdf_data_filename(basename)
+    if suffix is None and basename.lower() != "data.json":
+        return ""
+    prefix = key[: -len(basename)]
+    if suffix:
+        return prefix + f"surrogate_{suffix}.json"
+    return prefix + "surrogate.json"
 
 
 def _s3_env_values(paths: StrainDashboardPaths) -> Dict[str, str]:
@@ -1485,6 +1779,63 @@ def validate_nsdf_measurement_doc(doc: Mapping[str, Any]) -> NSDFMeasurementData
     )
 
 
+def _parse_nsdf_points(value: Any) -> Optional[int]:
+    if isinstance(value, int) and value > 0:
+        return value
+    if _is_number(value):
+        parsed = int(value)
+        if parsed > 0:
+            return parsed
+    return None
+
+
+def _valid_grid_size(value: Optional[Tuple[int, int]]) -> Optional[Tuple[int, int]]:
+    if value is None or len(value) < 2:
+        return None
+    try:
+        width = int(value[0])
+        height = int(value[1])
+    except (TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
+def infer_grid_size_from_dim(value: Any) -> Optional[Tuple[int, int]]:
+    """Parse explicit grid width/height from a ``dim`` field (list or mapping)."""
+    if isinstance(value, Mapping):
+        for width_key, height_key in (
+            ("width", "height"),
+            ("grid_width", "grid_height"),
+            ("nx", "ny"),
+        ):
+            if width_key in value and height_key in value:
+                return _valid_grid_size((value[width_key], value[height_key]))
+        return None
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        return _valid_grid_size((value[0], value[1]))
+    return None
+
+
+def format_nsdf_workflow_display(
+    surrogate_info: NSDFSurrogateData,
+    next_x_info: "NSDFNextXData",
+) -> str:
+    """Collect unique workflow IDs from surrogate and next_x for dashboard display."""
+    ids: List[str] = []
+    if surrogate_info.workflow_id:
+        ids.append(surrogate_info.workflow_id)
+    for entry in next_x_info.entries:
+        if entry.workflow_id and entry.workflow_id not in ids:
+            ids.append(entry.workflow_id)
+    if not ids:
+        return ""
+    if len(ids) == 1:
+        return f"Workflow ID: {ids[0]}"
+    return "Workflow IDs: " + ", ".join(ids)
+
+
 def validate_nsdf_surrogate_doc(
     surrogate_doc: Optional[Mapping[str, Any]],
     expected_len: int,
@@ -1494,6 +1845,15 @@ def validate_nsdf_surrogate_doc(
         return NSDFSurrogateData(warnings=warnings)
     if not isinstance(surrogate_doc, Mapping):
         return NSDFSurrogateData(warnings=["Skipping surrogate JSON: expected a JSON object."])
+    workflow_id: Optional[str] = None
+    raw_workflow_id = surrogate_doc.get("workflow_id")
+    if isinstance(raw_workflow_id, str) and raw_workflow_id.strip():
+        workflow_id = raw_workflow_id.strip()
+    dim = infer_grid_size_from_dim(surrogate_doc.get("dim"))
+    if surrogate_doc.get("dim") is not None and dim is None:
+        warnings.append("Skipping surrogate 'dim': expected [width, height] or {width, height}.")
+    bounds = _validate_bounds(surrogate_doc.get("bounds"))
+    points = _parse_nsdf_points(surrogate_doc.get("points"))
     return NSDFSurrogateData(
         surrogate=_numeric_1d_array_or_none(surrogate_doc, "surrogate", expected_len, warnings),
         uncertainty=_numeric_1d_array_or_none(surrogate_doc, "uncertainty", expected_len, warnings),
@@ -1503,6 +1863,10 @@ def validate_nsdf_surrogate_doc(
             expected_len,
             warnings,
         ),
+        workflow_id=workflow_id,
+        dim=dim,
+        bounds=bounds,
+        points=points,
         warnings=warnings,
     )
 
@@ -1555,32 +1919,36 @@ def infer_nsdf_bounds_grid_size(data_doc: Mapping[str, Any]) -> Optional[Tuple[i
     return out[0], out[1]
 
 
-def _valid_grid_size(value: Optional[Tuple[int, int]]) -> Optional[Tuple[int, int]]:
-    if value is None or len(value) < 2:
-        return None
-    try:
-        width = int(value[0])
-        height = int(value[1])
-    except (TypeError, ValueError):
-        return None
-    if width <= 0 or height <= 0:
-        return None
-    return width, height
+def surrogate_doc_defines_grid_size(surrogate_doc: Optional[Mapping[str, Any]]) -> bool:
+    """Return True when surrogate JSON carries pre-capture grid metadata."""
+    if not isinstance(surrogate_doc, Mapping):
+        return False
+    if infer_grid_size_from_dim(surrogate_doc.get("dim")):
+        return True
+    return infer_nsdf_bounds_grid_size(surrogate_doc) is not None
 
 
 def resolve_nsdf_grid_size(
     data_doc: Mapping[str, Any],
     *,
+    surrogate_doc: Optional[Mapping[str, Any]] = None,
     env_grid_size: Optional[Tuple[int, int]] = None,
     manual_grid_size: Optional[Tuple[int, int]] = None,
 ) -> Tuple[Tuple[int, int], str]:
-    """Resolve grid size and source using bounds, manual controls, env, then dataset_x."""
-    bounds_size = infer_nsdf_bounds_grid_size(data_doc)
-    if bounds_size:
-        return bounds_size, "bounds"
+    """Resolve grid size from manual controls, surrogate metadata, data bounds, env, dataset_x."""
     manual_size = _valid_grid_size(manual_grid_size)
     if manual_size:
         return manual_size, "manual controls"
+    if isinstance(surrogate_doc, Mapping):
+        dim_size = infer_grid_size_from_dim(surrogate_doc.get("dim"))
+        if dim_size:
+            return dim_size, "surrogate dim"
+        surrogate_bounds_size = infer_nsdf_bounds_grid_size(surrogate_doc)
+        if surrogate_bounds_size:
+            return surrogate_bounds_size, "surrogate bounds"
+    bounds_size = infer_nsdf_bounds_grid_size(data_doc)
+    if bounds_size:
+        return bounds_size, "bounds"
     env_size = _valid_grid_size(env_grid_size)
     if env_size:
         return env_size, "environment"

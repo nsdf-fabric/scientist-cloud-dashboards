@@ -15,7 +15,7 @@ from typing import Any, Callable, Dict, Optional
 
 from bokeh.io import curdoc
 from bokeh.layouts import column, row
-from bokeh.models import Button, Div, Spinner
+from bokeh.models import Button, Div, Select, Spinner
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 for _shared_candidate in (
@@ -88,7 +88,9 @@ from nsdf_dashboard.ornl_chess_strain_lib import (  # noqa: E402
     NSDFLoadedBundle,
     StrainDashboardPaths,
     StrainFieldPlotConfig,
+    apply_nsdf_version_suffix,
     build_strain_field_grids,
+    discover_nsdf_version_options,
     enrich_strain_paths_from_dataset_doc,
     find_strain_json_under_dataset_dir,
     infer_nsdf_grid_size,
@@ -98,8 +100,10 @@ from nsdf_dashboard.ornl_chess_strain_lib import (  # noqa: E402
     load_nsdf_json_bundle,
     make_strain_triplet_figures,
     infer_nsdf_bounds_grid_size,
+    format_nsdf_workflow_display,
     resolve_strain_paths_for_session,
     resolve_nsdf_grid_size,
+    surrogate_doc_defines_grid_size,
     validate_nsdf_measurement_doc,
     validate_nsdf_next_x_doc,
     validate_nsdf_surrogate_doc,
@@ -240,7 +244,15 @@ else:
             )
         return p
 
-    def _resolve_paths() -> StrainDashboardPaths:
+    grid_state: Dict[str, Any] = {
+        "manual_grid_size": None,
+        "active_source": "environment",
+        "updating_controls": False,
+        "last_status": {},
+        "version_suffix": "latest",
+    }
+
+    def _resolve_base_paths() -> StrainDashboardPaths:
         return enrich_strain_paths_from_dataset_doc(
             _prefer_upload_mirror_when_url_only(
                 resolve_strain_paths_for_session(
@@ -260,13 +272,28 @@ else:
             save_dir=_sd,
         )
 
+    def _resolve_paths() -> StrainDashboardPaths:
+        base = _resolve_base_paths()
+        suffix = str(grid_state.get("version_suffix") or "").strip()
+        if suffix in ("", "latest"):
+            return apply_nsdf_version_suffix(base, "")
+        return apply_nsdf_version_suffix(base, suffix)
+
     paths = _resolve_paths()
     plot_cfg = StrainFieldPlotConfig()
     env_grid_size = _fixed_grid_size_from_env()
     if env_grid_size:
         plot_cfg.grid_size = env_grid_size
+    grid_state["active_source"] = "environment" if env_grid_size else "dataset_x"
 
     status_div = Div(text="", sizing_mode="stretch_width", visible=False)
+    workflow_div = Div(text="", sizing_mode="stretch_width", visible=False)
+    version_select = Select(
+        title="Snapshot",
+        value="latest",
+        options=[("latest", "Latest (data.json)")],
+        width=240,
+    )
     grid_w = Spinner(title="Grid width", low=1, high=512, step=1, value=plot_cfg.grid_size[0], width=100)
     grid_h = Spinner(title="Grid height", low=1, high=512, step=1, value=plot_cfg.grid_size[1], width=100)
     btn_reset_grid = Button(label="Reset", button_type="default", width=80)
@@ -275,12 +302,6 @@ else:
 
     loaded_bundle: Optional[NSDFLoadedBundle] = None
     figures_column = column(sizing_mode="stretch_width")
-    grid_state: Dict[str, Any] = {
-        "manual_grid_size": None,
-        "active_source": "environment" if env_grid_size else "dataset_x",
-        "updating_controls": False,
-        "last_status": {},
-    }
 
     def set_status(msg: str, ok: bool = True) -> None:
         color = "#0a0" if ok else "#a00"
@@ -318,29 +339,66 @@ else:
             f"Coordinate normalization: {last_status['bounds_source']}.",
             "Compatible fields: " + ", ".join(last_status["fields"]) + ".",
         ]
+        if last_status.get("surrogate_grid_line"):
+            msg_parts.append(last_status["surrogate_grid_line"])
         if last_status.get("next_x_summary"):
             msg_parts.append(last_status["next_x_summary"])
         if last_status.get("next_x_warnings"):
             msg_parts.extend(last_status["next_x_warnings"])
+        if last_status.get("version_label"):
+            msg_parts.insert(0, f"Snapshot: {last_status['version_label']}.")
+        if last_status.get("workflow_line"):
+            msg_parts.insert(0, last_status["workflow_line"])
         if last_status["source_line"]:
             msg_parts.insert(0, last_status["source_line"])
         msg_parts.extend(last_status["messages"])
         msg_parts.extend(last_status["warnings"])
         set_status("\n".join(msg_parts), ok=True)
+        workflow_line = last_status.get("workflow_line") or ""
+        if workflow_line:
+            workflow_div.text = (
+                f'<div style="font-family:monospace;font-size:14px;padding:6px 0;">'
+                f"<b>{workflow_line}</b></div>"
+            )
+            workflow_div.visible = True
+        else:
+            workflow_div.text = ""
+            workflow_div.visible = False
+
+    def _refresh_version_options() -> None:
+        options = discover_nsdf_version_options(
+            _resolve_base_paths(),
+            base_dir=_bd,
+            save_dir=_sd,
+            mongo_s3_auth=_dataset_s3_auth_override(),
+        )
+        current = str(grid_state.get("version_suffix") or "latest")
+        valid_values = {value for value, _label in options}
+        if current not in valid_values:
+            current = "latest"
+            grid_state["version_suffix"] = current
+        grid_state["updating_controls"] = True
+        try:
+            version_select.options = options
+            version_select.value = current
+        finally:
+            grid_state["updating_controls"] = False
 
     def load_payload() -> None:
         global loaded_bundle  # noqa: PLW0603
 
+        _refresh_version_options()
         p = _resolve_paths()
         try:
             bundle = load_nsdf_json_bundle(p, mongo_s3_auth=_dataset_s3_auth_override())
             measurement = validate_nsdf_measurement_doc(bundle.data)
             fields = list_nsdf_field_headers(bundle.data, bundle.surrogate)
             inferred_grid_size = infer_nsdf_grid_size(bundle.data)
-            if infer_nsdf_bounds_grid_size(bundle.data):
+            if infer_nsdf_bounds_grid_size(bundle.data) or surrogate_doc_defines_grid_size(bundle.surrogate):
                 grid_state["manual_grid_size"] = None
             active_grid_size, active_grid_source = resolve_nsdf_grid_size(
                 bundle.data,
+                surrogate_doc=bundle.surrogate,
                 env_grid_size=env_grid_size,
                 manual_grid_size=grid_state["manual_grid_size"],
             )
@@ -380,12 +438,35 @@ else:
             )
         elif bundle.next_x is not None:
             next_x_summary = "next_x: loaded but no valid workflow entries."
+        workflow_line = format_nsdf_workflow_display(surrogate_info, next_x_info)
+        surrogate_grid_line = ""
+        if surrogate_info.dim:
+            surrogate_grid_line = (
+                f"Surrogate grid dim: {surrogate_info.dim[0]} x {surrogate_info.dim[1]}."
+            )
+        elif surrogate_info.bounds and infer_nsdf_bounds_grid_size(bundle.surrogate or {}):
+            size = infer_nsdf_bounds_grid_size(bundle.surrogate or {})
+            if size:
+                surrogate_grid_line = f"Surrogate grid bounds: {size[0]} x {size[1]}."
+        if surrogate_info.points:
+            points_note = f"Expected points (surrogate): {surrogate_info.points}."
+            surrogate_grid_line = (
+                f"{surrogate_grid_line} {points_note}".strip()
+                if surrogate_grid_line
+                else points_note
+            )
+        version_label = "Latest (data.json)"
+        if (p.version_suffix or "").strip():
+            version_label = p.version_suffix
         grid_state["last_status"] = {
             "measurement_count": measurement.observed_values.shape[0],
             "inferred_grid_size": inferred_grid_size,
             "bounds_source": measurement.bounds_source,
             "fields": fields,
             "source_line": source_line,
+            "version_label": version_label,
+            "workflow_line": workflow_line,
+            "surrogate_grid_line": surrogate_grid_line,
             "messages": list(bundle.messages),
             "warnings": list(surrogate_info.warnings),
             "next_x_summary": next_x_summary,
@@ -409,6 +490,12 @@ else:
         except Exception as e:
             figures_column.children = [Div(text=f"<pre>NSDF grid build failed: {e}</pre>")]
             traceback.print_exc()
+
+    def on_version_change(attr: str, old: Any, new: Any) -> None:
+        if grid_state["updating_controls"]:
+            return
+        grid_state["version_suffix"] = str(new or "latest")
+        on_reload()
 
     def on_reload() -> None:
         load_payload()
@@ -435,6 +522,7 @@ else:
         else:
             active_grid_size, active_grid_source = resolve_nsdf_grid_size(
                 loaded_bundle.data,
+                surrogate_doc=loaded_bundle.surrogate,
                 env_grid_size=env_grid_size,
                 manual_grid_size=None,
             )
@@ -450,12 +538,13 @@ else:
 
     grid_w.on_change("value", on_grid_control_change)
     grid_h.on_change("value", on_grid_control_change)
+    version_select.on_change("value", on_version_change)
     btn_reset_grid.on_click(on_reset_grid)
     btn_reload.on_click(on_reload)
     btn_toggle_status.on_click(on_toggle_status)
 
     controls = column(
-        row(grid_w, grid_h, btn_reload, btn_reset_grid, btn_toggle_status, sizing_mode="scale_width"),
+        row(version_select, grid_w, grid_h, btn_reload, btn_reset_grid, btn_toggle_status, sizing_mode="scale_width"),
         status_div,
         sizing_mode="stretch_width",
     )
@@ -464,7 +553,7 @@ else:
         header = create_header_banner("ORNL CHESS Strain", "ScientistCloud")
     else:
         header = create_header_banner("ORNL CHESS NSDF measurements", "DIAL Dashboard")
-    root = column(header, controls, figures_column, sizing_mode="stretch_width")
+    root = column(header, workflow_div, controls, figures_column, sizing_mode="stretch_width")
     doc.add_root(root)
 
     if paths.local_data_dir or paths.has_s3_source() or paths.local_json_path or paths.json_url:

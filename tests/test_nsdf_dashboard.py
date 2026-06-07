@@ -15,19 +15,28 @@ from nsdf_dashboard import refresh_api, refresh_bus
 from nsdf_dashboard.ornl_chess_strain_lib import (
     StrainDashboardPaths,
     StrainFieldPlotConfig,
+    apply_nsdf_version_suffix,
     build_strain_field_grids,
+    discover_nsdf_version_options,
     enrich_strain_paths_from_dataset_doc,
     infer_nsdf_bounds_grid_size,
     infer_nsdf_grid_size,
+    infer_grid_size_from_dim,
+    format_nsdf_workflow_display,
     list_nsdf_field_headers,
+    list_nsdf_version_suffixes_from_directory,
     load_simple_env_file,
     load_json_from_url,
     load_nsdf_json_bundle,
     normalize_nsdf_gateway_data_url,
     normalize_nsdf_remote_data_link,
+    nsdf_triplet_basenames,
+    parse_nsdf_data_filename,
     resolve_nsdf_grid_size,
+    surrogate_doc_defines_grid_size,
     validate_nsdf_measurement_doc,
     validate_nsdf_next_x_doc,
+    validate_nsdf_surrogate_doc,
 )
 
 
@@ -137,8 +146,8 @@ def test_bounds_grid_size_is_explicit_when_bounds_start_at_zero() -> None:
     }
     assert infer_nsdf_bounds_grid_size(data) == (21, 13)
     assert resolve_nsdf_grid_size(data, env_grid_size=(26, 26), manual_grid_size=(9, 9)) == (
-        (21, 13),
-        "bounds",
+        (9, 9),
+        "manual controls",
     )
 
 
@@ -190,9 +199,51 @@ def test_refresh_bounds_replaces_manual_grid_size() -> None:
         "bounds": [[0, 21], [0, 13]],
     }
     assert resolve_nsdf_grid_size(data, env_grid_size=(26, 26), manual_grid_size=(5, 5)) == (
-        (21, 13),
-        "bounds",
+        (5, 5),
+        "manual controls",
     )
+
+
+def test_surrogate_dim_overrides_sparse_data_inference() -> None:
+    data = {
+        "dataset_x": [[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]],
+        "dataset_y": [1.0, 2.0, 3.0],
+    }
+    surrogate = {"workflow_id": "abc123", "dim": [24, 24]}
+    assert resolve_nsdf_grid_size(data, surrogate_doc=surrogate) == ((24, 24), "surrogate dim")
+    assert surrogate_doc_defines_grid_size(surrogate) is True
+
+
+def test_surrogate_bounds_grid_size() -> None:
+    data = {
+        "dataset_x": [[0.0, 0.0], [1.0, 1.0]],
+        "dataset_y": [1.0, 2.0],
+    }
+    surrogate = {"bounds": [[0, 21], [0, 13]], "points": 273}
+    assert resolve_nsdf_grid_size(data, surrogate_doc=surrogate) == ((21, 13), "surrogate bounds")
+    info = validate_nsdf_surrogate_doc(surrogate, expected_len=2)
+    assert info.points == 273
+
+
+def test_surrogate_workflow_id_display() -> None:
+    surrogate = validate_nsdf_surrogate_doc(
+        {"workflow_id": "6a24964fbc355556959d697f", "surrogate": [1.0, 2.0]},
+        expected_len=2,
+    )
+    next_x = validate_nsdf_next_x_doc(
+        [{"workflow_id": "other-id", "data": [[0.0, 0.0]]}],
+    )
+    assert surrogate.workflow_id == "6a24964fbc355556959d697f"
+    display = format_nsdf_workflow_display(surrogate, next_x)
+    assert "6a24964fbc355556959d697f" in display
+    assert "other-id" in display
+
+
+def test_infer_grid_size_from_dim_formats() -> None:
+    assert infer_grid_size_from_dim([21, 13]) == (21, 13)
+    assert infer_grid_size_from_dim({"width": 21, "height": 13}) == (21, 13)
+    assert infer_grid_size_from_dim({"nx": 21, "ny": 13}) == (21, 13)
+    assert infer_grid_size_from_dim("invalid") is None
 
 
 def test_local_surrogate_sibling_inference() -> None:
@@ -260,6 +311,47 @@ def test_normalize_gateway_prefix_to_data_json() -> None:
         "https://gw.example.com/bucket/prefix/data.json?access_key=AK&secret_key=SK"
     )
     assert "/prefix/data.json?" in explicit
+
+
+def test_nsdf_version_suffix_triplet_and_apply() -> None:
+    assert nsdf_triplet_basenames("") == ("data.json", "surrogate.json", "next_x.json")
+    assert nsdf_triplet_basenames("20260606T223505Z") == (
+        "data_20260606T223505Z.json",
+        "surrogate_20260606T223505Z.json",
+        "next_x_20260606T223505Z.json",
+    )
+    assert parse_nsdf_data_filename("data.json") is None
+    assert parse_nsdf_data_filename("data_20260606T223505Z.json") == "20260606T223505Z"
+
+    base = StrainDashboardPaths(
+        local_data_dir="/tmp/chess-data",
+    )
+    versioned = apply_nsdf_version_suffix(base, "20260606T223505Z")
+    assert versioned.local_json_path.endswith("data_20260606T223505Z.json")
+    assert versioned.surrogate_json_path.endswith("surrogate_20260606T223505Z.json")
+    assert versioned.next_x_json_path.endswith("next_x_20260606T223505Z.json")
+
+    remote = StrainDashboardPaths(
+        json_url="https://gw.example.com/bucket/chess-data/data.json?access_key=AK&secret_key=SK",
+        s3_bucket="bucket",
+        s3_data_key="chess-data/data.json",
+    )
+    versioned_remote = apply_nsdf_version_suffix(remote, "20260606T223505Z")
+    assert "data_20260606T223505Z.json" in versioned_remote.json_url
+    assert versioned_remote.s3_data_key.endswith("data_20260606T223505Z.json")
+    assert versioned_remote.s3_surrogate_key.endswith("surrogate_20260606T223505Z.json")
+
+
+def test_list_nsdf_version_suffixes_from_directory() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        open(os.path.join(tmp, "data.json"), "w", encoding="utf-8").close()
+        open(os.path.join(tmp, "data_20260606T215241Z.json"), "w", encoding="utf-8").close()
+        open(os.path.join(tmp, "data_20260607T023932Z.json"), "w", encoding="utf-8").close()
+        suffixes = list_nsdf_version_suffixes_from_directory(tmp)
+        assert suffixes == ["20260607T023932Z", "20260606T215241Z"]
+        options = discover_nsdf_version_options(StrainDashboardPaths(local_data_dir=tmp))
+        assert options[0] == ("latest", "Latest (data.json)")
+        assert ("20260607T023932Z", "20260607T023932Z") in options
 
 
 def test_enrich_directory_link_resolves_s3_prefix_for_direct_read() -> None:
@@ -552,6 +644,8 @@ def main() -> None:
         test_local_next_x_sibling_inference,
         test_next_x_validation_skips_bad_rows,
         test_normalize_gateway_prefix_to_data_json,
+        test_nsdf_version_suffix_triplet_and_apply,
+        test_list_nsdf_version_suffixes_from_directory,
         test_enrich_directory_link_resolves_s3_prefix_for_direct_read,
         test_load_json_from_url_reads_prefix_via_data_json_key,
         test_env_file_parser_and_s3_config_detection,
