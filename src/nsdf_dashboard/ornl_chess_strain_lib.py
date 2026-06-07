@@ -1971,6 +1971,20 @@ def _grid_display_coords(
     return px, py
 
 
+def _configure_point_legend_below(figure: Any) -> None:
+    if not figure.legend or not figure.legend.items:
+        return
+    figure.legend.location = "below"
+    figure.legend.orientation = "horizontal"
+    figure.legend.click_policy = "hide"
+    figure.legend.background_fill_alpha = 0.92
+    figure.legend.border_line_alpha = 0.0
+    figure.legend.label_text_font_size = "9pt"
+    figure.legend.spacing = 14
+    figure.legend.margin = 6
+    figure.min_border_bottom = 78
+
+
 def _add_grid_point_overlay(
     figure: Any,
     gx: np.ndarray,
@@ -1983,6 +1997,9 @@ def _add_grid_point_overlay(
     marker: str,
     size: int,
     legend_label: str,
+    line_color: Optional[str] = None,
+    line_width: float = 1.5,
+    fill_alpha: float = 0.95,
 ) -> None:
     if gx.size == 0:
         return
@@ -1993,9 +2010,10 @@ def _add_grid_point_overlay(
         size=size,
         marker=marker,
         color=color,
-        line_color="#ffffff",
-        line_width=1.5,
-        alpha=0.95,
+        line_color=line_color or color,
+        line_width=line_width,
+        fill_alpha=fill_alpha,
+        alpha=1.0 if fill_alpha > 0 else None,
         legend_label=legend_label,
     )
 
@@ -2430,8 +2448,11 @@ def make_strain_triplet_figures(
             cfg.flip_y_for_display,
             color=cfg.colormap_mask[1],
             marker="circle",
-            size=10,
+            size=9,
             legend_label="Sampled",
+            line_color="#ffffff",
+            line_width=1.25,
+            fill_alpha=0.95,
         )
     if next_x_info is not None and active_workflow_id:
         nx_gx, nx_gy = next_x_grid_coords_for_workflow(
@@ -2441,22 +2462,23 @@ def make_strain_triplet_figures(
             ny,
             bounds,
         )
-        _add_grid_point_overlay(
-            p0,
-            nx_gx,
-            nx_gy,
-            nx,
-            ny,
-            cfg.flip_y_for_display,
-            color="#ff6600",
-            marker="triangle",
-            size=14,
-            legend_label="Proposed next scan",
-        )
-    if p0.legend and p0.legend.items:
-        p0.legend.location = "top_left"
-        p0.legend.click_policy = "hide"
-        p0.legend.background_fill_alpha = 0.85
+        if nx_gx.size:
+            _add_grid_point_overlay(
+                p0,
+                nx_gx,
+                nx_gy,
+                nx,
+                ny,
+                cfg.flip_y_for_display,
+                color="#ff6600",
+                marker="cross",
+                size=16,
+                legend_label="Proposed next scan",
+                line_color="#ff6600",
+                line_width=2.5,
+                fill_alpha=0.0,
+            )
+    _configure_point_legend_below(p0)
     p1 = make_strain_heatmap_figure(
         f"{cfg.title_estimate}{sub}",
         grids.estimate,
