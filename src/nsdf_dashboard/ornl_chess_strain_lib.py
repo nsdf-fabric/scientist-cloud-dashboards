@@ -633,35 +633,26 @@ def apply_nsdf_version_suffix(
     if out.local_data_dir and local_files_first_for_testing():
         base = out.local_data_dir.rstrip("/")
         out.local_json_path = os.path.join(base, data_fn)
-        if suffix:
-            out.surrogate_json_path = os.path.join(base, sur_fn)
-            out.next_x_json_path = os.path.join(base, nx_fn)
+        out.surrogate_json_path = os.path.join(base, sur_fn)
+        out.next_x_json_path = os.path.join(base, nx_fn)
         return out
 
     if out.local_json_path and not _looks_like_http_url(out.local_json_path):
         base = os.path.dirname(out.local_json_path)
         out.local_json_path = os.path.join(base, data_fn)
-        if suffix:
-            out.surrogate_json_path = os.path.join(base, sur_fn)
-            out.next_x_json_path = os.path.join(base, nx_fn)
+        out.surrogate_json_path = os.path.join(base, sur_fn)
+        out.next_x_json_path = os.path.join(base, nx_fn)
         return out
 
     if out.json_url:
         out.json_url = _replace_url_basename(out.json_url, data_fn)
-        if suffix:
-            out.surrogate_json_url = _replace_url_basename(out.json_url, sur_fn)
-            out.next_x_json_url = _replace_url_basename(out.json_url, nx_fn)
+        out.surrogate_json_url = _replace_url_basename(out.json_url, sur_fn)
+        out.next_x_json_url = _replace_url_basename(out.json_url, nx_fn)
 
     if out.s3_data_key:
         out.s3_data_key = _replace_s3_key_basename(out.s3_data_key, data_fn)
-        if suffix:
-            out.s3_surrogate_key = _replace_s3_key_basename(out.s3_data_key, sur_fn)
-            out.s3_next_x_key = _replace_s3_key_basename(out.s3_data_key, nx_fn)
-        else:
-            out.s3_surrogate_key = (paths.s3_surrogate_key or "").strip() or _sibling_surrogate_s3_key(
-                out.s3_data_key
-            )
-            out.s3_next_x_key = (paths.s3_next_x_key or "").strip() or _sibling_next_x_s3_key(out.s3_data_key)
+        out.s3_surrogate_key = _replace_s3_key_basename(out.s3_data_key, sur_fn)
+        out.s3_next_x_key = _replace_s3_key_basename(out.s3_data_key, nx_fn)
 
     return out
 
@@ -761,6 +752,25 @@ def list_nsdf_version_suffixes_from_directory(directory: str) -> List[str]:
     return sorted(set(suffixes), reverse=True)
 
 
+def list_nsdf_surrogate_suffixes_from_directory(directory: str) -> List[str]:
+    """List timestamp suffixes from ``surrogate_<suffix>.json`` files (newest first)."""
+    d = (directory or "").strip()
+    if not d or not os.path.isdir(d):
+        return []
+    suffixes: List[str] = []
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return []
+    for name in names:
+        if not (name.startswith("surrogate_") and name.endswith(".json")):
+            continue
+        parsed = parse_nsdf_surrogate_filename(name)
+        if parsed:
+            suffixes.append(parsed)
+    return sorted(set(suffixes), reverse=True)
+
+
 def list_nsdf_version_suffixes_from_s3(
     paths: StrainDashboardPaths,
     *,
@@ -818,6 +828,96 @@ def list_nsdf_version_suffixes_from_s3(
     except Exception:
         return []
     return sorted(set(suffixes), reverse=True)
+
+
+def parse_nsdf_surrogate_filename(name: str) -> Optional[str]:
+    """Parse ``surrogate_<suffix>.json``; return suffix or ``None`` for ``surrogate.json``."""
+    base = os.path.basename((name or "").strip())
+    if base == "surrogate.json":
+        return None
+    if not (base.startswith("surrogate_") and base.endswith(".json")):
+        return None
+    middle = base[len("surrogate_") : -len(".json")]
+    return middle or None
+
+
+def list_nsdf_surrogate_suffixes_from_s3(
+    paths: StrainDashboardPaths,
+    *,
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """List timestamp suffixes from ``surrogate_<suffix>.json`` under the S3 prefix."""
+    bucket = (paths.s3_bucket or "").strip()
+    data_key = (paths.s3_data_key or "").strip()
+    if not bucket and (paths.json_url or "").strip():
+        cfg = _parse_gateway_url_with_query_keys((paths.json_url or "").strip())
+        if cfg:
+            bucket = (cfg.get("bucket") or "").strip()
+            data_key = (cfg.get("key") or "").strip()
+    if not bucket:
+        return []
+
+    prefix = ""
+    if data_key:
+        if "/" in data_key:
+            prefix = data_key.rsplit("/", 1)[0] + "/"
+        elif parse_nsdf_data_filename(data_key) is None:
+            prefix = data_key.rstrip("/") + "/"
+
+    list_paths = StrainDashboardPaths(
+        s3_bucket=bucket,
+        s3_data_key=data_key or "data.json",
+        s3_endpoint_url=paths.s3_endpoint_url,
+        s3_region=paths.s3_region,
+        s3_env_file=paths.s3_env_file,
+        json_url=paths.json_url,
+    )
+    try:
+        client = _make_nsdf_s3_client(list_paths, mongo_s3_auth=mongo_s3_auth)
+    except Exception:
+        return []
+
+    suffixes: List[str] = []
+    continuation: Optional[str] = None
+    try:
+        while True:
+            params: Dict[str, Any] = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": 1000}
+            if continuation:
+                params["ContinuationToken"] = continuation
+            result = client.list_objects_v2(**params)
+            for obj in result.get("Contents") or []:
+                name = os.path.basename(str(obj.get("Key") or ""))
+                parsed = parse_nsdf_surrogate_filename(name)
+                if parsed:
+                    suffixes.append(parsed)
+            if not result.get("IsTruncated"):
+                break
+            continuation = result.get("NextContinuationToken")
+            if not continuation:
+                break
+    except Exception:
+        return []
+    return sorted(set(suffixes), reverse=True)
+
+
+def _merged_snapshot_suffixes_from_directory(directory: str) -> List[str]:
+    return sorted(
+        set(list_nsdf_version_suffixes_from_directory(directory))
+        | set(list_nsdf_surrogate_suffixes_from_directory(directory)),
+        reverse=True,
+    )
+
+
+def _merged_snapshot_suffixes_from_s3(
+    paths: StrainDashboardPaths,
+    *,
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    return sorted(
+        set(list_nsdf_version_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth))
+        | set(list_nsdf_surrogate_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth)),
+        reverse=True,
+    )
 
 
 def discover_nsdf_version_options(
@@ -1371,6 +1471,19 @@ def load_optional_surrogate_json(
             if sib_url:
                 candidates.append(("url", sib_url, False))
 
+    tried = {value for _, value, _ in candidates}
+    for path in _iter_surrogate_path_candidates(paths):
+        if path not in tried:
+            candidates.append(("path", path, False))
+            tried.add(path)
+    if paths.json_url:
+        for suffix in _merged_snapshot_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth):
+            _, sur_fn, _ = nsdf_triplet_basenames(suffix)
+            sur_url = _replace_url_basename(paths.json_url, sur_fn)
+            if sur_url not in tried:
+                candidates.append(("url", sur_url, False))
+                tried.add(sur_url)
+
     for kind, value, explicit in candidates:
         try:
             if kind == "path":
@@ -1563,33 +1676,44 @@ def load_nsdf_json_bundle_from_local_data_dir(paths: StrainDashboardPaths) -> Op
     data = load_json_from_local_path(data_path)
     surrogate = None
     messages = [f"Loaded NSDF data JSON from local path: {data_path}"]
-    surrogate_path = os.path.join(local_dir, sur_fn)
     effective = StrainDashboardPaths(
         local_json_path=data_path,
         surrogate_json_path="",
         local_data_dir=local_dir,
         version_suffix=paths.version_suffix,
     )
-    if os.path.isfile(surrogate_path):
+    for surrogate_path in _iter_surrogate_path_candidates(
+        paths,
+        data_path=data_path,
+        local_dir=local_dir,
+    ):
+        if not os.path.isfile(surrogate_path):
+            continue
         try:
             surrogate = load_json_from_local_path(surrogate_path)
             effective.surrogate_json_path = surrogate_path
             messages.append(f"Loaded surrogate JSON from local path: {surrogate_path}")
+            break
         except Exception as exc:
-            messages.append(f"Local surrogate JSON skipped: {exc}")
+            messages.append(f"Local surrogate JSON skipped ({surrogate_path}): {exc}")
     next_x = None
-    next_x_path = os.path.join(local_dir, nx_fn)
-    if os.path.isfile(next_x_path):
+    for next_x_path in _iter_next_x_path_candidates(
+        paths,
+        data_path=data_path,
+        local_dir=local_dir,
+    ):
+        if not os.path.isfile(next_x_path):
+            continue
         try:
             next_x_doc = load_json_from_local_path(next_x_path)
             if isinstance(next_x_doc, list):
                 next_x = next_x_doc
                 effective.next_x_json_path = next_x_path
                 messages.append(f"Loaded next_x JSON from local path: {next_x_path}")
-            else:
-                messages.append("Local next_x JSON skipped: expected a JSON array.")
+                break
+            messages.append(f"Local next_x JSON skipped ({next_x_path}): expected a JSON array.")
         except Exception as exc:
-            messages.append(f"Local next_x JSON skipped: {exc}")
+            messages.append(f"Local next_x JSON skipped ({next_x_path}): {exc}")
     return NSDFLoadedBundle(data=data, surrogate=surrogate, next_x=next_x, messages=messages, paths=effective)
 
 
@@ -1629,6 +1753,130 @@ def load_nsdf_json_bundle(
         messages=messages,
         paths=effective,
     )
+
+
+def _nsdf_key_prefix(key: str) -> str:
+    key = (key or "").strip()
+    if not key:
+        return ""
+    basename = key.rsplit("/", 1)[-1]
+    return key[: -len(basename)] if basename else ""
+
+
+def _iter_surrogate_path_candidates(
+    paths: StrainDashboardPaths,
+    *,
+    data_path: str = "",
+    local_dir: str = "",
+) -> List[str]:
+    """Ordered surrogate.json paths to try, including timestamped fallbacks."""
+    candidates: List[str] = []
+    seen: set[str] = set()
+
+    def add(path: str) -> None:
+        p = (path or "").strip()
+        if p and p not in seen:
+            seen.add(p)
+            candidates.append(p)
+
+    data_path = (data_path or paths.local_json_path or "").strip()
+    local_dir = (local_dir or paths.local_data_dir or "").strip()
+    directory = local_dir or (os.path.dirname(data_path) if data_path else "")
+
+    add((paths.surrogate_json_path or "").strip())
+    add(_sibling_surrogate_path(data_path))
+
+    for listed_suffix in _merged_snapshot_suffixes_from_directory(directory):
+        _, sur_fn, _ = nsdf_triplet_basenames(listed_suffix)
+        if directory:
+            add(os.path.join(directory, sur_fn))
+    return candidates
+
+
+def _iter_next_x_path_candidates(
+    paths: StrainDashboardPaths,
+    *,
+    data_path: str = "",
+    local_dir: str = "",
+) -> List[str]:
+    """Ordered next_x.json paths to try, including timestamped fallbacks."""
+    candidates: List[str] = []
+    seen: set[str] = set()
+
+    def add(path: str) -> None:
+        p = (path or "").strip()
+        if p and p not in seen:
+            seen.add(p)
+            candidates.append(p)
+
+    data_path = (data_path or paths.local_json_path or "").strip()
+    local_dir = (local_dir or paths.local_data_dir or "").strip()
+    directory = local_dir or (os.path.dirname(data_path) if data_path else "")
+
+    add((paths.next_x_json_path or "").strip())
+    add(_sibling_next_x_path(data_path))
+
+    for listed_suffix in list_nsdf_version_suffixes_from_directory(directory):
+        _, _, nx_fn = nsdf_triplet_basenames(listed_suffix)
+        if directory:
+            add(os.path.join(directory, nx_fn))
+    return candidates
+
+
+def _iter_surrogate_s3_key_candidates(
+    paths: StrainDashboardPaths,
+    data_key: str,
+    *,
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """Ordered surrogate S3 keys to try, including timestamped fallbacks."""
+    candidates: List[str] = []
+    seen: set[str] = set()
+
+    def add(key: str) -> None:
+        k = (key or "").strip()
+        if k and k not in seen:
+            seen.add(k)
+            candidates.append(k)
+
+    data_key = (data_key or "").strip()
+    prefix = _nsdf_key_prefix(data_key)
+
+    add((paths.s3_surrogate_key or "").strip())
+    add(_sibling_surrogate_s3_key(data_key))
+
+    for listed_suffix in _merged_snapshot_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth):
+        _, sur_fn, _ = nsdf_triplet_basenames(listed_suffix)
+        add(prefix + sur_fn)
+    return candidates
+
+
+def _iter_next_x_s3_key_candidates(
+    paths: StrainDashboardPaths,
+    data_key: str,
+    *,
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """Ordered next_x S3 keys to try, including timestamped fallbacks."""
+    candidates: List[str] = []
+    seen: set[str] = set()
+
+    def add(key: str) -> None:
+        k = (key or "").strip()
+        if k and k not in seen:
+            seen.add(k)
+            candidates.append(k)
+
+    data_key = (data_key or "").strip()
+    prefix = _nsdf_key_prefix(data_key)
+
+    add((paths.s3_next_x_key or "").strip())
+    add(_sibling_next_x_s3_key(data_key))
+
+    for listed_suffix in list_nsdf_version_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth):
+        _, _, nx_fn = nsdf_triplet_basenames(listed_suffix)
+        add(prefix + nx_fn)
+    return candidates
 
 
 def _sibling_surrogate_s3_key(data_key: str) -> str:
@@ -1732,8 +1980,47 @@ def load_nsdf_json_bundle_from_s3(
     messages = [f"Loaded NSDF data JSON from s3://{bucket}/{data_key}"]
 
     surrogate = None
-    surrogate_key = (paths.s3_surrogate_key or "").strip() or _sibling_surrogate_s3_key(data_key)
-    next_x_key = (paths.s3_next_x_key or "").strip() or _sibling_next_x_s3_key(data_key)
+    surrogate_key = ""
+    surrogate_candidates = _iter_surrogate_s3_key_candidates(
+        paths,
+        data_key,
+        mongo_s3_auth=mongo_s3_auth,
+    )
+    for candidate_key in surrogate_candidates:
+        try:
+            surrogate = _load_json_from_s3_key(client, bucket, candidate_key)
+            surrogate_key = candidate_key
+            messages.append(f"Loaded surrogate JSON from s3://{bucket}/{candidate_key}")
+            break
+        except Exception as exc:
+            if _s3_missing_error(exc):
+                continue
+            messages.append(f"S3 surrogate JSON skipped ({candidate_key}): {exc}")
+            break
+
+    next_x = None
+    next_x_key = ""
+    for candidate_key in _iter_next_x_s3_key_candidates(
+        paths,
+        data_key,
+        mongo_s3_auth=mongo_s3_auth,
+    ):
+        try:
+            next_x_doc = _load_json_from_s3_key(client, bucket, candidate_key)
+            if isinstance(next_x_doc, list):
+                next_x = next_x_doc
+                next_x_key = candidate_key
+                messages.append(f"Loaded next_x JSON from s3://{bucket}/{candidate_key}")
+                break
+            messages.append(
+                f"S3 next_x JSON skipped ({candidate_key}): expected a JSON array."
+            )
+        except Exception as exc:
+            if _s3_missing_error(exc):
+                continue
+            messages.append(f"S3 next_x JSON skipped ({candidate_key}): {exc}")
+            break
+
     effective = StrainDashboardPaths(
         s3_env_file=paths.s3_env_file,
         local_data_dir=paths.local_data_dir,
@@ -1743,31 +2030,12 @@ def load_nsdf_json_bundle_from_s3(
         s3_next_x_key=next_x_key,
         s3_endpoint_url=paths.s3_endpoint_url,
         s3_region=paths.s3_region,
+        version_suffix=paths.version_suffix,
     )
-    if surrogate_key:
-        try:
-            surrogate = _load_json_from_s3_key(client, bucket, surrogate_key)
-            messages.append(f"Loaded surrogate JSON from s3://{bucket}/{surrogate_key}")
-        except Exception as exc:
-            if _s3_missing_error(exc):
-                messages.append(f"S3 surrogate JSON not found: s3://{bucket}/{surrogate_key}")
-            else:
-                messages.append(f"S3 surrogate JSON skipped: {exc}")
-
-    next_x = None
-    if next_x_key:
-        try:
-            next_x_doc = _load_json_from_s3_key(client, bucket, next_x_key)
-            if isinstance(next_x_doc, list):
-                next_x = next_x_doc
-                messages.append(f"Loaded next_x JSON from s3://{bucket}/{next_x_key}")
-            else:
-                messages.append(f"S3 next_x JSON skipped: expected a JSON array at s3://{bucket}/{next_x_key}")
-        except Exception as exc:
-            if _s3_missing_error(exc):
-                messages.append(f"S3 next_x JSON not found: s3://{bucket}/{next_x_key}")
-            else:
-                messages.append(f"S3 next_x JSON skipped: {exc}")
+    if not surrogate and surrogate_candidates:
+        messages.append(
+            "S3 surrogate JSON not found for latest triplet or timestamped fallbacks."
+        )
 
     return NSDFLoadedBundle(data=data, surrogate=surrogate, next_x=next_x, messages=messages, paths=effective)
 

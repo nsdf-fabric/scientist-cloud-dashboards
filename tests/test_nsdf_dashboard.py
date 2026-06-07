@@ -617,10 +617,10 @@ class _FakeS3Client:
         raise AssertionError(f"unexpected key {Key}")
 
     def list_objects_v2(self, **kwargs) -> dict:  # noqa: N803
-        contents = [
-            {"Key": f"prefix/data_{suffix}.json"}
-            for suffix in self.listed_suffixes
-        ]
+        contents = []
+        for suffix in self.listed_suffixes:
+            contents.append({"Key": f"prefix/data_{suffix}.json"})
+            contents.append({"Key": f"prefix/surrogate_{suffix}.json"})
         return {"Contents": contents, "IsTruncated": False}
 
 
@@ -642,6 +642,93 @@ def test_s3_bundle_loads_and_infers_surrogate_key() -> None:
             "prefix/surrogate.json",
             "prefix/next_x.json",
         ]
+    finally:
+        lib._make_nsdf_s3_client = old_make_client
+
+
+def test_dated_snapshot_falls_back_to_nearest_surrogate() -> None:
+    with _local_files_first_for_testing():
+        with tempfile.TemporaryDirectory() as tmp:
+            data_path = os.path.join(tmp, "data_20260606T223505Z.json")
+            with open(data_path, "w", encoding="utf-8") as fh:
+                json.dump(_base_data(), fh)
+            with open(os.path.join(tmp, "surrogate_20260606T223507Z.json"), "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "surrogate": [1.0, 2.0, 3.0, 4.0],
+                        "uncertainty": [0.1, 0.2, 0.3, 0.4],
+                        "bounds": [[0.0, 2.0], [0.0, 2.0]],
+                    },
+                    fh,
+                )
+            paths = apply_nsdf_version_suffix(
+                StrainDashboardPaths(local_data_dir=tmp),
+                "20260606T223505Z",
+            )
+            bundle = load_nsdf_json_bundle(paths)
+            assert bundle.surrogate is not None
+            assert bundle.surrogate["surrogate"] == [1.0, 2.0, 3.0, 4.0]
+            cfg = StrainFieldPlotConfig()
+            cfg.grid_size = resolve_nsdf_grid_size(bundle.data, surrogate_doc=bundle.surrogate)[0]
+            grids = build_strain_field_grids(bundle.data, cfg, bundle.surrogate)
+            assert grids.meta["estimate_source"] == "surrogate_grid"
+
+
+def test_latest_without_surrogate_json_uses_timestamped_fallback() -> None:
+    with _local_files_first_for_testing():
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "data.json"), "w", encoding="utf-8") as fh:
+                json.dump(_base_data(), fh)
+            with open(os.path.join(tmp, "data_20260606T223505Z.json"), "w", encoding="utf-8") as fh:
+                json.dump(_base_data(), fh)
+            with open(os.path.join(tmp, "surrogate_20260606T223507Z.json"), "w", encoding="utf-8") as fh:
+                json.dump({"surrogate": [1.0, 2.0, 3.0, 4.0], "uncertainty": [0.1, 0.2, 0.3, 0.4]}, fh)
+            bundle = load_nsdf_json_bundle(StrainDashboardPaths(local_data_dir=tmp))
+            assert bundle.surrogate is not None
+            cfg = StrainFieldPlotConfig()
+            cfg.grid_size = resolve_nsdf_grid_size(bundle.data, surrogate_doc=bundle.surrogate)[0]
+            grids = build_strain_field_grids(bundle.data, cfg, bundle.surrogate)
+            assert grids.meta["estimate_source"] == "surrogate_grid"
+
+
+def test_s3_surrogate_fallback_when_latest_triplet_missing() -> None:
+    class _FallbackS3Client(_FakeS3Client):
+        def get_object(self, Bucket: str, Key: str) -> dict:  # noqa: N803
+            self.keys_requested.append(Key)
+            if Bucket != "my-bucket":
+                raise AssertionError(f"unexpected bucket {Bucket}")
+            if Key == "prefix/data.json":
+                return {"Body": _FakeBody(_base_data())}
+            if Key == "prefix/surrogate.json":
+                from botocore.exceptions import ClientError
+
+                raise ClientError({"Error": {"Code": "NoSuchKey", "Message": "missing"}}, "GetObject")
+            if Key == "prefix/surrogate_20260606T223507Z.json":
+                return {
+                    "Body": _FakeBody(
+                        {
+                            "surrogate": [1.0, 2.0, 3.0, 4.0],
+                            "uncertainty": [0.1, 0.2, 0.3, 0.4],
+                            "bounds": [[0.0, 2.0], [0.0, 2.0]],
+                        }
+                    )
+                }
+            if Key == "prefix/next_x.json":
+                return {"Body": _FakeBody([])}
+            raise AssertionError(f"unexpected key {Key}")
+
+    fake_client = _FallbackS3Client()
+    fake_client.listed_suffixes = ["20260606T223507Z"]
+    old_make_client = lib._make_nsdf_s3_client
+    try:
+        lib._make_nsdf_s3_client = lambda paths, mongo_s3_auth=None: fake_client
+        paths = StrainDashboardPaths(
+            s3_bucket="my-bucket",
+            s3_data_key="prefix/data.json",
+        )
+        bundle = load_nsdf_json_bundle(paths)
+        assert bundle.surrogate is not None
+        assert "prefix/surrogate_20260606T223507Z.json" in fake_client.keys_requested
     finally:
         lib._make_nsdf_s3_client = old_make_client
 
@@ -878,6 +965,9 @@ def main() -> None:
         test_load_json_from_url_reads_prefix_via_data_json_key,
         test_env_file_parser_and_s3_config_detection,
         test_s3_bundle_loads_and_infers_surrogate_key,
+        test_dated_snapshot_falls_back_to_nearest_surrogate,
+        test_latest_without_surrogate_json_uses_timestamped_fallback,
+        test_s3_surrogate_fallback_when_latest_triplet_missing,
         test_local_data_dir_takes_priority_over_s3,
         test_s3_preferred_when_local_data_dir_without_testing_flag,
         test_local_data_dir_loads_local_surrogate,
