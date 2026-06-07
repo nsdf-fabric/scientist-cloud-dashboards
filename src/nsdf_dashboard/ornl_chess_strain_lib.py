@@ -2004,18 +2004,17 @@ def _add_grid_point_overlay(
     if gx.size == 0:
         return
     px, py = _grid_display_coords(gx, gy, nx, ny, flip_y)
-    figure.scatter(
-        px,
-        py,
-        size=size,
-        marker=marker,
-        color=color,
-        line_color=line_color or color,
-        line_width=line_width,
-        fill_alpha=fill_alpha,
-        alpha=1.0 if fill_alpha > 0 else None,
-        legend_label=legend_label,
-    )
+    scatter_kwargs: Dict[str, Any] = {
+        "size": size,
+        "marker": marker,
+        "color": color,
+        "line_color": line_color or color,
+        "line_width": line_width,
+        "fill_alpha": fill_alpha,
+        "line_alpha": 1.0,
+        "legend_label": legend_label,
+    }
+    figure.scatter(px, py, **scatter_kwargs)
 
 
 def format_nsdf_workflow_display(
