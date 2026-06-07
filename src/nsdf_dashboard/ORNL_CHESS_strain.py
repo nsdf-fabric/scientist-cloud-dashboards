@@ -444,14 +444,16 @@ else:
             next_x_summary = "next_x: loaded but no valid workflow entries."
         workflow_line = format_nsdf_workflow_display(surrogate_info, next_x_info)
         surrogate_grid_line = ""
-        if surrogate_info.dim:
+        if surrogate_info.plot_dim:
+            surrogate_grid_line = f"Surrogate plot dim: {surrogate_info.plot_dim}."
+        bounds_size = infer_nsdf_bounds_grid_size(bundle.surrogate or {})
+        if bounds_size:
+            bounds_note = f"Grid size from bounds: {bounds_size[0]} x {bounds_size[1]}."
             surrogate_grid_line = (
-                f"Surrogate grid dim: {surrogate_info.dim[0]} x {surrogate_info.dim[1]}."
+                f"{surrogate_grid_line} {bounds_note}".strip()
+                if surrogate_grid_line
+                else bounds_note
             )
-        elif surrogate_info.bounds and infer_nsdf_bounds_grid_size(bundle.surrogate or {}):
-            size = infer_nsdf_bounds_grid_size(bundle.surrogate or {})
-            if size:
-                surrogate_grid_line = f"Surrogate grid bounds: {size[0]} x {size[1]}."
         if surrogate_info.points:
             points_note = f"Expected points (surrogate): {surrogate_info.points}."
             surrogate_grid_line = (

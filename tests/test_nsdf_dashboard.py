@@ -22,6 +22,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (
     infer_nsdf_bounds_grid_size,
     infer_nsdf_grid_size,
     infer_grid_size_from_dim,
+    parse_nsdf_plot_dim,
     format_nsdf_workflow_display,
     next_x_grid_coords_for_workflow,
     _grid_display_coords,
@@ -66,7 +67,8 @@ def test_empty_measurement_doc_allows_pre_capture_view() -> None:
     }
     surrogate = {
         "workflow_id": "wf-pre",
-        "dim": [5, 5],
+        "dim": "2D",
+        "bounds": [[0, 5], [0, 5]],
         "surrogate": [float(i) for i in range(25)],
         "uncertainty": [0.1 for _ in range(25)],
     }
@@ -75,7 +77,7 @@ def test_empty_measurement_doc_allows_pre_capture_view() -> None:
     ]
     measurement = validate_nsdf_measurement_doc(data)
     assert measurement.observed_values.shape == (0,)
-    assert resolve_nsdf_grid_size(data, surrogate_doc=surrogate) == ((5, 5), "surrogate dim")
+    assert resolve_nsdf_grid_size(data, surrogate_doc=surrogate) == ((5, 5), "surrogate bounds")
     cfg = StrainFieldPlotConfig()
     cfg.grid_size = (5, 5)
     grids = build_strain_field_grids(data, cfg, surrogate)
@@ -105,7 +107,8 @@ def test_valid_without_surrogate() -> None:
 def test_valid_with_matching_surrogate() -> None:
     cfg = StrainFieldPlotConfig(grid_size=(11, 11))
     surrogate = {
-        "dim": [11, 11],
+        "dim": "2D",
+        "bounds": [[0, 11], [0, 11]],
         "surrogate": [float(i) for i in range(121)],
         "uncertainty": [0.1 for _ in range(121)],
         "raw_uncertainty": [0.01 for _ in range(121)],
@@ -232,14 +235,33 @@ def test_refresh_bounds_replaces_manual_grid_size() -> None:
     )
 
 
-def test_surrogate_dim_overrides_sparse_data_inference() -> None:
+def test_surrogate_bounds_overrides_sparse_data_inference() -> None:
     data = {
         "dataset_x": [[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]],
         "dataset_y": [1.0, 2.0, 3.0],
     }
-    surrogate = {"workflow_id": "abc123", "dim": [24, 24]}
-    assert resolve_nsdf_grid_size(data, surrogate_doc=surrogate) == ((24, 24), "surrogate dim")
+    surrogate = {
+        "workflow_id": "abc123",
+        "dim": "2D",
+        "bounds": [[0, 24], [0, 24]],
+    }
+    assert resolve_nsdf_grid_size(data, surrogate_doc=surrogate) == ((24, 24), "surrogate bounds")
     assert surrogate_doc_defines_grid_size(surrogate) is True
+
+
+def test_legacy_surrogate_dim_array_still_resolves_grid_size() -> None:
+    data = {
+        "dataset_x": [[0.0, 0.0], [1.0, 1.0]],
+        "dataset_y": [1.0, 2.0],
+    }
+    surrogate = {"workflow_id": "abc123", "dim": [24, 24]}
+    assert resolve_nsdf_grid_size(data, surrogate_doc=surrogate) == (
+        (24, 24),
+        "surrogate dim (deprecated)",
+    )
+    info = validate_nsdf_surrogate_doc(surrogate)
+    assert info.plot_dim is None
+    assert any("deprecated" in warning for warning in info.warnings)
 
 
 def test_surrogate_bounds_grid_size() -> None:
@@ -310,11 +332,23 @@ def test_next_x_grid_coords_for_active_workflow() -> None:
     assert float(py[0]) == 10.5
 
 
-def test_infer_grid_size_from_dim_formats() -> None:
+def test_parse_nsdf_plot_dim() -> None:
+    assert parse_nsdf_plot_dim("2D") == ("2D", None)
+    assert parse_nsdf_plot_dim("3d") == ("3D", None)
+    assert parse_nsdf_plot_dim("1D") == ("1D", None)
+    plot_dim, warning = parse_nsdf_plot_dim([21, 13])
+    assert plot_dim is None
+    assert warning is not None and "deprecated" in warning
+    plot_dim, warning = parse_nsdf_plot_dim("invalid")
+    assert plot_dim is None
+    assert warning is not None
+
+
+def test_infer_grid_size_from_dim_legacy_formats() -> None:
     assert infer_grid_size_from_dim([21, 13]) == (21, 13)
     assert infer_grid_size_from_dim({"width": 21, "height": 13}) == (21, 13)
     assert infer_grid_size_from_dim({"nx": 21, "ny": 13}) == (21, 13)
-    assert infer_grid_size_from_dim("invalid") is None
+    assert infer_grid_size_from_dim("2D") is None
 
 
 def test_surrogate_model_grid_independent_of_measurement_count() -> None:
@@ -325,7 +359,8 @@ def test_surrogate_model_grid_independent_of_measurement_count() -> None:
     }
     surrogate = {
         "workflow_id": "abc123",
-        "dim": [5, 5],
+        "dim": "2D",
+        "bounds": [[0, 5], [0, 5]],
         "surrogate": [float(i) for i in range(25)],
         "uncertainty": [0.1 for _ in range(25)],
     }

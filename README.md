@@ -42,7 +42,7 @@ Optional `surrogate.json`:
 ```json
 {
   "workflow_id": "test-workflow",
-  "dim": [24, 24],
+  "dim": "2D",
   "bounds": [[0, 24], [0, 24]],
   "points": 576,
   "surrogate": [69.1, 69.2],
@@ -53,8 +53,9 @@ Optional `surrogate.json`:
 
 `surrogate`, `uncertainty`, and `raw_uncertainty` are flattened model grids from the
 learning workflow. They are independent of the sparse measurement count in
-`data.json`. Provide `dim` (or `bounds`) in `surrogate.json` so the dashboard can
-reshape the model field onto the display grid. When the model grid differs from
+`data.json`. Set `dim` to the plot type (`"1D"`, `"2D"`, `"3D"`, etc.) and provide
+`bounds` in `surrogate.json` so the dashboard knows the model grid shape and can
+reshape the flattened field onto the display grid. When the model grid differs from
 the display grid, values are resampled for visualization. Variance is shown as
 `uncertainty ** 2`.
 

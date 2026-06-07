@@ -378,7 +378,7 @@ class NSDFSurrogateData:
     uncertainty: Optional[np.ndarray] = None
     raw_uncertainty: Optional[np.ndarray] = None
     workflow_id: Optional[str] = None
-    dim: Optional[Tuple[int, int]] = None
+    plot_dim: Optional[str] = None
     bounds: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None
     points: Optional[int] = None
     warnings: List[str] = field(default_factory=list)
@@ -1714,13 +1714,10 @@ def _surrogate_source_grid_size(
     warnings: List[str],
 ) -> Optional[Tuple[int, int]]:
     """Infer the model grid shape for a flattened surrogate field."""
-    if surrogate_info.dim:
-        nx, ny = surrogate_info.dim
-        if nx * ny == length:
-            return nx, ny
-        warnings.append(
-            f"Surrogate dim {nx} x {ny} ({nx * ny} cells) does not match field length {length}."
-        )
+    if surrogate_info.bounds:
+        bounds_size = infer_nsdf_bounds_grid_size({"bounds": list(surrogate_info.bounds)})
+        if bounds_size and bounds_size[0] * bounds_size[1] == length:
+            return bounds_size
     if isinstance(surrogate_doc, Mapping):
         bounds_size = infer_nsdf_bounds_grid_size(surrogate_doc)
         if bounds_size and bounds_size[0] * bounds_size[1] == length:
@@ -1739,7 +1736,7 @@ def _surrogate_source_grid_size(
             return nx, ny
     warnings.append(
         f"Could not infer surrogate grid shape for field length {length}; "
-        "provide surrogate dim or bounds."
+        "provide surrogate bounds."
     )
     return None
 
@@ -1908,8 +1905,30 @@ def _valid_grid_size(value: Optional[Tuple[int, int]]) -> Optional[Tuple[int, in
     return width, height
 
 
-def infer_grid_size_from_dim(value: Any) -> Optional[Tuple[int, int]]:
-    """Parse explicit grid width/height from a ``dim`` field (list or mapping)."""
+def parse_nsdf_plot_dim(value: Any) -> Tuple[Optional[str], Optional[str]]:
+    """Parse ``dim`` as a plot type string (``1D``, ``2D``, ``3D``)."""
+    if value is None:
+        return None, None
+    if isinstance(value, str):
+        normalized = value.strip().upper()
+        if normalized in {"1D", "2D", "3D"}:
+            return normalized, None
+        return None, f"Skipping surrogate 'dim': expected '1D', '2D', or '3D', got {value!r}."
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        return None, (
+            "surrogate 'dim' as [width, height] is deprecated; use dim: \"2D\" "
+            "and bounds for grid size."
+        )
+    if isinstance(value, Mapping):
+        return None, (
+            "surrogate 'dim' as {width, height} is deprecated; use dim: \"2D\" "
+            "and bounds for grid size."
+        )
+    return None, f"Skipping surrogate 'dim': expected a plot type string, got {type(value).__name__}."
+
+
+def _legacy_grid_size_from_dim_array(value: Any) -> Optional[Tuple[int, int]]:
+    """Deprecated fallback: grid width/height encoded as a two-element ``dim`` array."""
     if isinstance(value, Mapping):
         for width_key, height_key in (
             ("width", "height"),
@@ -1922,6 +1941,11 @@ def infer_grid_size_from_dim(value: Any) -> Optional[Tuple[int, int]]:
     if isinstance(value, (list, tuple)) and len(value) >= 2:
         return _valid_grid_size((value[0], value[1]))
     return None
+
+
+def infer_grid_size_from_dim(value: Any) -> Optional[Tuple[int, int]]:
+    """Deprecated alias for legacy ``dim: [width, height]`` grid metadata."""
+    return _legacy_grid_size_from_dim_array(value)
 
 
 def _is_demo_workflow_id(workflow_id: str) -> bool:
@@ -2063,9 +2087,9 @@ def validate_nsdf_surrogate_doc(
     raw_workflow_id = surrogate_doc.get("workflow_id")
     if isinstance(raw_workflow_id, str) and raw_workflow_id.strip():
         workflow_id = raw_workflow_id.strip()
-    dim = infer_grid_size_from_dim(surrogate_doc.get("dim"))
-    if surrogate_doc.get("dim") is not None and dim is None:
-        warnings.append("Skipping surrogate 'dim': expected [width, height] or {width, height}.")
+    plot_dim, plot_dim_warning = parse_nsdf_plot_dim(surrogate_doc.get("dim"))
+    if plot_dim_warning:
+        warnings.append(plot_dim_warning)
     bounds = _validate_bounds(surrogate_doc.get("bounds"))
     points = _parse_nsdf_points(surrogate_doc.get("points"))
     return NSDFSurrogateData(
@@ -2077,7 +2101,7 @@ def validate_nsdf_surrogate_doc(
             warnings,
         ),
         workflow_id=workflow_id,
-        dim=dim,
+        plot_dim=plot_dim,
         bounds=bounds,
         points=points,
         warnings=warnings,
@@ -2111,15 +2135,15 @@ def infer_nsdf_grid_size(data_doc: Mapping[str, Any]) -> Tuple[int, int]:
 
 
 def infer_nsdf_bounds_grid_size(data_doc: Mapping[str, Any]) -> Optional[Tuple[int, int]]:
-    """Read explicit grid width/height from ``bounds=[[0, width], [0, height]]``."""
+    """Read grid width/height from ``bounds=[[0, width], [0, height], ...]``."""
     if not isinstance(data_doc, Mapping):
         return None
     bounds = data_doc.get("bounds")
-    if not isinstance(bounds, list) or len(bounds) < 2:
+    if not isinstance(bounds, list) or len(bounds) < 1:
         return None
 
     out: List[int] = []
-    for axis in bounds[:2]:
+    for axis in bounds:
         if not isinstance(axis, list) or len(axis) < 2:
             return None
         lo, hi = axis[0], axis[1]
@@ -2134,6 +2158,8 @@ def infer_nsdf_bounds_grid_size(data_doc: Mapping[str, Any]) -> Optional[Tuple[i
         if abs(fhi - rounded) > 1e-9 or rounded <= 0:
             return None
         out.append(rounded)
+    if len(out) == 1:
+        return out[0], 1
     return out[0], out[1]
 
 
@@ -2141,9 +2167,9 @@ def surrogate_doc_defines_grid_size(surrogate_doc: Optional[Mapping[str, Any]]) 
     """Return True when surrogate JSON carries pre-capture grid metadata."""
     if not isinstance(surrogate_doc, Mapping):
         return False
-    if infer_grid_size_from_dim(surrogate_doc.get("dim")):
+    if infer_nsdf_bounds_grid_size(surrogate_doc) is not None:
         return True
-    return infer_nsdf_bounds_grid_size(surrogate_doc) is not None
+    return _legacy_grid_size_from_dim_array(surrogate_doc.get("dim")) is not None
 
 
 def resolve_nsdf_grid_size(
@@ -2158,12 +2184,12 @@ def resolve_nsdf_grid_size(
     if manual_size:
         return manual_size, "manual controls"
     if isinstance(surrogate_doc, Mapping):
-        dim_size = infer_grid_size_from_dim(surrogate_doc.get("dim"))
-        if dim_size:
-            return dim_size, "surrogate dim"
         surrogate_bounds_size = infer_nsdf_bounds_grid_size(surrogate_doc)
         if surrogate_bounds_size:
             return surrogate_bounds_size, "surrogate bounds"
+        legacy_dim_size = _legacy_grid_size_from_dim_array(surrogate_doc.get("dim"))
+        if legacy_dim_size:
+            return legacy_dim_size, "surrogate dim (deprecated)"
     bounds_size = infer_nsdf_bounds_grid_size(data_doc)
     if bounds_size:
         return bounds_size, "bounds"
