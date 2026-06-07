@@ -1974,7 +1974,7 @@ def _grid_display_coords(
 def _configure_point_legend_below(figure: Any) -> None:
     if not figure.legend or not figure.legend.items:
         return
-    figure.legend.location = "below"
+    figure.legend.location = "bottom"
     figure.legend.orientation = "horizontal"
     figure.legend.click_policy = "hide"
     figure.legend.background_fill_alpha = 0.92
