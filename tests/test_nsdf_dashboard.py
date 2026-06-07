@@ -23,6 +23,9 @@ from nsdf_dashboard.ornl_chess_strain_lib import (
     infer_nsdf_grid_size,
     infer_grid_size_from_dim,
     format_nsdf_workflow_display,
+    next_x_grid_coords_for_workflow,
+    _grid_display_coords,
+    resolve_nsdf_workflow_id,
     list_nsdf_field_headers,
     list_nsdf_version_suffixes_from_directory,
     load_simple_env_file,
@@ -221,12 +224,56 @@ def test_surrogate_workflow_id_display() -> None:
         {"workflow_id": "6a24964fbc355556959d697f", "surrogate": [1.0, 2.0]},
     )
     next_x = validate_nsdf_next_x_doc(
-        [{"workflow_id": "other-id", "data": [[0.0, 0.0]]}],
+        [
+            {"workflow_id": "dashboard-demo", "data": [[0.0, 0.0], [1.0, 1.0]]},
+            {"workflow_id": "other-id", "data": [[2.0, 2.0]]},
+        ],
     )
-    assert surrogate.workflow_id == "6a24964fbc355556959d697f"
+    assert resolve_nsdf_workflow_id(surrogate, next_x) == "6a24964fbc355556959d697f"
     display = format_nsdf_workflow_display(surrogate, next_x)
-    assert "6a24964fbc355556959d697f" in display
-    assert "other-id" in display
+    assert display == "Workflow ID: 6a24964fbc355556959d697f"
+    assert "other-id" not in display
+    assert "dashboard-demo" not in display
+
+
+def test_workflow_id_falls_back_to_next_x_when_surrogate_missing() -> None:
+    surrogate = validate_nsdf_surrogate_doc({"surrogate": [1.0, 2.0]})
+    next_x = validate_nsdf_next_x_doc(
+        [
+            {"workflow_id": "dashboard-demo", "data": [[0.0, 0.0]]},
+            {"workflow_id": "6a249da9bc355556959d6980", "data": [[1.0, 1.0], [2.0, 2.0]]},
+        ],
+    )
+    assert resolve_nsdf_workflow_id(surrogate, next_x) == "6a249da9bc355556959d6980"
+    assert format_nsdf_workflow_display(surrogate, next_x) == (
+        "Workflow ID: 6a249da9bc355556959d6980"
+    )
+
+
+def test_next_x_grid_coords_for_active_workflow() -> None:
+    data = {
+        "dataset_x": [[0.0, 0.0], [10.0, 10.0]],
+        "dataset_y": [1.0, 2.0],
+        "bounds": [[0.0, 10.0], [0.0, 10.0]],
+    }
+    cfg = StrainFieldPlotConfig(grid_size=(11, 11))
+    grids = build_strain_field_grids(data, cfg)
+    next_x = validate_nsdf_next_x_doc(
+        [
+            {"workflow_id": "dashboard-demo", "data": [[5.0, 5.0]]},
+            {
+                "workflow_id": "wf-active",
+                "data": [[0.0, 0.0], [10.0, 10.0], [5.0, 5.0]],
+            },
+        ],
+    )
+    gx, gy = next_x_grid_coords_for_workflow(next_x, "wf-active", 11, 11, grids.meta["measurement_bounds"])
+    assert gx.shape == (3,)
+    assert gy.shape == (3,)
+    _assert_mask_at(grids.measurements, 0, 0)
+    px, py = _grid_display_coords(gx, gy, 11, 11, flip_y=True)
+    assert float(px[0]) == 0.5
+    assert float(py[0]) == 10.5
 
 
 def test_infer_grid_size_from_dim_formats() -> None:

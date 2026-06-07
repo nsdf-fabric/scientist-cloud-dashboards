@@ -101,6 +101,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (  # noqa: E402
     make_strain_triplet_figures,
     infer_nsdf_bounds_grid_size,
     format_nsdf_workflow_display,
+    resolve_nsdf_workflow_id,
     resolve_strain_paths_for_session,
     resolve_nsdf_grid_size,
     surrogate_doc_defines_grid_size,
@@ -427,12 +428,19 @@ else:
             loc = (bundle.paths.local_json_path or "").strip()
             source_line = f"Source: {loc or bundle.paths.json_url}"
         next_x_summary = ""
-        if next_x_info.entries:
-            workflow_ids = ", ".join(entry.workflow_id for entry in next_x_info.entries)
-            next_x_summary = (
-                f"next_x: {len(next_x_info.entries)} workflow(s), "
-                f"{next_x_info.total_points} proposed point(s) ({workflow_ids})."
+        active_workflow_id = resolve_nsdf_workflow_id(surrogate_info, next_x_info)
+        if next_x_info.entries and active_workflow_id:
+            active_points = sum(
+                int(entry.coordinates.shape[0])
+                for entry in next_x_info.entries
+                if entry.workflow_id == active_workflow_id
             )
+            if active_points:
+                next_x_summary = (
+                    f"next_x: {active_points} proposed point(s) for workflow {active_workflow_id}."
+                )
+        elif next_x_info.entries:
+            next_x_summary = "next_x: loaded but no active non-demo workflow entry."
         elif bundle.next_x is not None:
             next_x_summary = "next_x: loaded but no valid workflow entries."
         workflow_line = format_nsdf_workflow_display(surrogate_info, next_x_info)
@@ -482,7 +490,16 @@ else:
             return
         try:
             grids = build_strain_field_grids(loaded_bundle.data, plot_cfg, loaded_bundle.surrogate)
-            p0, p1, p2 = make_strain_triplet_figures(grids, plot_cfg, row_subtitle="dataset_y")
+            surrogate_info = validate_nsdf_surrogate_doc(loaded_bundle.surrogate)
+            next_x_info = validate_nsdf_next_x_doc(loaded_bundle.next_x)
+            active_workflow_id = resolve_nsdf_workflow_id(surrogate_info, next_x_info)
+            p0, p1, p2 = make_strain_triplet_figures(
+                grids,
+                plot_cfg,
+                row_subtitle="dataset_y",
+                next_x_info=next_x_info,
+                active_workflow_id=active_workflow_id,
+            )
             figures_column.children = [row(p0, p1, p2, sizing_mode="scale_width")]
         except Exception as e:
             figures_column.children = [Div(text=f"<pre>NSDF grid build failed: {e}</pre>")]

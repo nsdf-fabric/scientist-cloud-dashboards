@@ -1910,22 +1910,105 @@ def infer_grid_size_from_dim(value: Any) -> Optional[Tuple[int, int]]:
     return None
 
 
+def _is_demo_workflow_id(workflow_id: str) -> bool:
+    normalized = str(workflow_id or "").strip().lower()
+    if not normalized:
+        return True
+    if normalized in {"dashboard-demo", "demo", "test", "test-workflow"}:
+        return True
+    return normalized.startswith("dashboard-demo")
+
+
+def resolve_nsdf_workflow_id(
+    surrogate_info: NSDFSurrogateData,
+    next_x_info: NSDFNextXData,
+) -> Optional[str]:
+    """Return the active workflow id (surrogate first, then first real next_x entry)."""
+    if surrogate_info.workflow_id and not _is_demo_workflow_id(surrogate_info.workflow_id):
+        return surrogate_info.workflow_id
+    for entry in next_x_info.entries:
+        if entry.workflow_id and not _is_demo_workflow_id(entry.workflow_id):
+            return entry.workflow_id
+    return None
+
+
+def next_x_grid_coords_for_workflow(
+    next_x_info: NSDFNextXData,
+    workflow_id: Optional[str],
+    nx: int,
+    ny: int,
+    bounds: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Map proposed next-scan coordinates onto the dashboard grid for one workflow."""
+    if not workflow_id:
+        return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
+    coords: List[Tuple[float, float]] = []
+    for entry in next_x_info.entries:
+        if entry.workflow_id != workflow_id:
+            continue
+        for row in entry.coordinates:
+            coords.append((float(row[0]), float(row[1])))
+    if not coords:
+        return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
+    arr = np.asarray(coords, dtype=np.float64)
+    return _norm_positions_to_grid(arr[:, 0], arr[:, 1], nx, ny, bounds)
+
+
+def _grid_display_coords(
+    gx: np.ndarray,
+    gy: np.ndarray,
+    nx: int,
+    ny: int,
+    flip_y: bool,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Convert normalized grid indices to Bokeh figure coordinates (cell centers)."""
+    if gx.size == 0:
+        return gx, gy
+    ix = np.clip(np.rint(gx).astype(int), 0, nx - 1)
+    iy = np.clip(np.rint(gy).astype(int), 0, ny - 1)
+    px = ix.astype(np.float64) + 0.5
+    py = (ny - 1 - iy + 0.5).astype(np.float64) if flip_y else iy.astype(np.float64) + 0.5
+    return px, py
+
+
+def _add_grid_point_overlay(
+    figure: Any,
+    gx: np.ndarray,
+    gy: np.ndarray,
+    nx: int,
+    ny: int,
+    flip_y: bool,
+    *,
+    color: str,
+    marker: str,
+    size: int,
+    legend_label: str,
+) -> None:
+    if gx.size == 0:
+        return
+    px, py = _grid_display_coords(gx, gy, nx, ny, flip_y)
+    figure.scatter(
+        px,
+        py,
+        size=size,
+        marker=marker,
+        color=color,
+        line_color="#ffffff",
+        line_width=1.5,
+        alpha=0.95,
+        legend_label=legend_label,
+    )
+
+
 def format_nsdf_workflow_display(
     surrogate_info: NSDFSurrogateData,
     next_x_info: "NSDFNextXData",
 ) -> str:
-    """Collect unique workflow IDs from surrogate and next_x for dashboard display."""
-    ids: List[str] = []
-    if surrogate_info.workflow_id:
-        ids.append(surrogate_info.workflow_id)
-    for entry in next_x_info.entries:
-        if entry.workflow_id and entry.workflow_id not in ids:
-            ids.append(entry.workflow_id)
-    if not ids:
+    """Show the single active workflow id for the dashboard banner."""
+    workflow_id = resolve_nsdf_workflow_id(surrogate_info, next_x_info)
+    if not workflow_id:
         return ""
-    if len(ids) == 1:
-        return f"Workflow ID: {ids[0]}"
-    return "Workflow IDs: " + ", ".join(ids)
+    return f"Workflow ID: {workflow_id}"
 
 
 def validate_nsdf_surrogate_doc(
@@ -2178,6 +2261,9 @@ def build_strain_field_grids(
         "mode": "nsdf_sparse",
         "n_points": int(values.shape[0]),
         "bounds_source": measurement.bounds_source,
+        "measurement_bounds": measurement.bounds,
+        "measurement_gx": gx,
+        "measurement_gy": gy,
         "plottable_fields": surrogate.plottable_fields,
         "warnings": list(surrogate.warnings),
     }
@@ -2308,6 +2394,8 @@ def make_strain_triplet_figures(
     cfg: StrainFieldPlotConfig,
     *,
     row_subtitle: str = "",
+    next_x_info: Optional[NSDFNextXData] = None,
+    active_workflow_id: Optional[str] = None,
 ):
     sub = f" — {row_subtitle}" if row_subtitle else ""
     est = grids.estimate
@@ -2317,6 +2405,11 @@ def make_strain_triplet_figures(
     if lo == hi:
         hi = lo + 1e-12
 
+    nx, ny = cfg.grid_size
+    bounds = grids.meta.get("measurement_bounds")
+    if not isinstance(bounds, tuple):
+        bounds = None
+
     p0 = make_strain_heatmap_figure(
         f"{cfg.title_measurements}{sub}",
         grids.measurements,
@@ -2325,6 +2418,45 @@ def make_strain_triplet_figures(
         discrete_mask=True,
         low_high=(0.0, 1.0),
     )
+    measured_gx = grids.meta.get("measurement_gx")
+    measured_gy = grids.meta.get("measurement_gy")
+    if isinstance(measured_gx, np.ndarray) and isinstance(measured_gy, np.ndarray) and measured_gx.size:
+        _add_grid_point_overlay(
+            p0,
+            measured_gx,
+            measured_gy,
+            nx,
+            ny,
+            cfg.flip_y_for_display,
+            color=cfg.colormap_mask[1],
+            marker="circle",
+            size=10,
+            legend_label="Sampled",
+        )
+    if next_x_info is not None and active_workflow_id:
+        nx_gx, nx_gy = next_x_grid_coords_for_workflow(
+            next_x_info,
+            active_workflow_id,
+            nx,
+            ny,
+            bounds,
+        )
+        _add_grid_point_overlay(
+            p0,
+            nx_gx,
+            nx_gy,
+            nx,
+            ny,
+            cfg.flip_y_for_display,
+            color="#ff6600",
+            marker="triangle",
+            size=14,
+            legend_label="Proposed next scan",
+        )
+    if p0.legend and p0.legend.items:
+        p0.legend.location = "top_left"
+        p0.legend.click_policy = "hide"
+        p0.legend.background_fill_alpha = 0.85
     p1 = make_strain_heatmap_figure(
         f"{cfg.title_estimate}{sub}",
         grids.estimate,
