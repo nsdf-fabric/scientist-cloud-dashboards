@@ -2065,25 +2065,24 @@ def _attach_point_legend_below(
     figure: Any,
     legend_items: List[Tuple[str, Any]],
 ) -> None:
-    """Place marker legend in the layout below the plot frame (not over the heatmap)."""
-    if not legend_items:
-        return
+    """Place marker legend below the plot frame; always reserve footer space."""
     from bokeh.models import Legend, LegendItem
 
-    legend = Legend(
-        items=[LegendItem(label=label, renderers=[renderer]) for label, renderer in legend_items],
-        location="center",
-        orientation="horizontal",
-        click_policy="hide",
-        background_fill_alpha=0.92,
-        border_line_alpha=0.0,
-        label_text_font_size="9pt",
-        spacing=14,
-        margin=0,
-        padding=6,
-    )
-    figure.add_layout(legend, "below")
-    figure.min_border_bottom = 10
+    if legend_items:
+        legend = Legend(
+            items=[LegendItem(label=label, renderers=[renderer]) for label, renderer in legend_items],
+            location="center",
+            orientation="horizontal",
+            click_policy="hide",
+            background_fill_alpha=0.92,
+            border_line_alpha=0.0,
+            label_text_font_size="9pt",
+            spacing=14,
+            margin=0,
+            padding=6,
+        )
+        figure.add_layout(legend, "below")
+    figure.min_border_bottom = 40
 
 
 def _add_grid_point_overlay(

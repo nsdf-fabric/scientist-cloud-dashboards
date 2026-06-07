@@ -15,7 +15,62 @@ from typing import Any, Callable, Dict, Optional
 
 from bokeh.io import curdoc
 from bokeh.layouts import column, row
-from bokeh.models import Button, Div, Select, Spinner
+from bokeh.models import Button, Div, InlineStyleSheet, Select, Spinner, TextInput
+
+# Match Bokeh titled-widget label + gap so plain buttons line up with inputs.
+_TITLED_WIDGET_LABEL_HEIGHT = 20
+_CONTROL_BTN_HEIGHT = 31
+_FIXED_BTN_STYLE = InlineStyleSheet(
+    css=f"""
+:host {{
+  height: {_CONTROL_BTN_HEIGHT}px !important;
+  min-height: {_CONTROL_BTN_HEIGHT}px !important;
+  max-height: {_CONTROL_BTN_HEIGHT}px !important;
+}}
+:host button {{
+  height: {_CONTROL_BTN_HEIGHT}px !important;
+  min-height: {_CONTROL_BTN_HEIGHT}px !important;
+  max-height: {_CONTROL_BTN_HEIGHT}px !important;
+  white-space: nowrap !important;
+  line-height: 1 !important;
+  box-sizing: border-box !important;
+}}
+"""
+)
+
+
+def _toolbar_button(label: str, *, button_type: str, width: int) -> Button:
+    btn = Button(label=label, button_type=button_type, width=width)
+    btn.stylesheets = [_FIXED_BTN_STYLE]
+    return btn
+
+
+def _bottom_aligned_button(btn: Button) -> column:
+    return column(
+        Div(
+            text="&nbsp;",
+            height=_TITLED_WIDGET_LABEL_HEIGHT,
+            width=1,
+            styles={
+                "padding": "0",
+                "margin": "0",
+                "border": "0",
+                "font-size": "13px",
+                "line-height": "1.35",
+                "overflow": "hidden",
+                "box-sizing": "border-box",
+            },
+        ),
+        btn,
+        sizing_mode="fixed",
+    )
+
+
+def _control_row(*widgets: Any) -> row:
+    return row(
+        *(_bottom_aligned_button(w) if isinstance(w, Button) else w for w in widgets),
+        sizing_mode="scale_width",
+    )
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 for _shared_candidate in (
@@ -251,6 +306,12 @@ else:
         "updating_controls": False,
         "last_status": {},
         "version_suffix": "latest",
+        "playback": {
+            "active": False,
+            "order": [],
+            "index": 0,
+            "callback_id": None,
+        },
     }
 
     def _resolve_base_paths() -> StrainDashboardPaths:
@@ -288,18 +349,27 @@ else:
     grid_state["active_source"] = "environment" if env_grid_size else "dataset_x"
 
     status_div = Div(text="", sizing_mode="stretch_width", visible=False)
-    workflow_div = Div(text="", sizing_mode="stretch_width", visible=False)
+    _workflow_placeholder = (
+        '<div style="font-family:monospace;font-size:14px;padding:6px 0;'
+        'min-height:1.35em;line-height:1.35em;color:#888;">Workflow ID: —</div>'
+    )
+    workflow_div = Div(text=_workflow_placeholder, sizing_mode="stretch_width")
     version_select = Select(
         title="Snapshot",
         value="latest",
         options=[("latest", "Latest (data.json)")],
         width=240,
     )
+    _play_btn_width = 90
+    play_interval_input = TextInput(title="Play interval (s)", value="2.0", width=110)
+    btn_play_backward = _toolbar_button("< Play", button_type="success", width=_play_btn_width)
+    btn_play_forward = _toolbar_button("Play >", button_type="success", width=_play_btn_width)
+    btn_play_stop = _toolbar_button("Stop", button_type="warning", width=_play_btn_width)
     grid_w = Spinner(title="Grid width", low=1, high=512, step=1, value=plot_cfg.grid_size[0], width=100)
     grid_h = Spinner(title="Grid height", low=1, high=512, step=1, value=plot_cfg.grid_size[1], width=100)
-    btn_reset_grid = Button(label="Reset", button_type="default", width=80)
-    btn_reload = Button(label="Reload", button_type="primary", width=90)
-    btn_toggle_status = Button(label="Show status", button_type="default", width=110)
+    btn_reset_grid = _toolbar_button("Reset", button_type="default", width=80)
+    btn_reload = _toolbar_button("Reload", button_type="primary", width=90)
+    btn_toggle_status = _toolbar_button("Show status", button_type="default", width=110)
 
     loaded_bundle: Optional[NSDFLoadedBundle] = None
     figures_column = column(sizing_mode="stretch_width")
@@ -358,13 +428,11 @@ else:
         workflow_line = last_status.get("workflow_line") or ""
         if workflow_line:
             workflow_div.text = (
-                f'<div style="font-family:monospace;font-size:14px;padding:6px 0;">'
-                f"<b>{workflow_line}</b></div>"
+                f'<div style="font-family:monospace;font-size:14px;padding:6px 0;'
+                f'min-height:1.35em;line-height:1.35em;"><b>{workflow_line}</b></div>'
             )
-            workflow_div.visible = True
         else:
-            workflow_div.text = ""
-            workflow_div.visible = False
+            workflow_div.text = _workflow_placeholder
 
     def _refresh_version_options() -> None:
         options = discover_nsdf_version_options(
@@ -384,6 +452,86 @@ else:
             version_select.value = current
         finally:
             grid_state["updating_controls"] = False
+
+    def _snapshot_values_chronological() -> list[str]:
+        """Oldest timestamped snapshot first, ``latest`` last."""
+        values = [str(value) for value, _label in version_select.options]
+        timestamps = sorted(v for v in values if v != "latest")
+        if "latest" in values:
+            timestamps.append("latest")
+        return timestamps
+
+    def _playback_interval_ms() -> int:
+        try:
+            seconds = float(str(play_interval_input.value or "").strip())
+        except ValueError:
+            seconds = 2.0
+        seconds = max(0.5, min(120.0, seconds))
+        return int(seconds * 1000)
+
+    def _stop_playback() -> None:
+        playback = grid_state.get("playback") or {}
+        callback_id = playback.get("callback_id")
+        if callback_id is not None:
+            doc.remove_periodic_callback(callback_id)
+        grid_state["playback"] = {
+            "active": False,
+            "order": [],
+            "index": 0,
+            "callback_id": None,
+        }
+
+    def _apply_snapshot_value(value: str) -> None:
+        grid_state["version_suffix"] = str(value or "latest")
+        grid_state["updating_controls"] = True
+        try:
+            version_select.value = grid_state["version_suffix"]
+        finally:
+            grid_state["updating_controls"] = False
+        on_reload()
+
+    def _advance_playback() -> None:
+        playback = grid_state.get("playback") or {}
+        if not playback.get("active"):
+            return
+        order = playback.get("order") or []
+        if len(order) <= 1:
+            _stop_playback()
+            return
+        next_index = int(playback.get("index", 0)) + 1
+        if next_index >= len(order):
+            _stop_playback()
+            return
+        playback["index"] = next_index
+        grid_state["playback"] = playback
+        _apply_snapshot_value(str(order[next_index]))
+
+    def _start_playback(*, forward: bool) -> None:
+        _stop_playback()
+        chronological = _snapshot_values_chronological()
+        if len(chronological) <= 1:
+            set_status("Need at least two snapshots to play acquisition.", ok=False)
+            status_div.visible = True
+            return
+        order = chronological if forward else list(reversed(chronological))
+        current = str(version_select.value or "latest")
+        start_index = order.index(current) if current in order else 0
+        callback_id = doc.add_periodic_callback(_advance_playback, _playback_interval_ms())
+        grid_state["playback"] = {
+            "active": True,
+            "order": order,
+            "index": start_index,
+            "callback_id": callback_id,
+        }
+
+    def on_play_forward() -> None:
+        _start_playback(forward=True)
+
+    def on_play_backward() -> None:
+        _start_playback(forward=False)
+
+    def on_play_stop() -> None:
+        _stop_playback()
 
     def load_payload() -> None:
         global loaded_bundle  # noqa: PLW0603
@@ -509,6 +657,8 @@ else:
     def on_version_change(attr: str, old: Any, new: Any) -> None:
         if grid_state["updating_controls"]:
             return
+        if (grid_state.get("playback") or {}).get("active"):
+            _stop_playback()
         grid_state["version_suffix"] = str(new or "latest")
         on_reload()
 
@@ -554,12 +704,22 @@ else:
     grid_w.on_change("value", on_grid_control_change)
     grid_h.on_change("value", on_grid_control_change)
     version_select.on_change("value", on_version_change)
+    btn_play_forward.on_click(on_play_forward)
+    btn_play_backward.on_click(on_play_backward)
+    btn_play_stop.on_click(on_play_stop)
     btn_reset_grid.on_click(on_reset_grid)
     btn_reload.on_click(on_reload)
     btn_toggle_status.on_click(on_toggle_status)
 
     controls = column(
-        row(version_select, grid_w, grid_h, btn_reload, btn_reset_grid, btn_toggle_status, sizing_mode="scale_width"),
+        row(version_select, sizing_mode="scale_width"),
+        _control_row(grid_w, grid_h, btn_reload, btn_reset_grid, btn_toggle_status),
+        _control_row(
+            play_interval_input,
+            btn_play_backward,
+            btn_play_forward,
+            btn_play_stop,
+        ),
         status_div,
         sizing_mode="stretch_width",
     )
@@ -591,6 +751,7 @@ else:
             token: int = _refresh_token,
             unregister: Callable[[int], None] = unregister_refresh_callback,
         ) -> None:
+            _stop_playback()
             unregister(token)
 
         doc.on_session_destroyed(_cleanup_refresh_callback)
