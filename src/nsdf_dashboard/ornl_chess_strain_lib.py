@@ -198,6 +198,12 @@ _STRAIN_ORDER_PORTAL: Tuple[str, ...] = (
     "env_path",
     "env_url",
 )
+_STRAIN_ORDER_REMOTE_LINKED: Tuple[str, ...] = (
+    "query_url",
+    "query_path",
+    "env_url",
+    "env_path",
+)
 _STRAIN_ORDER_CLI: Tuple[str, ...] = (
     "env_path",
     "env_url",
@@ -243,7 +249,38 @@ def find_strain_json_under_dataset_dir(directory: str) -> str:
     return ""
 
 
-def _strain_effective_source_order(base_dir: str, save_dir: str) -> Tuple[str, ...]:
+def scientistcloud_dataset_is_remote_linked(
+    doc: Optional[Mapping[str, Any]] = None,
+    *,
+    server_param: str = "",
+) -> bool:
+    """
+    True for ScientistCloud datasets linked to remote S3/gateway storage.
+
+    Mirrors ``sc_dataset_is_remote_linked()`` in dashboard_share_link.php.
+    Uploaded-file datasets (local upload tree only) return False.
+    """
+    if str(server_param or "").strip().lower() == "true":
+        return True
+    if not isinstance(doc, Mapping):
+        return False
+    if str(doc.get("server") or "").strip().lower() == "true":
+        return True
+    link = pick_strain_json_link_from_dataset_doc(doc)
+    if not link:
+        return False
+    low = link.lower()
+    return low.startswith(("s3://", "http://", "https://"))
+
+
+def _strain_effective_source_order(
+    base_dir: str,
+    save_dir: str,
+    *,
+    remote_linked: bool = False,
+) -> Tuple[str, ...]:
+    if remote_linked:
+        return _STRAIN_ORDER_REMOTE_LINKED
     custom = (os.environ.get("ORNL_STRAIN_SOURCE_ORDER") or "").strip()
     if custom:
         parts = tuple(
@@ -291,6 +328,7 @@ def resolve_strain_paths_for_session(
     query_next_x_json_path: str = "",
     query_next_x_json_url: str = "",
     env: Optional[StrainDashboardPaths] = None,
+    remote_linked: bool = False,
 ) -> StrainDashboardPaths:
     """
     Build ``StrainDashboardPaths`` using the configured source order.
@@ -300,7 +338,7 @@ def resolve_strain_paths_for_session(
     provenance); ``load_strain_json`` reads the file first.
     """
     env = env or StrainDashboardPaths.from_environ()
-    order = _strain_effective_source_order(base_dir, save_dir)
+    order = _strain_effective_source_order(base_dir, save_dir, remote_linked=remote_linked)
     q_path = normalize_nsdf_remote_data_link((query_strain_json_path or "").strip())
     q_url = normalize_nsdf_remote_data_link((query_strain_json_url or "").strip())
     env_path = (env.local_json_path or "").strip()
@@ -773,8 +811,11 @@ def nsdf_listing_directory(
     *,
     base_dir: str = "",
     save_dir: str = "",
+    remote_linked: bool = False,
 ) -> str:
     """Best-effort local directory for discovering timestamped NSDF JSON backups."""
+    if remote_linked:
+        return ""
     candidates: List[str] = []
     if (paths.local_data_dir or "").strip() and local_files_first_for_testing():
         candidates.append((paths.local_data_dir or "").strip())
@@ -1157,6 +1198,7 @@ def discover_nsdf_version_options(
     base_dir: str = "",
     save_dir: str = "",
     mongo_s3_auth: Optional[Dict[str, str]] = None,
+    remote_linked: bool = False,
 ) -> List[Tuple[str, str]]:
     """
     Return ``(value, label)`` pairs for a version selector.
@@ -1170,11 +1212,12 @@ def discover_nsdf_version_options(
     options: List[Tuple[str, str]] = [("latest", "Latest (data.json)")]
     seen: set[str] = set()
 
-    local_dir = nsdf_listing_directory(paths, base_dir=base_dir, save_dir=save_dir)
-    for suffix in list_nsdf_version_suffixes_from_directory(local_dir):
-        if suffix not in seen:
-            seen.add(suffix)
-            options.append((suffix, suffix))
+    if not remote_linked:
+        local_dir = nsdf_listing_directory(paths, base_dir=base_dir, save_dir=save_dir)
+        for suffix in list_nsdf_version_suffixes_from_directory(local_dir):
+            if suffix not in seen:
+                seen.add(suffix)
+                options.append((suffix, suffix))
 
     if not _remote_snapshot_listing_enabled(paths):
         return options
@@ -1441,17 +1484,45 @@ def discover_nsdf_triplet_index(
     base_dir: str = "",
     save_dir: str = "",
     mongo_s3_auth: Optional[Dict[str, str]] = None,
+    remote_linked: bool = False,
 ) -> NSDFTripletIndex:
     """
     Build a workflow-scoped snapshot catalog (list + lightweight JSON peeks).
 
     Called once per Reload; snapshot/workflow UI filters use the cached index.
+
+    ScientistCloud S3-linked datasets must list only the remote prefix (never the
+    sparse upload mirror). Uploaded-file datasets use the local upload tree.
     """
+    if _local_data_dir_active(paths):
+        local_dir = nsdf_listing_directory(paths, base_dir=base_dir, save_dir=save_dir)
+        if local_dir:
+            return _build_triplet_index_from_directory(local_dir)
+        return NSDFTripletIndex()
+
+    if remote_linked:
+        if not _remote_snapshot_listing_enabled(paths):
+            return NSDFTripletIndex()
+        remote_paths = (
+            paths
+            if paths.has_s3_source()
+            else promote_gateway_json_url_to_s3_paths(paths)
+        )
+        return _build_triplet_index_from_s3(remote_paths, mongo_s3_auth=mongo_s3_auth)
+
+    if _remote_snapshot_listing_enabled(paths):
+        remote_paths = (
+            paths
+            if paths.has_s3_source()
+            else promote_gateway_json_url_to_s3_paths(paths)
+        )
+        index = _build_triplet_index_from_s3(remote_paths, mongo_s3_auth=mongo_s3_auth)
+        if index.snapshots:
+            return index
+
     local_dir = nsdf_listing_directory(paths, base_dir=base_dir, save_dir=save_dir)
     if local_dir:
         return _build_triplet_index_from_directory(local_dir)
-    if _remote_snapshot_listing_enabled(paths):
-        return _build_triplet_index_from_s3(paths, mongo_s3_auth=mongo_s3_auth)
     return NSDFTripletIndex()
 
 
@@ -1564,6 +1635,69 @@ def promote_gateway_json_url_to_s3_paths(paths: StrainDashboardPaths) -> StrainD
 
 def _finalize_strain_paths(paths: StrainDashboardPaths) -> StrainDashboardPaths:
     return promote_gateway_json_url_to_s3_paths(paths)
+
+
+def _paths_without_local_json_files(paths: StrainDashboardPaths) -> StrainDashboardPaths:
+    """Drop portal upload-mirror file paths; keep remote URL / S3 routing."""
+    return StrainDashboardPaths(
+        local_json_path="",
+        json_url=paths.json_url,
+        surrogate_json_path="",
+        surrogate_json_url=paths.surrogate_json_url,
+        next_x_json_path="",
+        next_x_json_url=paths.next_x_json_url,
+        local_data_dir=paths.local_data_dir,
+        s3_env_file=paths.s3_env_file,
+        s3_bucket=paths.s3_bucket,
+        s3_data_key=paths.s3_data_key,
+        s3_surrogate_key=paths.s3_surrogate_key,
+        s3_next_x_key=paths.s3_next_x_key,
+        s3_endpoint_url=paths.s3_endpoint_url,
+        s3_region=paths.s3_region,
+        version_suffix=paths.version_suffix,
+    )
+
+
+def apply_scientistcloud_storage_policy(
+    paths: StrainDashboardPaths,
+    doc: Optional[Mapping[str, Any]] = None,
+    *,
+    server_param: str = "",
+    base_dir: str = "",
+    save_dir: str = "",
+) -> StrainDashboardPaths:
+    """
+    Enforce ScientistCloud storage mode on resolved session paths.
+
+    Remote-linked datasets use S3 / gateway only. Uploaded-file datasets keep
+    the portal upload/converted tree.
+    """
+    if not scientistcloud_dataset_is_remote_linked(doc, server_param=server_param):
+        return _finalize_strain_paths(paths)
+
+    cleared = _paths_without_local_json_files(paths)
+    finalized = _finalize_strain_paths(cleared)
+    if finalized.has_s3_source() or (finalized.json_url or "").strip():
+        return finalized
+
+    if isinstance(doc, Mapping):
+        return enrich_strain_paths_from_dataset_doc(
+            _copy_s3_fields(
+                paths,
+                StrainDashboardPaths(
+                    local_json_path="",
+                    json_url="",
+                    surrogate_json_path=paths.surrogate_json_path,
+                    surrogate_json_url=paths.surrogate_json_url,
+                    next_x_json_path=paths.next_x_json_path,
+                    next_x_json_url=paths.next_x_json_url,
+                ),
+            ),
+            doc,
+            base_dir=base_dir,
+            save_dir=save_dir,
+        )
+    return finalized
 
 
 def enrich_strain_paths_from_dataset_doc(
@@ -2334,6 +2468,7 @@ def load_nsdf_json_bundle(
     paths: StrainDashboardPaths,
     *,
     mongo_s3_auth: Optional[Dict[str, str]] = None,
+    remote_linked: bool = False,
 ) -> NSDFLoadedBundle:
     if _local_data_dir_active(paths):
         local_bundle = load_nsdf_json_bundle_from_local_data_dir(paths)
@@ -2347,10 +2482,13 @@ def load_nsdf_json_bundle(
         )
 
     load_paths = promote_gateway_json_url_to_s3_paths(_strip_local_data_dir_paths(paths))
-    if load_paths.has_s3_source():
+    if remote_linked:
+        load_paths = _paths_without_local_json_files(load_paths)
+    if remote_linked or load_paths.has_s3_source():
         load_paths.local_json_path = ""
         load_paths.surrogate_json_path = ""
         load_paths.next_x_json_path = ""
+    if load_paths.has_s3_source():
         return load_nsdf_json_bundle_from_s3(load_paths, mongo_s3_auth=mongo_s3_auth)
     data = load_strain_json(load_paths, mongo_s3_auth=mongo_s3_auth)
     surrogate, messages, effective = load_optional_surrogate_json(
@@ -2564,6 +2702,18 @@ def _make_nsdf_s3_client(
         tok = (mongo_s3_auth.get("aws_session_token") or "").strip()
         if tok:
             cfg["aws_session_token"] = tok
+    if not (cfg["aws_access_key_id"] and cfg["aws_secret_access_key"]):
+        gateway = _parse_gateway_url_with_query_keys((paths.json_url or "").strip())
+        if gateway:
+            cfg["aws_access_key_id"] = (gateway.get("access_key_id") or "").strip()
+            cfg["aws_secret_access_key"] = (gateway.get("secret_access_key") or "").strip()
+            if not cfg["endpoint_url"]:
+                cfg["endpoint_url"] = (gateway.get("endpoint_url") or "").strip()
+            if gateway.get("region_name"):
+                cfg["region_name"] = (gateway.get("region_name") or cfg["region_name"]).strip()
+            tok = (gateway.get("aws_session_token") or "").strip()
+            if tok:
+                cfg["aws_session_token"] = tok
 
     kwargs: Dict[str, Any] = {
         "region_name": cfg["region_name"],

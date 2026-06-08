@@ -15,6 +15,8 @@ import nsdf_dashboard.ornl_chess_strain_lib as lib
 from nsdf_dashboard import refresh_api, refresh_bus
 from nsdf_dashboard.ornl_chess_strain_lib import (
     NSDFLoadedBundle,
+    NSDFSnapshotRef,
+    NSDFTripletIndex,
     NSDF_UNKNOWN_WORKFLOW_ID,
     StrainDashboardPaths,
     StrainFieldPlotConfig,
@@ -34,6 +36,8 @@ from nsdf_dashboard.ornl_chess_strain_lib import (
     _grid_display_coords,
     resolve_default_workflow_selection,
     resolve_nsdf_workflow_id,
+    resolve_strain_paths_for_session,
+    scientistcloud_dataset_is_remote_linked,
     list_nsdf_field_headers,
     list_nsdf_version_suffixes_from_directory,
     load_simple_env_file,
@@ -979,6 +983,143 @@ def test_triplet_index_groups_snapshots_by_workflow() -> None:
         ) == "wf-b"
         unknown_opts = index.snapshot_select_options(NSDF_UNKNOWN_WORKFLOW_ID)
         assert unknown_opts == [("20260607T110000Z", "20260607T110000Z")]
+
+
+def test_scientistcloud_dataset_is_remote_linked() -> None:
+    assert scientistcloud_dataset_is_remote_linked({"server": "true"})
+    assert scientistcloud_dataset_is_remote_linked(
+        {"google_drive_link": "https://gateway.example/bucket/data.json"}
+    )
+    assert not scientistcloud_dataset_is_remote_linked(
+        {"google_drive_link": "/mnt/visus_datasets/upload/uuid/data.json"}
+    )
+    assert scientistcloud_dataset_is_remote_linked(
+        None,
+        server_param="true",
+    )
+
+
+def test_resolve_strain_paths_remote_linked_skips_upload_mirror() -> None:
+    with tempfile.TemporaryDirectory() as upload_dir:
+        data_path = os.path.join(upload_dir, "data.json")
+        with open(data_path, "w", encoding="utf-8") as fh:
+            json.dump(_base_data(), fh)
+        gateway = "https://gateway.example/bucket/prefix/data.json?access_key=a&secret_key=b"
+        paths = resolve_strain_paths_for_session(
+            base_dir=upload_dir,
+            save_dir="",
+            query_strain_json_url=gateway,
+            remote_linked=True,
+        )
+        assert paths.local_json_path == ""
+        assert paths.json_url == gateway
+
+
+def test_discover_triplet_index_remote_linked_never_uses_local(monkeypatch) -> None:
+    with tempfile.TemporaryDirectory() as upload_dir:
+        with open(os.path.join(upload_dir, "data.json"), "w", encoding="utf-8") as fh:
+            json.dump(_base_data(), fh)
+
+        local_calls: list[str] = []
+
+        def _fake_empty_s3(paths, mongo_s3_auth=None):
+            return NSDFTripletIndex()
+
+        def _fake_local_index(directory: str) -> NSDFTripletIndex:
+            local_calls.append(directory)
+            raise AssertionError("local index should not run for remote-linked datasets")
+
+        monkeypatch.setattr(lib, "_build_triplet_index_from_s3", _fake_empty_s3)
+        monkeypatch.setattr(lib, "_build_triplet_index_from_directory", _fake_local_index)
+
+        paths = StrainDashboardPaths(
+            s3_bucket="my-bucket",
+            s3_data_key="prefix/data.json",
+            local_json_path=os.path.join(upload_dir, "data.json"),
+        )
+        discover_nsdf_triplet_index(
+            paths,
+            base_dir=upload_dir,
+            save_dir="",
+            remote_linked=True,
+        )
+        assert local_calls == []
+
+
+def test_discover_triplet_index_prefers_s3_over_sparse_portal_mirror(monkeypatch) -> None:
+    """Portal upload dirs often mirror only latest JSON; catalog must list S3 prefix."""
+    with tempfile.TemporaryDirectory() as upload_dir:
+        with open(os.path.join(upload_dir, "data.json"), "w", encoding="utf-8") as fh:
+            json.dump(_base_data(), fh)
+
+        s3_snap = NSDFSnapshotRef(
+            suffix="",
+            workflow_id="wf-from-s3",
+            sort_key="z_latest",
+        )
+        s3_index = NSDFTripletIndex(
+            snapshots=[s3_snap],
+            by_workflow={"wf-from-s3": [s3_snap]},
+        )
+        local_calls: list[str] = []
+
+        def _fake_s3_index(paths, mongo_s3_auth=None):
+            return s3_index
+
+        def _fake_local_index(directory: str) -> NSDFTripletIndex:
+            local_calls.append(directory)
+            unknown_snap = NSDFSnapshotRef(
+                suffix="",
+                workflow_id=NSDF_UNKNOWN_WORKFLOW_ID,
+                sort_key="z_latest",
+            )
+            return NSDFTripletIndex(
+                snapshots=[unknown_snap],
+                by_workflow={NSDF_UNKNOWN_WORKFLOW_ID: [unknown_snap]},
+            )
+
+        monkeypatch.setattr(lib, "_build_triplet_index_from_s3", _fake_s3_index)
+        monkeypatch.setattr(lib, "_build_triplet_index_from_directory", _fake_local_index)
+
+        paths = StrainDashboardPaths(
+            local_json_path=os.path.join(upload_dir, "data.json"),
+            json_url="https://gateway.example/bucket/prefix/data.json",
+            s3_bucket="my-bucket",
+            s3_data_key="prefix/data.json",
+        )
+        index = discover_nsdf_triplet_index(
+            paths,
+            base_dir=upload_dir,
+            save_dir="",
+        )
+        assert index.has_workflow("wf-from-s3")
+        assert local_calls == []
+
+
+def test_discover_triplet_index_falls_back_to_local_when_s3_empty(monkeypatch) -> None:
+    with tempfile.TemporaryDirectory() as upload_dir:
+        with open(os.path.join(upload_dir, "data.json"), "w", encoding="utf-8") as fh:
+            json.dump(_base_data(), fh)
+
+        local_calls: list[str] = []
+
+        def _fake_empty_s3(paths, mongo_s3_auth=None):
+            return NSDFTripletIndex()
+
+        def _fake_local_index(directory: str) -> NSDFTripletIndex:
+            local_calls.append(directory)
+            return _build_triplet_index_from_directory(directory)
+
+        monkeypatch.setattr(lib, "_build_triplet_index_from_s3", _fake_empty_s3)
+        monkeypatch.setattr(lib, "_build_triplet_index_from_directory", _fake_local_index)
+
+        paths = StrainDashboardPaths(
+            s3_bucket="my-bucket",
+            s3_data_key="prefix/data.json",
+        )
+        index = discover_nsdf_triplet_index(paths, base_dir=upload_dir, save_dir="")
+        assert local_calls == [upload_dir]
+        assert index.has_workflow(NSDF_UNKNOWN_WORKFLOW_ID)
 
 
 def test_s3_surrogate_fallback_when_latest_triplet_missing() -> None:

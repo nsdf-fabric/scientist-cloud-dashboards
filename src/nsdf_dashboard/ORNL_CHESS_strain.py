@@ -148,6 +148,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (  # noqa: E402
     StrainDashboardPaths,
     StrainFieldPlotConfig,
     apply_nsdf_version_suffix,
+    apply_scientistcloud_storage_policy,
     active_workflow_id_from_grid_state,
     build_strain_field_grids,
     collect_nsdf_triplet_load_issues,
@@ -168,6 +169,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (  # noqa: E402
     resolve_nsdf_workflow_id,
     resolve_strain_paths_for_session,
     resolve_nsdf_grid_size,
+    scientistcloud_dataset_is_remote_linked,
     surrogate_doc_defines_grid_size,
     validate_nsdf_measurement_doc,
     validate_nsdf_next_x_doc,
@@ -268,6 +270,10 @@ else:
             return None
 
     _dataset_doc = _fetch_dataset_doc()
+    _remote_linked = scientistcloud_dataset_is_remote_linked(
+        _dataset_doc,
+        server_param=str(_params.get("server") or ""),
+    )
 
     def _dataset_s3_auth_override() -> Optional[Dict[str, str]]:
         dataset_doc = _dataset_doc
@@ -287,6 +293,8 @@ else:
         return out
 
     def _prefer_upload_mirror_when_url_only(p: StrainDashboardPaths) -> StrainDashboardPaths:
+        if _remote_linked:
+            return p
         loc = (p.local_json_path or "").strip()
         jurl = (p.json_url or "").strip()
         if loc or not jurl:
@@ -330,21 +338,28 @@ else:
     }
 
     def _resolve_base_paths() -> StrainDashboardPaths:
-        return enrich_strain_paths_from_dataset_doc(
-            _prefer_upload_mirror_when_url_only(
-                resolve_strain_paths_for_session(
-                    base_dir=_bd,
-                    save_dir=_sd,
-                    query_strain_json_path=_query_data_path0,
-                    query_strain_json_url=_query_data_url0,
-                    query_surrogate_json_path=_query_surrogate_path0,
-                    query_surrogate_json_url=_query_surrogate_url0,
-                    query_next_x_json_path=_query_next_x_path0,
-                    query_next_x_json_url=_query_next_x_url0,
-                    env=StrainDashboardPaths.from_environ(),
-                )
+        return apply_scientistcloud_storage_policy(
+            enrich_strain_paths_from_dataset_doc(
+                _prefer_upload_mirror_when_url_only(
+                    resolve_strain_paths_for_session(
+                        base_dir=_bd,
+                        save_dir=_sd,
+                        query_strain_json_path=_query_data_path0,
+                        query_strain_json_url=_query_data_url0,
+                        query_surrogate_json_path=_query_surrogate_path0,
+                        query_surrogate_json_url=_query_surrogate_url0,
+                        query_next_x_json_path=_query_next_x_path0,
+                        query_next_x_json_url=_query_next_x_url0,
+                        env=StrainDashboardPaths.from_environ(),
+                        remote_linked=_remote_linked,
+                    )
+                ),
+                _dataset_doc,
+                base_dir=_bd,
+                save_dir=_sd,
             ),
             _dataset_doc,
+            server_param=str(_params.get("server") or ""),
             base_dir=_bd,
             save_dir=_sd,
         )
@@ -521,6 +536,7 @@ else:
             base_dir=_bd,
             save_dir=_sd,
             mongo_s3_auth=_dataset_s3_auth_override(),
+            remote_linked=_remote_linked,
         )
         grid_state["triplet_index"] = index
 
@@ -663,7 +679,11 @@ else:
 
         p = _resolve_paths()
         try:
-            bundle = load_nsdf_json_bundle(p, mongo_s3_auth=_dataset_s3_auth_override())
+            bundle = load_nsdf_json_bundle(
+                p,
+                mongo_s3_auth=_dataset_s3_auth_override(),
+                remote_linked=_remote_linked,
+            )
             measurement = validate_nsdf_measurement_doc(bundle.data)
             fields = list_nsdf_field_headers(bundle.data, bundle.surrogate)
             inferred_grid_size = infer_nsdf_grid_size(bundle.data)
