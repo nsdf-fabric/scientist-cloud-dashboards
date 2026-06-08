@@ -559,6 +559,56 @@ def test_parse_transformed_stddevs_avg_points() -> None:
     points, _ = parse_transformed_stddevs_avg_points([[1.0, 0.5], [2.0, 0.3]])
     assert points == [("1", 0.5), ("2", 0.3)]
 
+    points, _ = parse_transformed_stddevs_avg_points(0.42)
+    assert points == []
+
+
+def test_peek_transformed_stddevs_avg_scalar() -> None:
+    from nsdf_dashboard.ornl_chess_strain_lib import _peek_transformed_stddevs_avg_scalar
+
+    assert _peek_transformed_stddevs_avg_scalar({"transformed_stddevs_avg": 0.15}) == 0.15
+    assert _peek_transformed_stddevs_avg_scalar(
+        {"transformed_stddevs_avg": [["20260608T120000Z", 0.2]]}
+    ) == 0.2
+    assert _peek_transformed_stddevs_avg_scalar(
+        {"transformed_stddevs_avg": [["a", 0.9], ["b", 0.4]]}
+    ) is None
+
+
+def test_build_uncertainty_trend_series_from_scalar_per_snapshot_surrogates() -> None:
+    from nsdf_dashboard.ornl_chess_strain_lib import _build_triplet_index_from_directory
+
+    with tempfile.TemporaryDirectory() as tmp:
+        for suffix, y in (
+            ("20260601T100000Z", 0.9),
+            ("20260602T100000Z", 0.6),
+            ("20260603T100000Z", 0.4),
+        ):
+            with open(os.path.join(tmp, f"data_{suffix}.json"), "w", encoding="utf-8") as fh:
+                json.dump({**_base_data(), "workflow_id": "wf-scalar"}, fh)
+            with open(os.path.join(tmp, f"surrogate_{suffix}.json"), "w", encoding="utf-8") as fh:
+                json.dump(
+                    {"workflow_id": "wf-scalar", "transformed_stddevs_avg": y},
+                    fh,
+                )
+        index = _build_triplet_index_from_directory(tmp)
+        paths = StrainDashboardPaths(local_json_path=os.path.join(tmp, "data.json"))
+        series = build_uncertainty_trend_series(
+            index,
+            paths,
+            workflow_id="wf-scalar",
+            current_snapshot="20260602T100000Z",
+            grid_size=(11, 11),
+        )
+        assert series.step_ids == [
+            "20260601T100000Z",
+            "20260602T100000Z",
+            "20260603T100000Z",
+        ]
+        assert series.y.tolist() == [0.9, 0.6, 0.4]
+        assert series.current_index == 1
+        assert series.source == "per_snapshot_transformed_stddevs_avg"
+
 
 def test_build_uncertainty_trend_skips_per_snapshot_when_disabled() -> None:
     index = NSDFTripletIndex(

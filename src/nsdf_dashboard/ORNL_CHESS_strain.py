@@ -403,6 +403,9 @@ else:
             "callback_id": None,
         },
         "loading_generation": 0,
+        "figures_work_tick_scheduled": False,
+        "pending_figures_work": None,
+        "suppress_selector_reload": False,
         "catalog_ready": False,
         "catalog_loading": False,
         "catalog_callback_id": None,
@@ -536,13 +539,28 @@ else:
         return token
 
     def _defer_figures_work(work_fn: Callable[[], None], *, message: str) -> None:
+        grid_state["pending_figures_work"] = work_fn
+        if grid_state.get("figures_work_tick_scheduled"):
+            if figures_column.children:
+                figures_column.children = [_loading_placeholder_div(message)]
+            return
+
         token = _begin_figures_loading(message)
+        grid_state["figures_work_tick_scheduled"] = True
 
         def _run() -> None:
+            grid_state["figures_work_tick_scheduled"] = False
             if grid_state.get("loading_generation") != token:
                 return
             try:
-                work_fn()
+                while True:
+                    pending = grid_state.get("pending_figures_work")
+                    if pending is None:
+                        break
+                    grid_state["pending_figures_work"] = None
+                    pending()
+                    if grid_state.get("loading_generation") != token:
+                        return
             except Exception as exc:
                 traceback.print_exc()
                 if grid_state.get("loading_generation") == token:
@@ -709,6 +727,14 @@ else:
         grid_state["uncertainty_trend_points_key"] = ""
         grid_state["uncertainty_trend_points"] = None
 
+    def _end_control_update_batch() -> None:
+        grid_state["updating_controls"] = False
+
+    def _set_select_value_if_needed(select: Select, value: str) -> None:
+        target = str(value or "latest")
+        if str(select.value or "") != target:
+            select.value = target
+
     def _reset_to_latest_triplet_selectors() -> None:
         """Point all three file selectors at the live latest triplet."""
         grid_state["version_suffix"] = "latest"
@@ -718,20 +744,33 @@ else:
         grid_state["next_x_manual"] = False
         grid_state["updating_controls"] = True
         try:
-            if "latest" in {value for value, _label in version_select.options}:
-                version_select.value = "latest"
-            if "latest" in {value for value, _label in surrogate_select.options}:
-                surrogate_select.value = "latest"
-            if "latest" in {value for value, _label in next_x_select.options}:
-                next_x_select.value = "latest"
+            latest_values = {value for value, _label in version_select.options}
+            if "latest" in latest_values:
+                _set_select_value_if_needed(version_select, "latest")
+            latest_values = {value for value, _label in surrogate_select.options}
+            if "latest" in latest_values:
+                _set_select_value_if_needed(surrogate_select, "latest")
+            latest_values = {value for value, _label in next_x_select.options}
+            if "latest" in latest_values:
+                _set_select_value_if_needed(next_x_select, "latest")
         finally:
-            grid_state["updating_controls"] = False
+            # Bokeh may emit select callbacks after this function returns.
+            doc.add_next_tick_callback(_end_control_update_batch)
 
     def _reload_current_view() -> None:
-        _reset_to_latest_triplet_selectors()
-        load_payload()
-        _update_workflow_hint_from_bundle()
-        rebuild_figures()
+        grid_state["suppress_selector_reload"] = True
+        try:
+            _reset_to_latest_triplet_selectors()
+            if grid_state.get("catalog_ready"):
+                _sync_auxiliary_selectors_from_data(reset_manual=True)
+            load_payload()
+            _update_workflow_hint_from_bundle()
+            rebuild_figures()
+        finally:
+            def _clear_selector_suppress() -> None:
+                grid_state["suppress_selector_reload"] = False
+
+            doc.add_next_tick_callback(_clear_selector_suppress)
 
     def _wrap_log_html(inner_html: str) -> str:
         return (
@@ -908,9 +947,15 @@ else:
         grid_state["updating_controls"] = True
         try:
             surrogate_select.options = sur_options
-            surrogate_select.value = str(grid_state.get("surrogate_version_suffix") or "latest")
+            _set_select_value_if_needed(
+                surrogate_select,
+                str(grid_state.get("surrogate_version_suffix") or "latest"),
+            )
             next_x_select.options = nx_options
-            next_x_select.value = str(grid_state.get("next_x_version_suffix") or "latest")
+            _set_select_value_if_needed(
+                next_x_select,
+                str(grid_state.get("next_x_version_suffix") or "latest"),
+            )
         finally:
             grid_state["updating_controls"] = False
 
@@ -1252,11 +1297,11 @@ else:
 
     def _uncertainty_trend_for_dashboard() -> Optional[UncertaintyTrendSeries]:
         current_snap = str(grid_state.get("version_suffix") or "latest")
-        quick = _uncertainty_trend_from_loaded_surrogate(current_snap)
-        if quick is not None:
-            return quick
 
         if not grid_state.get("catalog_ready"):
+            quick = _uncertainty_trend_from_loaded_surrogate(current_snap)
+            if quick is not None:
+                return quick
             quick = build_uncertainty_trend_from_surrogate_paths(
                 _resolve_paths(),
                 current_snapshot=current_snap,
@@ -1370,7 +1415,7 @@ else:
                 _set_loaded_status()
 
     def on_version_change(attr: str, old: Any, new: Any) -> None:
-        if grid_state["updating_controls"]:
+        if grid_state["updating_controls"] or grid_state.get("suppress_selector_reload"):
             return
         if (grid_state.get("playback") or {}).get("active"):
             _stop_playback()
@@ -1379,14 +1424,14 @@ else:
         _defer_figures_work(_reload_figures_view, message="Loading data snapshot...")
 
     def on_surrogate_change(attr: str, old: Any, new: Any) -> None:
-        if grid_state["updating_controls"]:
+        if grid_state["updating_controls"] or grid_state.get("suppress_selector_reload"):
             return
         grid_state["surrogate_version_suffix"] = str(new or "latest")
         grid_state["surrogate_manual"] = True
         _defer_figures_work(_reload_figures_view, message="Loading surrogate snapshot...")
 
     def on_next_x_change(attr: str, old: Any, new: Any) -> None:
-        if grid_state["updating_controls"]:
+        if grid_state["updating_controls"] or grid_state.get("suppress_selector_reload"):
             return
         grid_state["next_x_version_suffix"] = str(new or "latest")
         grid_state["next_x_manual"] = True

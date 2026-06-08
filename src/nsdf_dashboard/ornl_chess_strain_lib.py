@@ -38,7 +38,7 @@ import logging
 import math
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -527,6 +527,7 @@ class NSDFSnapshotRef:
     suffix: str  # ``""`` = latest trio (`data.json`, etc.)
     workflow_id: str
     sort_key: str  # ISO suffix or ``latest`` for ordering
+    uncertainty_trend_y: Optional[float] = None  # ``transformed_stddevs_avg`` peeked at index time
 
 
 @dataclass
@@ -1698,6 +1699,7 @@ def _build_triplet_index_from_groups(
             suffix=suffix,
             workflow_id=workflow_id,
             sort_key=_snapshot_sort_key(suffix),
+            uncertainty_trend_y=_peek_transformed_stddevs_avg_scalar(surrogate_doc),
         )
         snapshots.append(ref)
         by_workflow.setdefault(workflow_id, []).append(ref)
@@ -4741,6 +4743,30 @@ def _parse_trend_y_value(value: Any) -> Optional[float]:
     return numeric if math.isfinite(numeric) else None
 
 
+def _peek_transformed_stddevs_avg_scalar(
+    surrogate_doc: Any,
+) -> Optional[float]:
+    """
+    Return one average-uncertainty value from a surrogate snapshot.
+
+    Accepts the current pipeline format ``transformed_stddevs_avg: <float>`` as
+    well as a single ``[[id, avg]]`` pair. Returns ``None`` when the field holds
+    a multi-step history (handled via the selected ``surrogate.json`` instead).
+    """
+    if not isinstance(surrogate_doc, Mapping):
+        return None
+    raw = surrogate_doc.get("transformed_stddevs_avg")
+    if raw is None:
+        return None
+    scalar = _parse_trend_y_value(raw)
+    if scalar is not None:
+        return scalar
+    points, _ = parse_transformed_stddevs_avg_points(raw)
+    if len(points) == 1:
+        return float(points[0][1])
+    return None
+
+
 def _append_transformed_stddevs_avg_point(
     points: List[Tuple[str, float]],
     *,
@@ -4776,6 +4802,9 @@ def parse_transformed_stddevs_avg_points(
     """
     warnings: List[str] = []
     if value is None:
+        return [], warnings
+    scalar = _parse_trend_y_value(value)
+    if scalar is not None:
         return [], warnings
     if isinstance(value, Mapping):
         ids = value.get("id")
@@ -4895,6 +4924,10 @@ def _uncertainty_point_from_surrogate_doc(
     """Return (step_id, y, source) for one snapshot's contribution to the trend line."""
     if not isinstance(surrogate_doc, Mapping):
         return None, None, "none"
+    scalar = _peek_transformed_stddevs_avg_scalar(surrogate_doc)
+    if scalar is not None:
+        label = (step_id or "").strip() or str(step_index)
+        return label, scalar, "transformed_stddevs_avg"
     points, _ = parse_transformed_stddevs_avg_points(
         surrogate_doc.get("transformed_stddevs_avg")
     )
@@ -4976,6 +5009,18 @@ def uncertainty_trend_from_surrogate_doc(
     """
     if not isinstance(surrogate_doc, Mapping):
         return None
+    scalar = _peek_transformed_stddevs_avg_scalar(surrogate_doc)
+    current_snapshot = (current_snapshot or "latest").strip() or "latest"
+    if scalar is not None:
+        step_id = current_snapshot if current_snapshot != "latest" else "latest"
+        return UncertaintyTrendSeries(
+            step_ids=[step_id],
+            y=np.asarray([scalar], dtype=np.float64),
+            labels=[step_id],
+            current_index=0,
+            source="transformed_stddevs_avg",
+            warnings=[],
+        )
     full_points, parse_warnings = parse_transformed_stddevs_avg_points(
         surrogate_doc.get("transformed_stddevs_avg")
     )
@@ -5014,6 +5059,68 @@ def uncertainty_trend_from_surrogate_doc(
         labels=[step_id],
         current_index=0,
         source="uncertainty_grid_mean",
+        warnings=warnings,
+    )
+
+
+def _build_per_snapshot_uncertainty_trend(
+    chrono: Sequence[NSDFSnapshotRef],
+    base_paths: StrainDashboardPaths,
+    *,
+    grid_size: Tuple[int, int],
+    current_snapshot: str,
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+    remote_linked: bool = False,
+    allow_file_load: bool = True,
+) -> UncertaintyTrendSeries:
+    """One trend point per ``surrogate_<suffix>.json`` (x = file id, y = scalar avg)."""
+    warnings: List[str] = []
+    step_ids_out: List[str] = []
+    ys_out: List[float] = []
+    labels_out: List[str] = []
+    current_index: Optional[int] = None
+    current_snapshot = (current_snapshot or "latest").strip() or "latest"
+
+    for step_idx, snap in enumerate(chrono, start=1):
+        suffix = snap.suffix or "latest"
+        label = "Latest" if not snap.suffix else snap.suffix
+        y_val = snap.uncertainty_trend_y
+        if y_val is None and allow_file_load:
+            snap_paths = apply_nsdf_version_suffix(
+                base_paths,
+                "" if suffix == "latest" else suffix,
+            )
+            surrogate_doc = load_surrogate_doc_for_paths(
+                snap_paths,
+                mongo_s3_auth=mongo_s3_auth,
+                remote_linked=remote_linked,
+            )
+            step_id, loaded_y, _point_source = _uncertainty_point_from_surrogate_doc(
+                surrogate_doc,
+                grid_size=grid_size,
+                step_index=step_idx,
+                step_id=label,
+            )
+            if loaded_y is not None:
+                y_val = loaded_y
+            elif step_id:
+                label = step_id
+        if y_val is None:
+            if allow_file_load:
+                warnings.append(f"Snapshot {label}: no transformed_stddevs_avg or uncertainty grid.")
+            continue
+        step_ids_out.append(label)
+        ys_out.append(float(y_val))
+        labels_out.append(label)
+        if suffix == current_snapshot:
+            current_index = len(step_ids_out) - 1
+
+    return UncertaintyTrendSeries(
+        step_ids=step_ids_out,
+        y=np.asarray(ys_out, dtype=np.float64),
+        labels=labels_out,
+        current_index=current_index,
+        source="per_snapshot_transformed_stddevs_avg" if step_ids_out else "per_snapshot",
         warnings=warnings,
     )
 
@@ -5058,8 +5165,9 @@ def build_uncertainty_trend_series(
     """
     Build avg-uncertainty vs time-step series for the active workflow.
 
-    Prefers ``transformed_stddevs_avg`` ``[[id, avg], ...]`` from the selected
-    ``surrogate.json``; falls back to per-snapshot means from uncertainty grids.
+    Prefers one ``transformed_stddevs_avg`` scalar per ``surrogate_<suffix>.json``
+    (x = snapshot id). Falls back to a multi-step history array in the selected
+    ``surrogate.json``, then per-snapshot uncertainty-grid means.
     """
     warnings: List[str] = []
     snaps = triplet_index.snapshots_for_workflow(workflow_id)
@@ -5072,6 +5180,24 @@ def build_uncertainty_trend_series(
         )
 
     chrono = _snapshots_chronological(snaps)
+    per_snapshot = _build_per_snapshot_uncertainty_trend(
+        chrono,
+        base_paths,
+        grid_size=grid_size,
+        current_snapshot=current_snapshot,
+        mongo_s3_auth=mongo_s3_auth,
+        remote_linked=remote_linked,
+        allow_file_load=allow_per_snapshot_fallback,
+    )
+    warnings.extend(per_snapshot.warnings)
+    if per_snapshot.step_ids:
+        if per_snapshot.current_index is None and current_snapshot == "latest" and chrono:
+            per_snapshot = replace(per_snapshot, current_index=len(per_snapshot.step_ids) - 1)
+        return replace(
+            per_snapshot,
+            warnings=warnings,
+        )
+
     trend_surrogate_paths = surrogate_paths or apply_nsdf_version_suffix(base_paths, "")
     trend_doc = load_surrogate_doc_for_paths(
         trend_surrogate_paths,
@@ -5107,7 +5233,7 @@ def build_uncertainty_trend_series(
         grid_size=grid_size,
     )
     if quick is not None:
-        return quick
+        return replace(quick, warnings=[*warnings, *quick.warnings])
 
     if not allow_per_snapshot_fallback:
         return UncertaintyTrendSeries(
@@ -5118,6 +5244,7 @@ def build_uncertainty_trend_series(
             or ["Uncertainty trend will update after the snapshot catalog finishes loading."],
         )
 
+    # Last resort: mean uncertainty grid per snapshot (loads full surrogate each time).
     step_ids_out: List[str] = []
     ys_out: List[float] = []
     labels_out: List[str] = []
@@ -5136,19 +5263,12 @@ def build_uncertainty_trend_series(
             mongo_s3_auth=mongo_s3_auth,
             remote_linked=remote_linked,
         )
-        step_id, y_val, _source = _uncertainty_point_from_surrogate_doc(
-            surrogate_doc,
-            grid_size=grid_size,
-            step_index=step_idx,
-            step_id=label,
-        )
-        if y_val is None:
+        mean_val = _mean_uncertainty_from_surrogate_doc(surrogate_doc, grid_size=grid_size)
+        if mean_val is None:
             warnings.append(f"Snapshot {label}: no transformed_stddevs_avg or uncertainty grid.")
             continue
-        if step_id is None:
-            step_id = label
-        step_ids_out.append(step_id)
-        ys_out.append(float(y_val))
+        step_ids_out.append(label)
+        ys_out.append(float(mean_val))
         labels_out.append(label)
         if suffix == current_snapshot:
             current_index = len(step_ids_out) - 1
