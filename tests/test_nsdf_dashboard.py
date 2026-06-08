@@ -17,11 +17,18 @@ from nsdf_dashboard.ornl_chess_strain_lib import (
     NSDFLoadedBundle,
     NSDFSnapshotRef,
     NSDFTripletIndex,
+    UncertaintyTrendSeries,
     NSDF_UNKNOWN_WORKFLOW_ID,
     StrainDashboardPaths,
     StrainFieldPlotConfig,
+    apply_nsdf_file_suffixes,
     apply_nsdf_version_suffix,
+    discover_nsdf_next_x_version_options,
+    discover_nsdf_surrogate_version_options,
+    resolve_auxiliary_suffix_for_data_snapshot,
     build_strain_field_grids,
+    build_uncertainty_trend_series,
+    parse_transformed_stddevs_avg_points,
     collect_nsdf_triplet_load_issues,
     discover_nsdf_triplet_index,
     discover_nsdf_version_options,
@@ -466,6 +473,59 @@ def test_next_x_validation_skips_bad_rows() -> None:
     assert info.warnings
 
 
+def test_parse_transformed_stddevs_avg_points() -> None:
+    points, warnings = parse_transformed_stddevs_avg_points([[1.0, 0.5], [2.0, 0.3]])
+    assert points == [(1.0, 0.5), (2.0, 0.3)]
+    assert not warnings
+
+    points, _ = parse_transformed_stddevs_avg_points({"x": [1, 2], "y": [0.5, 0.3]})
+    assert points == [(1.0, 0.5), (2.0, 0.3)]
+
+    points, _ = parse_transformed_stddevs_avg_points({"x": 3, "y": 0.2})
+    assert points == [(3.0, 0.2)]
+
+
+def test_build_uncertainty_trend_series_from_local_surrogates() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        for idx, y_val in enumerate((0.9, 0.6, 0.4), start=1):
+            with open(os.path.join(tmp, f"surrogate_2026060{idx}T100000Z.json"), "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "workflow_id": "wf-trend",
+                        "transformed_stddevs_avg": [[float(idx), y_val]],
+                    },
+                    fh,
+                )
+        with open(os.path.join(tmp, "data.json"), "w", encoding="utf-8") as fh:
+            json.dump(_base_data(), fh)
+
+        index = NSDFTripletIndex(
+            snapshots=[
+                NSDFSnapshotRef(suffix="20260603T100000Z", workflow_id="wf-trend", sort_key="20260603T100000Z"),
+                NSDFSnapshotRef(suffix="20260602T100000Z", workflow_id="wf-trend", sort_key="20260602T100000Z"),
+                NSDFSnapshotRef(suffix="20260601T100000Z", workflow_id="wf-trend", sort_key="20260601T100000Z"),
+            ],
+            by_workflow={
+                "wf-trend": [
+                    NSDFSnapshotRef(suffix="20260603T100000Z", workflow_id="wf-trend", sort_key="20260603T100000Z"),
+                    NSDFSnapshotRef(suffix="20260602T100000Z", workflow_id="wf-trend", sort_key="20260602T100000Z"),
+                    NSDFSnapshotRef(suffix="20260601T100000Z", workflow_id="wf-trend", sort_key="20260601T100000Z"),
+                ],
+            },
+        )
+        paths = StrainDashboardPaths(local_json_path=os.path.join(tmp, "data.json"))
+        series = build_uncertainty_trend_series(
+            index,
+            paths,
+            workflow_id="wf-trend",
+            current_snapshot="20260602T100000Z",
+            grid_size=(11, 11),
+        )
+        assert series.x.tolist() == [1.0, 2.0, 3.0]
+        assert series.y.tolist() == [0.9, 0.6, 0.4]
+        assert series.current_index == 1
+
+
 def test_next_x_object_schema_single_point() -> None:
     doc = {
         "workflow_id": "workflow-id",
@@ -548,6 +608,72 @@ def test_nsdf_version_suffix_triplet_and_apply() -> None:
     assert "data_20260606T223505Z.json" in versioned_remote.json_url
     assert versioned_remote.s3_data_key.endswith("data_20260606T223505Z.json")
     assert versioned_remote.s3_surrogate_key.endswith("surrogate_20260606T223505Z.json")
+
+
+def test_apply_nsdf_file_suffixes_accepts_latest_selector() -> None:
+    base = StrainDashboardPaths(local_data_dir="/tmp/chess-data")
+    with _local_files_first_for_testing():
+        versioned = apply_nsdf_file_suffixes(
+            base,
+            data_suffix="latest",
+            surrogate_suffix="latest",
+            next_x_suffix="latest",
+            strict=True,
+        )
+    assert versioned.local_json_path.endswith("data.json")
+    assert versioned.surrogate_json_path.endswith("surrogate.json")
+    assert versioned.next_x_json_path.endswith("next_x.json")
+
+
+def test_apply_nsdf_file_suffixes_independent() -> None:
+    base = StrainDashboardPaths(local_data_dir="/tmp/chess-data")
+    with _local_files_first_for_testing():
+        versioned = apply_nsdf_file_suffixes(
+            base,
+            data_suffix="20260601T100000Z",
+            surrogate_suffix="20260602T100000Z",
+            next_x_suffix="",
+            strict=True,
+        )
+    assert versioned.local_json_path.endswith("data_20260601T100000Z.json")
+    assert versioned.surrogate_json_path.endswith("surrogate_20260602T100000Z.json")
+    assert versioned.next_x_json_path.endswith("next_x.json")
+    assert versioned.strict_triplet_paths is True
+
+
+def test_resolve_auxiliary_suffix_for_data_snapshot() -> None:
+    available = ["20260601T100000Z", "20260603T100000Z"]
+    assert resolve_auxiliary_suffix_for_data_snapshot("latest", available) == "latest"
+    assert (
+        resolve_auxiliary_suffix_for_data_snapshot("20260601T100000Z", available)
+        == "20260601T100000Z"
+    )
+    assert (
+        resolve_auxiliary_suffix_for_data_snapshot("20260602T100000Z", available)
+        == "20260603T100000Z"
+    )
+    assert (
+        resolve_auxiliary_suffix_for_data_snapshot(
+            "20260607T201904Z",
+            ["20260607T201907Z", "20260607T201906Z"],
+        )
+        == "20260607T201906Z"
+    )
+
+
+def test_discover_auxiliary_version_options_from_directory() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        open(os.path.join(tmp, "surrogate.json"), "w", encoding="utf-8").close()
+        open(os.path.join(tmp, "surrogate_20260606T215241Z.json"), "w", encoding="utf-8").close()
+        open(os.path.join(tmp, "next_x_20260607T023932Z.json"), "w", encoding="utf-8").close()
+        paths = StrainDashboardPaths(local_data_dir=tmp)
+        with _local_files_first_for_testing():
+            sur_options = discover_nsdf_surrogate_version_options(paths)
+            nx_options = discover_nsdf_next_x_version_options(paths)
+        assert sur_options[0] == ("latest", "Latest (surrogate.json)")
+        assert ("20260606T215241Z", "20260606T215241Z") in sur_options
+        assert nx_options[0] == ("latest", "Latest (next_x.json)")
+        assert ("20260607T023932Z", "20260607T023932Z") in nx_options
 
 
 def test_list_nsdf_version_suffixes_from_directory() -> None:

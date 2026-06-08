@@ -12,6 +12,7 @@ import html
 import os
 import sys
 import traceback
+from dataclasses import replace
 from typing import Any, Callable, Dict, List, Optional
 
 from bokeh.io import curdoc
@@ -145,9 +146,17 @@ except Exception:
 
 from nsdf_dashboard.ornl_chess_strain_lib import (  # noqa: E402
     NSDFLoadedBundle,
+    NSDFTripletIndex,
     StrainDashboardPaths,
     StrainFieldPlotConfig,
-    apply_nsdf_version_suffix,
+    UncertaintyTrendSeries,
+    _snapshot_index_in_series,
+    _snapshots_chronological,
+    build_uncertainty_trend_series,
+    apply_nsdf_file_suffixes,
+    discover_nsdf_next_x_version_options,
+    discover_nsdf_surrogate_version_options,
+    resolve_auxiliary_suffix_for_data_snapshot,
     apply_scientistcloud_storage_policy,
     active_workflow_id_from_grid_state,
     build_strain_field_grids,
@@ -327,8 +336,16 @@ else:
         "updating_controls": False,
         "last_status": {},
         "version_suffix": "latest",
+        "surrogate_version_suffix": "latest",
+        "next_x_version_suffix": "latest",
+        "surrogate_suffix_options": [("latest", "Latest (surrogate.json)")],
+        "next_x_suffix_options": [("latest", "Latest (next_x.json)")],
+        "surrogate_manual": False,
+        "next_x_manual": False,
         "workflow_id": "",
         "triplet_index": None,
+        "uncertainty_trend_points_key": "",
+        "uncertainty_trend_points": None,
         "playback": {
             "active": False,
             "order": [],
@@ -366,10 +383,16 @@ else:
 
     def _resolve_paths() -> StrainDashboardPaths:
         base = _resolve_base_paths()
-        suffix = str(grid_state.get("version_suffix") or "").strip()
-        if suffix in ("", "latest"):
-            return apply_nsdf_version_suffix(base, "")
-        return apply_nsdf_version_suffix(base, suffix)
+        data_suffix = str(grid_state.get("version_suffix") or "latest").strip()
+        surrogate_suffix = str(grid_state.get("surrogate_version_suffix") or "latest").strip()
+        next_x_suffix = str(grid_state.get("next_x_version_suffix") or "latest").strip()
+        return apply_nsdf_file_suffixes(
+            base,
+            data_suffix=data_suffix,
+            surrogate_suffix=surrogate_suffix,
+            next_x_suffix=next_x_suffix,
+            strict=True,
+        )
 
     paths = _resolve_paths()
     plot_cfg = StrainFieldPlotConfig()
@@ -396,10 +419,22 @@ else:
         width=280,
     )
     version_select = Select(
-        title="Snapshot",
+        title="data.json",
         value="latest",
         options=[("latest", "Latest (data.json)")],
-        width=240,
+        width=220,
+    )
+    surrogate_select = Select(
+        title="surrogate.json",
+        value="latest",
+        options=[("latest", "Latest (surrogate.json)")],
+        width=220,
+    )
+    next_x_select = Select(
+        title="next_x.json",
+        value="latest",
+        options=[("latest", "Latest (next_x.json)")],
+        width=220,
     )
     _play_btn_width = 90
     play_interval_input = TextInput(title="Play interval (s)", value="2.0", width=110)
@@ -492,7 +527,7 @@ else:
         if last_status.get("next_x_warnings"):
             msg_parts.extend(last_status["next_x_warnings"])
         if last_status.get("version_label"):
-            msg_parts.insert(0, f"Snapshot: {last_status['version_label']}.")
+            msg_parts.insert(0, f"Files: {last_status['version_label']}.")
         if last_status.get("workflow_line"):
             msg_parts.insert(0, last_status["workflow_line"])
         if last_status["source_line"]:
@@ -526,6 +561,68 @@ else:
         else:
             workflow_div.text = _workflow_placeholder
 
+    def _refresh_auxiliary_suffix_options() -> None:
+        base_paths = _resolve_base_paths()
+        grid_state["surrogate_suffix_options"] = discover_nsdf_surrogate_version_options(
+            base_paths,
+            base_dir=_bd,
+            save_dir=_sd,
+            mongo_s3_auth=_dataset_s3_auth_override(),
+            remote_linked=_remote_linked,
+        )
+        grid_state["next_x_suffix_options"] = discover_nsdf_next_x_version_options(
+            base_paths,
+            base_dir=_bd,
+            save_dir=_sd,
+            mongo_s3_auth=_dataset_s3_auth_override(),
+            remote_linked=_remote_linked,
+        )
+
+    def _auxiliary_timestamp_values(options: list[tuple[str, str]]) -> list[str]:
+        return [value for value, _label in options if value != "latest"]
+
+    def _sync_auxiliary_selectors_from_data(*, reset_manual: bool = False) -> None:
+        if reset_manual:
+            grid_state["surrogate_manual"] = False
+            grid_state["next_x_manual"] = False
+
+        data_value = str(grid_state.get("version_suffix") or "latest")
+        sur_options = list(grid_state.get("surrogate_suffix_options") or [])
+        nx_options = list(grid_state.get("next_x_suffix_options") or [])
+        if not sur_options:
+            sur_options = [("latest", "Latest (surrogate.json)")]
+        if not nx_options:
+            nx_options = [("latest", "Latest (next_x.json)")]
+
+        if not grid_state.get("surrogate_manual"):
+            sur_value = resolve_auxiliary_suffix_for_data_snapshot(
+                data_value,
+                _auxiliary_timestamp_values(sur_options),
+            )
+            valid_sur = {value for value, _label in sur_options}
+            if sur_value not in valid_sur:
+                sur_value = "latest" if "latest" in valid_sur else sur_options[0][0]
+            grid_state["surrogate_version_suffix"] = sur_value
+
+        if not grid_state.get("next_x_manual"):
+            nx_value = resolve_auxiliary_suffix_for_data_snapshot(
+                data_value,
+                _auxiliary_timestamp_values(nx_options),
+            )
+            valid_nx = {value for value, _label in nx_options}
+            if nx_value not in valid_nx:
+                nx_value = "latest" if "latest" in valid_nx else nx_options[0][0]
+            grid_state["next_x_version_suffix"] = nx_value
+
+        grid_state["updating_controls"] = True
+        try:
+            surrogate_select.options = sur_options
+            surrogate_select.value = str(grid_state.get("surrogate_version_suffix") or "latest")
+            next_x_select.options = nx_options
+            next_x_select.value = str(grid_state.get("next_x_version_suffix") or "latest")
+        finally:
+            grid_state["updating_controls"] = False
+
     def _rebuild_triplet_catalog(
         *,
         preserve_workflow: bool = True,
@@ -539,6 +636,9 @@ else:
             remote_linked=_remote_linked,
         )
         grid_state["triplet_index"] = index
+        grid_state["uncertainty_trend_points_key"] = ""
+        grid_state["uncertainty_trend_points"] = None
+        _refresh_auxiliary_suffix_options()
 
         workflow_options = index.workflow_select_options()
         if not workflow_options:
@@ -575,6 +675,7 @@ else:
             version_select.value = current_snapshot
         finally:
             grid_state["updating_controls"] = False
+        _sync_auxiliary_selectors_from_data(reset_manual=not preserve_snapshot)
 
     def _refresh_snapshot_options_for_workflow(workflow_id: str) -> None:
         index = grid_state.get("triplet_index")
@@ -593,6 +694,7 @@ else:
             version_select.value = current_snapshot
         finally:
             grid_state["updating_controls"] = False
+        _sync_auxiliary_selectors_from_data(reset_manual=True)
 
     def _snapshot_values_chronological() -> list[str]:
         """Oldest timestamped snapshot first, ``latest`` last."""
@@ -629,6 +731,7 @@ else:
             version_select.value = grid_state["version_suffix"]
         finally:
             grid_state["updating_controls"] = False
+        _sync_auxiliary_selectors_from_data(reset_manual=True)
         load_payload()
         rebuild_figures()
 
@@ -759,9 +862,23 @@ else:
                 if surrogate_grid_line
                 else points_note
             )
-        version_label = "Latest (data.json)"
-        if (p.version_suffix or "").strip():
-            version_label = p.version_suffix
+        def _file_label(selector_value: str, latest_label: str) -> str:
+            value = str(selector_value or "latest").strip()
+            return latest_label if value in ("", "latest") else value
+
+        data_label = _file_label(
+            grid_state.get("version_suffix"),
+            "Latest (data.json)",
+        )
+        sur_label = _file_label(
+            grid_state.get("surrogate_version_suffix"),
+            "Latest (surrogate.json)",
+        )
+        nx_label = _file_label(
+            grid_state.get("next_x_version_suffix"),
+            "Latest (next_x.json)",
+        )
+        version_label = f"data={data_label}; surrogate={sur_label}; next_x={nx_label}"
         triplet_errors, triplet_warnings = collect_nsdf_triplet_load_issues(p, bundle)
         grid_state["last_status"] = {
             "measurement_count": measurement.observed_values.shape[0],
@@ -783,6 +900,45 @@ else:
     def apply_grid_size() -> None:
         plot_cfg.grid_size = _grid_size_from_controls()
 
+    def _uncertainty_trend_points_cache_key(workflow_id: str, index: NSDFTripletIndex) -> str:
+        base_paths = _resolve_base_paths()
+        return (
+            f"{workflow_id}|{len(index.snapshots_for_workflow(workflow_id))}|"
+            f"{base_paths.s3_data_key}|{base_paths.local_json_path}|{_remote_linked}|"
+            f"{plot_cfg.grid_size[0]}x{plot_cfg.grid_size[1]}"
+        )
+
+    def _uncertainty_trend_for_dashboard() -> Optional[UncertaintyTrendSeries]:
+        index = grid_state.get("triplet_index")
+        if not isinstance(index, NSDFTripletIndex):
+            return None
+        workflow = str(grid_state.get("workflow_id") or "").strip()
+        if not workflow or workflow == NSDF_UNKNOWN_WORKFLOW_ID:
+            return None
+        current_snap = str(grid_state.get("version_suffix") or "latest")
+        cache_key = _uncertainty_trend_points_cache_key(workflow, index)
+        cached = grid_state.get("uncertainty_trend_points")
+        if (
+            grid_state.get("uncertainty_trend_points_key") == cache_key
+            and isinstance(cached, UncertaintyTrendSeries)
+        ):
+            chrono = _snapshots_chronological(index.snapshots_for_workflow(workflow))
+            current_index = _snapshot_index_in_series(chrono, current_snap, int(cached.x.size))
+            return replace(cached, current_index=current_index)
+
+        series = build_uncertainty_trend_series(
+            index,
+            _resolve_base_paths(),
+            workflow_id=workflow,
+            current_snapshot=current_snap,
+            grid_size=plot_cfg.grid_size,
+            mongo_s3_auth=_dataset_s3_auth_override(),
+            remote_linked=_remote_linked,
+        )
+        grid_state["uncertainty_trend_points_key"] = cache_key
+        grid_state["uncertainty_trend_points"] = replace(series, current_index=None)
+        return series
+
     def rebuild_figures() -> None:
         apply_grid_size()
         figures_column.children = []
@@ -803,6 +959,7 @@ else:
                 row_subtitle="dataset_y",
                 next_x_info=next_x_info,
                 active_workflow_id=active_workflow_id,
+                uncertainty_trend=_uncertainty_trend_for_dashboard(),
             )
             figures_column.children = [triplet_row]
             if grid_state.get("last_status") is not None:
@@ -830,6 +987,23 @@ else:
         if (grid_state.get("playback") or {}).get("active"):
             _stop_playback()
         grid_state["version_suffix"] = str(new or "latest")
+        _sync_auxiliary_selectors_from_data(reset_manual=True)
+        load_payload()
+        rebuild_figures()
+
+    def on_surrogate_change(attr: str, old: Any, new: Any) -> None:
+        if grid_state["updating_controls"]:
+            return
+        grid_state["surrogate_version_suffix"] = str(new or "latest")
+        grid_state["surrogate_manual"] = True
+        load_payload()
+        rebuild_figures()
+
+    def on_next_x_change(attr: str, old: Any, new: Any) -> None:
+        if grid_state["updating_controls"]:
+            return
+        grid_state["next_x_version_suffix"] = str(new or "latest")
+        grid_state["next_x_manual"] = True
         load_payload()
         rebuild_figures()
 
@@ -885,6 +1059,8 @@ else:
     grid_h.on_change("value", on_grid_control_change)
     workflow_select.on_change("value", on_workflow_change)
     version_select.on_change("value", on_version_change)
+    surrogate_select.on_change("value", on_surrogate_change)
+    next_x_select.on_change("value", on_next_x_change)
     btn_play_forward.on_click(on_play_forward)
     btn_play_backward.on_click(on_play_backward)
     btn_play_stop.on_click(on_play_stop)
@@ -893,7 +1069,13 @@ else:
     btn_toggle_status.on_click(on_toggle_status)
 
     controls = column(
-        row(workflow_select, version_select, sizing_mode="scale_width"),
+        row(
+            workflow_select,
+            version_select,
+            surrogate_select,
+            next_x_select,
+            sizing_mode="scale_width",
+        ),
         _control_row(grid_w, grid_h, btn_reload, btn_reset_grid, btn_toggle_status),
         _control_row(
             play_interval_input,
