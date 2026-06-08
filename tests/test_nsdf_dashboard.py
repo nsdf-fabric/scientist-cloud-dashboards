@@ -466,6 +466,44 @@ def test_next_x_validation_skips_bad_rows() -> None:
     assert info.warnings
 
 
+def test_next_x_object_schema_single_point() -> None:
+    doc = {
+        "workflow_id": "workflow-id",
+        "dataset_x_size": 2,
+        "data": [[1.0, 2.0]],
+    }
+    info = validate_nsdf_next_x_doc(doc)
+    assert len(info.entries) == 1
+    assert info.entries[0].workflow_id == "workflow-id"
+    assert info.entries[0].coordinates.shape == (1, 2)
+    assert float(info.entries[0].coordinates[0, 0]) == 1.0
+    assert float(info.entries[0].coordinates[0, 1]) == 2.0
+    assert info.total_points == 1
+
+
+def test_next_x_object_schema_loads_from_local_bundle() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        data_path = os.path.join(tmp, "data.json")
+        next_x_path = os.path.join(tmp, "next_x.json")
+        with open(data_path, "w", encoding="utf-8") as fh:
+            json.dump(_base_data(), fh)
+        with open(next_x_path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "workflow_id": "wf-single",
+                    "dataset_x_size": 2,
+                    "data": [[4.0, 5.0]],
+                },
+                fh,
+            )
+
+        bundle = load_nsdf_json_bundle(StrainDashboardPaths(local_json_path=data_path))
+        assert isinstance(bundle.next_x, dict)
+        info = validate_nsdf_next_x_doc(bundle.next_x)
+        assert info.entries[0].workflow_id == "wf-single"
+        assert info.total_points == 1
+
+
 def test_normalize_gateway_prefix_to_data_json() -> None:
     base = (
         "https://us-east-1.gw.example.com/scientistcloud/test-chess"

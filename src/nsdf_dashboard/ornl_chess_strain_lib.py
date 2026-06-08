@@ -466,7 +466,7 @@ class NSDFSurrogateData:
 
 @dataclass
 class NSDFNextXEntry:
-    """One workflow block from ``next_x.json``."""
+    """One proposed-scan workflow block from ``next_x.json``."""
 
     workflow_id: str
     coordinates: np.ndarray
@@ -490,7 +490,7 @@ class NSDFLoadedBundle:
 
     data: Dict[str, Any]
     surrogate: Optional[Dict[str, Any]] = None
-    next_x: Optional[List[Dict[str, Any]]] = None
+    next_x: Optional[Any] = None
     messages: List[str] = field(default_factory=list)
     paths: StrainDashboardPaths = field(default_factory=StrainDashboardPaths)
 
@@ -1267,6 +1267,9 @@ def _peek_workflow_id_from_json_doc(doc: Any) -> Optional[str]:
 
 
 def _peek_workflow_id_from_next_x_doc(doc: Any) -> Optional[str]:
+    if isinstance(doc, Mapping):
+        value = str(doc.get("workflow_id") or "").strip()
+        return value or None
     if not isinstance(doc, list):
         return None
     found: set[str] = set()
@@ -1279,6 +1282,80 @@ def _peek_workflow_id_from_next_x_doc(doc: Any) -> Optional[str]:
     if len(found) == 1:
         return next(iter(found))
     return None
+
+
+def _next_x_doc_is_recognized_format(doc: Any) -> bool:
+    """True for the current object schema or the legacy array-of-blocks schema."""
+    if isinstance(doc, Mapping):
+        return True
+    return isinstance(doc, list)
+
+
+def _next_x_coord_size(item: Mapping[str, Any]) -> int:
+    raw = item.get("dataset_x_size")
+    if isinstance(raw, int) and raw > 0:
+        return raw
+    if _is_number(raw):
+        parsed = int(raw)
+        if parsed > 0:
+            return parsed
+    return 2
+
+
+def _iter_next_x_workflow_blocks(doc: Any) -> List[Mapping[str, Any]]:
+    """Normalize ``next_x.json`` to workflow blocks (object or legacy array)."""
+    if isinstance(doc, Mapping):
+        return [doc]
+    if isinstance(doc, list):
+        return [item for item in doc if isinstance(item, Mapping)]
+    return []
+
+
+def _parse_next_x_workflow_block(
+    item: Mapping[str, Any],
+    *,
+    label: str,
+    warnings: List[str],
+) -> Optional[NSDFNextXEntry]:
+    workflow_id = str(item.get("workflow_id") or "").strip()
+    if not workflow_id:
+        warnings.append(f"Skipping {label}: missing workflow_id.")
+        return None
+    data = item.get("data")
+    if not isinstance(data, list) or not data:
+        warnings.append(f"Skipping {label} ({workflow_id!r}): data must be a non-empty list.")
+        return None
+    coord_size = _next_x_coord_size(item)
+    coords: List[Tuple[float, float]] = []
+    for j, row_value in enumerate(data):
+        if not isinstance(row_value, list) or len(row_value) < coord_size:
+            warnings.append(
+                f"Skipping {label} ({workflow_id!r}): data[{j}] must contain "
+                f"at least {coord_size} numeric coordinate value(s)."
+            )
+            return None
+        values = row_value[:coord_size]
+        if not all(_is_number(value) for value in values):
+            warnings.append(
+                f"Skipping {label} ({workflow_id!r}): data[{j}] must contain numeric values."
+            )
+            return None
+        floats = [float(value) for value in values]
+        if not all(math.isfinite(value) for value in floats):
+            warnings.append(
+                f"Skipping {label} ({workflow_id!r}): data[{j}] values must be finite."
+            )
+            return None
+        if coord_size < 2:
+            warnings.append(
+                f"Skipping {label} ({workflow_id!r}): dataset_x_size must be at least 2 for plotting."
+            )
+            return None
+        coords.append((floats[0], floats[1]))
+    return NSDFNextXEntry(
+        workflow_id=workflow_id,
+        coordinates=np.asarray(coords, dtype=np.float64),
+    )
 
 
 def _attribute_workflow_to_triplet_files(
@@ -2260,58 +2337,37 @@ def _sibling_next_x_s3_key(data_key: str) -> str:
 
 
 def validate_nsdf_next_x_doc(value: Any) -> NSDFNextXData:
-    """Validate ``next_x.json``: a list of workflow blocks with coordinate pairs."""
+    """
+    Validate ``next_x.json``.
+
+    Current schema (single proposed point)::
+
+        {"workflow_id": "...", "dataset_x_size": 2, "data": [[labx, labz]]}
+
+    Legacy schema (array of workflow blocks) is still accepted.
+    """
     warnings: List[str] = []
     if value is None:
         return NSDFNextXData(warnings=warnings)
-    if not isinstance(value, list):
-        return NSDFNextXData(warnings=["Skipping next_x JSON: expected a JSON array."])
+    if isinstance(value, list):
+        blocks = _iter_next_x_workflow_blocks(value)
+        if not blocks and value:
+            return NSDFNextXData(
+                warnings=["Skipping next_x JSON: legacy array entries must be JSON objects."],
+            )
+    elif isinstance(value, Mapping):
+        blocks = [value]
+    else:
+        return NSDFNextXData(
+            warnings=["Skipping next_x JSON: expected a JSON object or array."],
+        )
 
     entries: List[NSDFNextXEntry] = []
-    for i, item in enumerate(value):
-        if not isinstance(item, dict):
-            warnings.append(f"Skipping next_x[{i}]: expected a JSON object.")
-            continue
-        workflow_id = str(item.get("workflow_id") or "").strip()
-        if not workflow_id:
-            warnings.append(f"Skipping next_x[{i}]: missing workflow_id.")
-            continue
-        data = item.get("data")
-        if not isinstance(data, list) or not data:
-            warnings.append(f"Skipping next_x[{i}] ({workflow_id!r}): data must be a non-empty list.")
-            continue
-        coords: List[Tuple[float, float]] = []
-        bad_row = False
-        for j, row_value in enumerate(data):
-            if not isinstance(row_value, list) or len(row_value) < 2:
-                warnings.append(
-                    f"Skipping next_x[{i}] ({workflow_id!r}): data[{j}] must contain labx/labz values."
-                )
-                bad_row = True
-                break
-            x, z = row_value[0], row_value[1]
-            if not (_is_number(x) and _is_number(z)):
-                warnings.append(
-                    f"Skipping next_x[{i}] ({workflow_id!r}): data[{j}] must contain numeric values."
-                )
-                bad_row = True
-                break
-            fx, fz = float(x), float(z)
-            if not (math.isfinite(fx) and math.isfinite(fz)):
-                warnings.append(
-                    f"Skipping next_x[{i}] ({workflow_id!r}): data[{j}] values must be finite."
-                )
-                bad_row = True
-                break
-            coords.append((fx, fz))
-        if bad_row:
-            continue
-        entries.append(
-            NSDFNextXEntry(
-                workflow_id=workflow_id,
-                coordinates=np.asarray(coords, dtype=np.float64),
-            )
-        )
+    for i, item in enumerate(blocks):
+        label = "next_x" if isinstance(value, Mapping) else f"next_x[{i}]"
+        parsed = _parse_next_x_workflow_block(item, label=label, warnings=warnings)
+        if parsed is not None:
+            entries.append(parsed)
     return NSDFNextXData(entries=entries, warnings=warnings)
 
 
@@ -2319,7 +2375,7 @@ def load_optional_next_x_json(
     paths: StrainDashboardPaths,
     *,
     mongo_s3_auth: Optional[Dict[str, str]] = None,
-) -> Tuple[Optional[List[Dict[str, Any]]], List[str], StrainDashboardPaths]:
+) -> Tuple[Optional[Any], List[str], StrainDashboardPaths]:
     """
     Load optional ``next_x.json`` from explicit path/URL or inferred sibling.
 
@@ -2383,8 +2439,8 @@ def load_optional_next_x_json(
             else:
                 doc = load_json_from_url(value, s3_auth_override=mongo_s3_auth)
                 effective.next_x_json_url = value
-            if not isinstance(doc, list):
-                raise ValueError("next_x.json must be a JSON array.")
+            if not _next_x_doc_is_recognized_format(doc):
+                raise ValueError("next_x.json must be a JSON object or array.")
             messages.append(f"Loaded next_x JSON from {kind}: {value}")
             return doc, messages, effective
         except FileNotFoundError as exc:
@@ -2453,12 +2509,14 @@ def load_nsdf_json_bundle_from_local_data_dir(paths: StrainDashboardPaths) -> Op
             continue
         try:
             next_x_doc = load_json_from_local_path(next_x_path)
-            if isinstance(next_x_doc, list):
+            if _next_x_doc_is_recognized_format(next_x_doc):
                 next_x = next_x_doc
                 effective.next_x_json_path = next_x_path
                 messages.append(f"Loaded next_x JSON from local path: {next_x_path}")
                 break
-            messages.append(f"Local next_x JSON skipped ({next_x_path}): expected a JSON array.")
+            messages.append(
+                f"Local next_x JSON skipped ({next_x_path}): expected a JSON object or array."
+            )
         except Exception as exc:
             messages.append(f"Local next_x JSON skipped ({next_x_path}): {exc}")
     return NSDFLoadedBundle(data=data, surrogate=surrogate, next_x=next_x, messages=messages, paths=effective)
@@ -2847,13 +2905,13 @@ def load_nsdf_json_bundle_from_s3(
     ):
         try:
             next_x_doc = _load_json_from_s3_key(client, bucket, candidate_key)
-            if isinstance(next_x_doc, list):
+            if _next_x_doc_is_recognized_format(next_x_doc):
                 next_x = next_x_doc
                 next_x_key = candidate_key
                 messages.append(f"Loaded next_x JSON from s3://{bucket}/{candidate_key}")
                 break
             messages.append(
-                f"S3 next_x JSON skipped ({candidate_key}): expected a JSON array."
+                f"S3 next_x JSON skipped ({candidate_key}): expected a JSON object or array."
             )
         except Exception as exc:
             if _s3_missing_error(exc):
@@ -2979,7 +3037,7 @@ def collect_nsdf_triplet_load_issues(
             token in msg.lower() for token in ("skipped", "not found", "not loaded", "missing")
         ):
             detail = msg.split(":", 1)[-1].strip() if ":" in msg else msg
-            if "expected a json array" in msg.lower():
+            if "expected a json object or array" in msg.lower():
                 errors.append(f"{nx_fn}: {detail}")
             else:
                 warnings.append(f"{nx_fn}: {detail}")
