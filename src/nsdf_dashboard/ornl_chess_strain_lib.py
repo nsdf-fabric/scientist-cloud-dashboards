@@ -4536,7 +4536,7 @@ def build_uncertainty_trend_from_surrogate_paths(
     """
     Fast uncertainty trend from one ``surrogate.json`` (``transformed_stddevs_avg`` only).
 
-    Returns ``None`` when the selected surrogate does not contain a multi-point series.
+    Returns ``None`` when the selected surrogate has no ``transformed_stddevs_avg`` points.
     """
     trend_doc = load_surrogate_doc_for_paths(
         surrogate_paths,
@@ -4546,7 +4546,7 @@ def build_uncertainty_trend_from_surrogate_paths(
     full_points, parse_warnings = parse_transformed_stddevs_avg_points(
         (trend_doc or {}).get("transformed_stddevs_avg")
     )
-    if len(full_points) < 2:
+    if len(full_points) < 1:
         return None
     step_ids = [point[0] for point in full_points]
     ys = np.asarray([point[1] for point in full_points], dtype=np.float64)
@@ -4557,6 +4557,8 @@ def build_uncertainty_trend_from_surrogate_paths(
             if step_id == current_snapshot:
                 current_index = idx
                 break
+    if current_index is None and current_snapshot == "latest" and step_ids:
+        current_index = len(step_ids) - 1
     return UncertaintyTrendSeries(
         step_ids=step_ids,
         y=ys,
@@ -4606,7 +4608,7 @@ def build_uncertainty_trend_series(
         (trend_doc or {}).get("transformed_stddevs_avg")
     )
     warnings.extend(parse_warnings)
-    if len(full_points) >= 2:
+    if len(full_points) >= 1:
         step_ids = [point[0] for point in full_points]
         ys = np.asarray([point[1] for point in full_points], dtype=np.float64)
         current_index = _trend_current_index(
@@ -4614,6 +4616,8 @@ def build_uncertainty_trend_series(
             current_snapshot=current_snapshot,
             chrono_snaps=chrono,
         )
+        if current_index is None and current_snapshot == "latest" and step_ids:
+            current_index = len(step_ids) - 1
         return UncertaintyTrendSeries(
             step_ids=step_ids,
             y=ys,
