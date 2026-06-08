@@ -418,7 +418,7 @@ class StrainFieldPlotConfig:
     title_uncertainty_trend: str = "Uncertainty trend"
     trend_x_axis_label: str = "time step"
     trend_y_axis_label: str = "avg uncertainty"
-    flip_y_for_display: bool = True
+    flip_y_for_display: bool = False
     colormap_estimate: str = "Viridis256"
     colormap_variance: str = "Coolwarm256"
     colormap_mask: Tuple[str, str] = ("#ffffff", "#ffffff")

@@ -376,9 +376,9 @@ def test_next_x_grid_coords_for_active_workflow() -> None:
     assert gx.shape == (3,)
     assert gy.shape == (3,)
     _assert_mask_at(grids.measurements, 0, 0)
-    px, py = _grid_display_coords(gx, gy, 11, 11, flip_y=True)
+    px, py = _grid_display_coords(gx, gy, 11, 11, flip_y=False)
     assert float(px[0]) == 0.5
-    assert float(py[0]) == 10.5
+    assert float(py[0]) == 0.5
 
 
 def test_parse_nsdf_plot_dim() -> None:
