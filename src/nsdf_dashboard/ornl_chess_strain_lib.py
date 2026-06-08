@@ -5794,9 +5794,9 @@ def make_uncertainty_trend_figure(
         }
     )
     p.line("step_id", "y", source=source, line_width=2, color="#2c7bb6")
-    p.circle("step_id", "y", source=source, size=6, color="#2c7bb6", alpha=0.7, line_color="#1f4f73")
+    p.scatter("step_id", "y", source=source, size=6, color="#2c7bb6", alpha=0.7, line_color="#1f4f73")
     if series.current_index is not None and 0 <= series.current_index < len(series.step_ids):
-        p.circle(
+        p.scatter(
             [series.step_ids[series.current_index]],
             [float(series.y[series.current_index])],
             size=11,
