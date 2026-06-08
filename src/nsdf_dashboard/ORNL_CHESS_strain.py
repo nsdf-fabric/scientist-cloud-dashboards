@@ -183,7 +183,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (  # noqa: E402
     _trend_current_index,
     build_uncertainty_trend_from_surrogate_paths,
     build_uncertainty_trend_series,
-    parse_transformed_stddevs_avg_points,
+    uncertainty_trend_from_surrogate_doc,
     apply_nsdf_file_suffixes,
     discover_nsdf_next_x_version_options,
     discover_nsdf_surrogate_version_options,
@@ -591,29 +591,12 @@ else:
     def _uncertainty_trend_from_loaded_surrogate(
         current_snap: str,
     ) -> Optional[UncertaintyTrendSeries]:
-        if loaded_bundle is None or not isinstance(loaded_bundle.surrogate, dict):
+        if loaded_bundle is None:
             return None
-        full_points, parse_warnings = parse_transformed_stddevs_avg_points(
-            loaded_bundle.surrogate.get("transformed_stddevs_avg")
-        )
-        if len(full_points) < 2:
-            return None
-        step_ids = [point[0] for point in full_points]
-        ys = np.asarray([point[1] for point in full_points], dtype=np.float64)
-        current_snapshot = (current_snap or "latest").strip() or "latest"
-        current_index: Optional[int] = None
-        if current_snapshot != "latest":
-            for idx, step_id in enumerate(step_ids):
-                if step_id == current_snapshot:
-                    current_index = idx
-                    break
-        return UncertaintyTrendSeries(
-            step_ids=step_ids,
-            y=ys,
-            labels=list(step_ids),
-            current_index=current_index,
-            source="transformed_stddevs_avg",
-            warnings=parse_warnings,
+        return uncertainty_trend_from_surrogate_doc(
+            loaded_bundle.surrogate,
+            current_snapshot=current_snap,
+            grid_size=plot_cfg.grid_size,
         )
 
     def _fast_latest_triplet_load_data() -> None:
@@ -688,7 +671,30 @@ else:
     def _initial_dashboard_load() -> None:
         _fast_latest_triplet_load()
 
+    def _invalidate_uncertainty_trend_cache() -> None:
+        grid_state["uncertainty_trend_points_key"] = ""
+        grid_state["uncertainty_trend_points"] = None
+
+    def _reset_to_latest_triplet_selectors() -> None:
+        """Point all three file selectors at the live latest triplet."""
+        grid_state["version_suffix"] = "latest"
+        grid_state["surrogate_version_suffix"] = "latest"
+        grid_state["next_x_version_suffix"] = "latest"
+        grid_state["surrogate_manual"] = False
+        grid_state["next_x_manual"] = False
+        grid_state["updating_controls"] = True
+        try:
+            if "latest" in {value for value, _label in version_select.options}:
+                version_select.value = "latest"
+            if "latest" in {value for value, _label in surrogate_select.options}:
+                surrogate_select.value = "latest"
+            if "latest" in {value for value, _label in next_x_select.options}:
+                next_x_select.value = "latest"
+        finally:
+            grid_state["updating_controls"] = False
+
     def _reload_current_view() -> None:
+        _reset_to_latest_triplet_selectors()
         load_payload()
         _update_workflow_hint_from_bundle()
         rebuild_figures()
@@ -1023,6 +1029,7 @@ else:
     def load_payload() -> None:
         global loaded_bundle  # noqa: PLW0603
 
+        _invalidate_uncertainty_trend_cache()
         p = _resolve_paths()
         try:
             bundle = load_nsdf_json_bundle(
@@ -1154,15 +1161,18 @@ else:
 
     def _uncertainty_trend_for_dashboard() -> Optional[UncertaintyTrendSeries]:
         current_snap = str(grid_state.get("version_suffix") or "latest")
+        quick = _uncertainty_trend_from_loaded_surrogate(current_snap)
+        if quick is not None:
+            return quick
+
         if not grid_state.get("catalog_ready"):
-            quick = _uncertainty_trend_from_loaded_surrogate(current_snap)
-            if quick is None:
-                quick = build_uncertainty_trend_from_surrogate_paths(
-                    _resolve_paths(),
-                    current_snapshot=current_snap,
-                    mongo_s3_auth=_dataset_s3_auth_override(),
-                    remote_linked=_remote_linked,
-                )
+            quick = build_uncertainty_trend_from_surrogate_paths(
+                _resolve_paths(),
+                current_snapshot=current_snap,
+                grid_size=plot_cfg.grid_size,
+                mongo_s3_auth=_dataset_s3_auth_override(),
+                remote_linked=_remote_linked,
+            )
             if quick is not None:
                 return quick
             return UncertaintyTrendSeries(
@@ -1258,6 +1268,7 @@ else:
         if (grid_state.get("playback") or {}).get("active"):
             _stop_playback()
         grid_state["version_suffix"] = str(new or "latest")
+        _sync_auxiliary_selectors_from_data(reset_manual=False)
         _defer_figures_work(_reload_figures_view, message="Loading data snapshot...")
 
     def on_surrogate_change(attr: str, old: Any, new: Any) -> None:
@@ -1423,11 +1434,11 @@ else:
         ) -> None:
             try:
                 stop_playback()
-            except BaseException:
+            except Exception:
                 pass
             try:
                 cancel_catalog()
-            except BaseException:
+            except Exception:
                 pass
             unregister(token)
 
