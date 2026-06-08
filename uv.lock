@@ -1034,7 +1034,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.110" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "numpy", specifier = ">=1.24" },
-    { name = "scipy" },
+    { name = "scipy", specifier = ">=1.10" },
     { name = "uvicorn", specifier = ">=0.27" },
 ]
 
