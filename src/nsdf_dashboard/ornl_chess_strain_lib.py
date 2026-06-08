@@ -3751,6 +3751,173 @@ def _scatter_field_to_display_grid(
     return canvas
 
 
+def _display_grid_physical_coords(
+    nx: int,
+    ny: int,
+    bounds: Tuple[Tuple[float, float], Tuple[float, float]],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Cell-center ``labx`` / ``labz`` meshes shaped ``(ny, nx)``."""
+    (xlo, xhi), (zlo, zhi) = bounds[0], bounds[1]
+    if nx <= 1:
+        xs = np.array([(xlo + xhi) / 2.0], dtype=np.float64)
+    else:
+        xs = xlo + np.arange(nx, dtype=np.float64) * (xhi - xlo) / (nx - 1)
+    if ny <= 1:
+        zs = np.array([(zlo + zhi) / 2.0], dtype=np.float64)
+    else:
+        zs = zlo + np.arange(ny, dtype=np.float64) * (zhi - zlo) / (ny - 1)
+    return np.meshgrid(xs, zs)
+
+
+def _snap_coordinates_to_lattice_axes(
+    coordinates: np.ndarray,
+    values: np.ndarray,
+    *,
+    atol: float = 0.08,
+) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """
+    Detect a labx×labz lattice in ``points_to_predict``.
+
+    Returns ``(unique_labx, unique_labz, grid[labz, labx])`` when at least 85% of
+    points snap to a rectangular lattice.
+    """
+    if coordinates.ndim != 2 or coordinates.shape[1] < 2:
+        return None
+    labx = coordinates[:, 0]
+    labz = coordinates[:, 1]
+    vals = np.asarray(values, dtype=np.float64)
+    ux = np.unique(np.round(labx, 4))
+    uz = np.unique(np.round(labz, 4))
+    if len(ux) < 2 or len(uz) < 2:
+        return None
+    expected = len(ux) * len(uz)
+    if len(vals) < expected * 0.85 or len(vals) > expected * 1.05:
+        return None
+
+    grid = np.full((len(uz), len(ux)), np.nan, dtype=np.float64)
+    counts = np.zeros_like(grid, dtype=np.int64)
+    for x, z, val in zip(labx, labz, vals):
+        if not (math.isfinite(x) and math.isfinite(z) and math.isfinite(float(val))):
+            continue
+        xi = int(np.argmin(np.abs(ux - x)))
+        zi = int(np.argmin(np.abs(uz - z)))
+        if abs(float(ux[xi]) - float(x)) > atol or abs(float(uz[zi]) - float(z)) > atol:
+            return None
+        if counts[zi, xi]:
+            grid[zi, xi] = (grid[zi, xi] * counts[zi, xi] + float(val)) / (counts[zi, xi] + 1)
+        else:
+            grid[zi, xi] = float(val)
+        counts[zi, xi] += 1
+    if int(np.sum(counts > 0)) < len(vals) * 0.85:
+        return None
+    return ux, uz, grid
+
+
+def _interpolate_lattice_to_display(
+    ux: np.ndarray,
+    uz: np.ndarray,
+    grid: np.ndarray,
+    *,
+    xx: np.ndarray,
+    zz: np.ndarray,
+    warnings: List[str],
+) -> Optional[np.ndarray]:
+    """Bilinear interpolation from a lab lattice onto the display canvas."""
+    try:
+        from scipy.interpolate import RegularGridInterpolator
+    except Exception as exc:
+        warnings.append(f"Structured lattice interpolation unavailable ({exc}).")
+        return None
+
+    interp = RegularGridInterpolator(
+        (uz, ux),
+        grid,
+        method="linear",
+        bounds_error=False,
+        fill_value=np.nan,
+    )
+    query = np.column_stack([zz.ravel(), xx.ravel()])
+    filled = interp(query).reshape(zz.shape)
+    if not np.any(np.isfinite(filled)):
+        return None
+    if np.any(~np.isfinite(filled)):
+        try:
+            from scipy.interpolate import NearestNDInterpolator
+
+            known = np.isfinite(grid)
+            if np.any(known):
+                zi, xi = np.where(known)
+                pts = np.column_stack([uz[zi], ux[xi]])
+                nearest = NearestNDInterpolator(pts, grid[known])
+                nan_mask = ~np.isfinite(filled)
+                filled[nan_mask] = nearest(
+                    np.column_stack([zz[nan_mask], xx[nan_mask]])
+                )
+        except Exception:
+            pass
+    return filled
+
+
+def _physical_idw_fill_grid(
+    labx: np.ndarray,
+    labz: np.ndarray,
+    values: np.ndarray,
+    *,
+    xx: np.ndarray,
+    zz: np.ndarray,
+    power: float = 2.0,
+    eps: float = 1e-12,
+) -> np.ndarray:
+    """Inverse-distance fill using physical ``labx`` / ``labz`` distances."""
+    pts_x = np.asarray(labx, dtype=np.float64).reshape(1, 1, -1)
+    pts_z = np.asarray(labz, dtype=np.float64).reshape(1, 1, -1)
+    pts_v = np.asarray(values, dtype=np.float64).reshape(1, 1, -1)
+    grid_x = xx.reshape(1, xx.shape[1], 1)
+    grid_z = zz.reshape(zz.shape[0], 1, 1)
+    mask = np.isfinite(pts_x) & np.isfinite(pts_z) & np.isfinite(pts_v)
+    pts_x = np.where(mask, pts_x, np.nan)
+    pts_z = np.where(mask, pts_z, np.nan)
+    pts_v = np.where(mask, pts_v, np.nan)
+    d2 = (pts_x - grid_x) ** 2 + (pts_z - grid_z) ** 2 + eps
+    w = d2 ** (-power / 2.0)
+    w = np.where(np.isfinite(w), w, 0.0)
+    pts_v = np.where(np.isfinite(pts_v), pts_v, 0.0)
+    denom = np.sum(w, axis=2)
+    numer = np.sum(w * pts_v, axis=2)
+    out = np.full((zz.shape[0], xx.shape[1]), np.nan, dtype=np.float64)
+    valid = denom > 0
+    out[valid] = numer[valid] / denom[valid]
+    return out
+
+
+def _interpolate_scattered_points_to_display(
+    labx: np.ndarray,
+    labz: np.ndarray,
+    values: np.ndarray,
+    *,
+    xx: np.ndarray,
+    zz: np.ndarray,
+    warnings: List[str],
+) -> np.ndarray:
+    """Unstructured fallback: linear ND in lab space, then physical IDW."""
+    points = np.column_stack([labx, labz])
+    vals = np.asarray(values, dtype=np.float64)
+    try:
+        from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
+
+        linear = LinearNDInterpolator(points, vals)
+        filled = linear(xx, zz)
+        if np.any(~np.isfinite(filled)):
+            nearest = NearestNDInterpolator(points, vals)
+            nan_mask = ~np.isfinite(filled)
+            filled[nan_mask] = nearest(xx[nan_mask], zz[nan_mask])
+        if np.any(np.isfinite(filled)):
+            return filled
+    except Exception as exc:
+        warnings.append(f"Linear ND interpolation unavailable ({exc}); using physical IDW.")
+    return _physical_idw_fill_grid(labx, labz, vals, xx=xx, zz=zz)
+
+
 def _scatter_and_interpolate_field_to_display_grid(
     values: np.ndarray,
     coordinates: np.ndarray,
@@ -3761,34 +3928,45 @@ def _scatter_and_interpolate_field_to_display_grid(
     warnings: List[str],
 ) -> np.ndarray:
     """
-    Place surrogate point values, then IDW-fill gaps on the bounds canvas.
+    Interpolate ``points_to_predict`` onto the bounds canvas in physical lab space.
 
-    Known prediction cells keep their exact values; empty cells are interpolated
-    from the same ``points_to_predict`` coordinates.
+    CHESS surrogate points usually form a labx×labz lattice; those are bilinearly
+    interpolated first. Unstructured clouds fall back to linear ND / physical IDW.
     """
-    sparse = _scatter_field_to_display_grid(
+    if coordinates.ndim != 2 or coordinates.shape[1] < 2:
+        warnings.append("points_to_predict must be a 2D coordinate array.")
+        return np.full((ny, nx), np.nan, dtype=np.float64)
+    if values.shape[0] != coordinates.shape[0]:
+        warnings.append(
+            f"Surrogate field length ({values.shape[0]}) does not match "
+            f"points_to_predict ({coordinates.shape[0]})."
+        )
+        return np.full((ny, nx), np.nan, dtype=np.float64)
+    if bounds is None:
+        warnings.append("Cannot interpolate surrogate points without bounds.")
+        return _scatter_field_to_display_grid(
+            values, coordinates, nx=nx, ny=ny, bounds=bounds, warnings=warnings
+        )
+
+    labx = coordinates[:, 0]
+    labz = coordinates[:, 1]
+    xx, zz = _display_grid_physical_coords(nx, ny, bounds)
+
+    lattice = _snap_coordinates_to_lattice_axes(coordinates, values)
+    if lattice is not None:
+        ux, uz, grid = lattice
+        filled = _interpolate_lattice_to_display(ux, uz, grid, xx=xx, zz=zz, warnings=warnings)
+        if filled is not None and np.any(np.isfinite(filled)):
+            return filled
+
+    return _interpolate_scattered_points_to_display(
+        labx,
+        labz,
         values,
-        coordinates,
-        nx=nx,
-        ny=ny,
-        bounds=bounds,
+        xx=xx,
+        zz=zz,
         warnings=warnings,
     )
-    if coordinates.ndim != 2 or coordinates.shape[1] < 2:
-        return sparse
-    if values.shape[0] != coordinates.shape[0]:
-        return sparse
-    finite_mask = np.isfinite(sparse)
-    if not np.any(finite_mask):
-        return sparse
-    if np.all(finite_mask):
-        return sparse
-
-    gx, gy = _norm_coordinates_to_grid(coordinates, nx, ny, bounds)
-    idw = _idw_fill_grid(gx, gy, values, nx, ny)
-    filled = idw.copy()
-    filled[finite_mask] = sparse[finite_mask]
-    return filled
 
 
 def _surrogate_field_to_display_grid(
@@ -5227,7 +5405,7 @@ def build_strain_field_grids(
     if est_grid is not None:
         est = est_grid
         meta["estimate_source"] = (
-            "surrogate_points_idw"
+            "surrogate_points_interp"
             if surrogate.points_to_predict is not None
             else "surrogate_grid"
         )
@@ -5263,7 +5441,7 @@ def build_strain_field_grids(
     if var_grid is not None and meta["estimate_source"] != "dataset_y_idw":
         var = np.square(np.maximum(var_grid, 0.0))
         meta["variance_source"] = (
-            "uncertainty_squared_points_idw"
+            "uncertainty_squared_points_interp"
             if surrogate.points_to_predict is not None
             else "uncertainty_squared_grid"
         )
