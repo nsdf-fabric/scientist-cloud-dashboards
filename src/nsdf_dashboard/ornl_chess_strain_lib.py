@@ -468,6 +468,7 @@ class NSDFSurrogateData:
     plot_dim: Optional[str] = None
     bounds: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None
     points: Optional[int] = None
+    points_to_predict: Optional[np.ndarray] = None
     warnings: List[str] = field(default_factory=list)
     source: str = ""
 
@@ -3207,12 +3208,58 @@ def _s3_missing_error(exc: Exception) -> bool:
     return code in ("NoSuchKey", "NoSuchBucket", "404", "NotFound")
 
 
+def _parse_nsdf_points_to_predict(
+    surrogate_doc: Mapping[str, Any],
+    warnings: List[str],
+) -> Optional[np.ndarray]:
+    """Parse ``points_to_predict`` coordinate pairs from ``surrogate.json``."""
+    raw = surrogate_doc.get("points_to_predict")
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not raw:
+        warnings.append("Skipping points_to_predict: expected a non-empty coordinate list.")
+        return None
+    coords: List[Tuple[float, float]] = []
+    for i, row_value in enumerate(raw):
+        if not isinstance(row_value, list) or len(row_value) < 2:
+            warnings.append(f"points_to_predict[{i}] must contain at least two numeric values.")
+            continue
+        x, z = row_value[0], row_value[1]
+        if not (_is_number(x) and _is_number(z)):
+            warnings.append(f"points_to_predict[{i}] must contain numeric labx/labz values.")
+            continue
+        fx, fz = float(x), float(z)
+        if not (math.isfinite(fx) and math.isfinite(fz)):
+            warnings.append(f"points_to_predict[{i}] labx/labz values must be finite.")
+            continue
+        coords.append((fx, fz))
+    if not coords:
+        return None
+    return np.asarray(coords, dtype=np.float64)
+
+
+def _surrogate_values_are_point_aligned(
+    surrogate_doc: Optional[Mapping[str, Any]],
+) -> bool:
+    """Return True when flattened surrogate arrays align with ``points_to_predict``."""
+    if not isinstance(surrogate_doc, Mapping):
+        return False
+    pts = surrogate_doc.get("points_to_predict")
+    sur = surrogate_doc.get("surrogate")
+    if not isinstance(pts, list) or not isinstance(sur, list):
+        return False
+    return len(pts) > 0 and len(pts) == len(sur)
+
+
 def _surrogate_list_is_usable_for_display(
     surrogate_values: Any,
     *,
     display_size: Tuple[int, int],
+    surrogate_doc: Optional[Mapping[str, Any]] = None,
 ) -> bool:
     """Reject stub surrogate arrays (e.g. two zeros) that flatten estimate/variance heatmaps."""
+    if _surrogate_values_are_point_aligned(surrogate_doc):
+        return True
     if not isinstance(surrogate_values, list) or len(surrogate_values) < 4:
         return False
     for value in surrogate_values:
@@ -3248,6 +3295,7 @@ def _surrogate_doc_is_usable_for_display(
     return _surrogate_list_is_usable_for_display(
         doc.get("surrogate"),
         display_size=display_size,
+        surrogate_doc=doc,
     )
 
 
@@ -3558,6 +3606,33 @@ def _numeric_1d_surrogate_array_or_none(
     return arr
 
 
+def _best_factor_grid_shape(
+    length: int,
+    *,
+    target: Optional[Tuple[int, int]] = None,
+) -> Optional[Tuple[int, int]]:
+    """
+    Pick a non-degenerate (nx, ny) factorization for a flattened surrogate grid.
+
+    When ``target`` is set (from bounds or display size), choose the shape whose
+    dimensions are closest to the target. This avoids mis-reading a 2D model as
+    1×N (vertical stripes on the dashboard).
+    """
+    candidates: List[Tuple[int, int]] = []
+    for ny in range(1, length + 1):
+        if length % ny != 0:
+            continue
+        candidates.append((length // ny, ny))
+    if not candidates:
+        return None
+    multi_d = [shape for shape in candidates if shape[0] > 1 and shape[1] > 1]
+    pool = multi_d if multi_d else candidates
+    if target and target[0] > 0 and target[1] > 0:
+        tx, ty = target
+        return min(pool, key=lambda shape: abs(shape[0] - tx) + abs(shape[1] - ty))
+    return min(pool, key=lambda shape: max(shape[0], shape[1]) / max(1, min(shape[0], shape[1])))
+
+
 def _surrogate_source_grid_size(
     length: int,
     surrogate_info: NSDFSurrogateData,
@@ -3580,12 +3655,24 @@ def _surrogate_source_grid_size(
     side = int(round(math.sqrt(length)))
     if side > 0 and side * side == length:
         return side, side
-    for ny in range(1, int(math.sqrt(length)) + 1):
-        if length % ny != 0:
-            continue
-        nx = length // ny
-        if nx >= ny:
-            return nx, ny
+
+    target: Optional[Tuple[int, int]] = None
+    if surrogate_info.bounds:
+        target = infer_nsdf_bounds_grid_size({"bounds": list(surrogate_info.bounds)})
+    if target is None and isinstance(surrogate_doc, Mapping):
+        target = infer_nsdf_bounds_grid_size(surrogate_doc)
+    if target is None:
+        target = display_size
+    inferred = _best_factor_grid_shape(length, target=target)
+    if inferred is not None:
+        if target and inferred[0] * inferred[1] != target[0] * target[1]:
+            warnings.append(
+                f"Surrogate grid length {length} does not match bounds "
+                f"{target[0]}x{target[1]}={target[0] * target[1]}; "
+                f"using inferred shape {inferred[0]}x{inferred[1]}."
+            )
+        return inferred
+
     warnings.append(
         f"Could not infer surrogate grid shape for field length {length}; "
         "provide surrogate bounds."
@@ -3593,33 +3680,115 @@ def _surrogate_source_grid_size(
     return None
 
 
-def _align_grid_to_display(
+def _embed_grid_in_display(
     grid: np.ndarray,
     target_nx: int,
     target_ny: int,
+    *,
+    warnings: Optional[List[str]] = None,
 ) -> np.ndarray:
-    """Resize a model grid onto the dashboard display grid."""
+    """
+    Place a native model grid on the bounds canvas without resampling.
+
+    Values are copied cell-for-cell from the origin; cells outside the model
+    grid (or beyond the bounds canvas) are left as NaN so the UI shows blank.
+    """
     src_ny, src_nx = grid.shape
     if src_nx == target_nx and src_ny == target_ny:
         return grid
-    try:
-        from scipy import ndimage  # type: ignore
+    canvas = np.full((target_ny, target_nx), np.nan, dtype=np.float64)
+    copy_nx = min(src_nx, target_nx)
+    copy_ny = min(src_ny, target_ny)
+    canvas[:copy_ny, :copy_nx] = grid[:copy_ny, :copy_nx]
+    if warnings is None:
+        return canvas
+    if copy_nx < src_nx or copy_ny < src_ny:
+        warnings.append(
+            f"Surrogate grid {src_nx}x{src_ny} clipped to fit "
+            f"{target_nx}x{target_ny} bounds canvas."
+        )
+    elif copy_nx < target_nx or copy_ny < target_ny:
+        warnings.append(
+            f"Surrogate grid {src_nx}x{src_ny} placed on "
+            f"{target_nx}x{target_ny} bounds canvas (uncovered cells left blank)."
+        )
+    return canvas
 
-        zoom_y = target_ny / float(src_ny)
-        zoom_x = target_nx / float(src_nx)
-        return ndimage.zoom(grid, (zoom_y, zoom_x), order=1)
-    except Exception:
-        y_idx = np.clip(
-            np.rint(np.linspace(0, src_ny - 1, target_ny)).astype(int),
-            0,
-            src_ny - 1,
+
+def _scatter_field_to_display_grid(
+    values: np.ndarray,
+    coordinates: np.ndarray,
+    *,
+    nx: int,
+    ny: int,
+    bounds: Optional[Tuple[Tuple[float, float], Tuple[float, float]]],
+    warnings: List[str],
+) -> np.ndarray:
+    """Place one scalar per ``points_to_predict`` coordinate on the bounds canvas."""
+    canvas = np.full((ny, nx), np.nan, dtype=np.float64)
+    if coordinates.ndim != 2 or coordinates.shape[1] < 2:
+        warnings.append("points_to_predict must be a 2D coordinate array.")
+        return canvas
+    if values.shape[0] != coordinates.shape[0]:
+        warnings.append(
+            f"Surrogate field length ({values.shape[0]}) does not match "
+            f"points_to_predict ({coordinates.shape[0]})."
         )
-        x_idx = np.clip(
-            np.rint(np.linspace(0, src_nx - 1, target_nx)).astype(int),
-            0,
-            src_nx - 1,
-        )
-        return grid[np.ix_(y_idx, x_idx)]
+        return canvas
+    gx, gy = _norm_coordinates_to_grid(coordinates, nx, ny, bounds)
+    placed = 0
+    for x, y, val in zip(gx, gy, values):
+        if not (math.isfinite(x) and math.isfinite(y)):
+            continue
+        if not math.isfinite(float(val)):
+            continue
+        ix = int(np.clip(round(float(x)), 0, nx - 1))
+        iy = int(np.clip(round(float(y)), 0, ny - 1))
+        canvas[iy, ix] = float(val)
+        placed += 1
+    if placed == 0:
+        warnings.append("No surrogate values could be placed from points_to_predict.")
+    return canvas
+
+
+def _scatter_and_interpolate_field_to_display_grid(
+    values: np.ndarray,
+    coordinates: np.ndarray,
+    *,
+    nx: int,
+    ny: int,
+    bounds: Optional[Tuple[Tuple[float, float], Tuple[float, float]]],
+    warnings: List[str],
+) -> np.ndarray:
+    """
+    Place surrogate point values, then IDW-fill gaps on the bounds canvas.
+
+    Known prediction cells keep their exact values; empty cells are interpolated
+    from the same ``points_to_predict`` coordinates.
+    """
+    sparse = _scatter_field_to_display_grid(
+        values,
+        coordinates,
+        nx=nx,
+        ny=ny,
+        bounds=bounds,
+        warnings=warnings,
+    )
+    if coordinates.ndim != 2 or coordinates.shape[1] < 2:
+        return sparse
+    if values.shape[0] != coordinates.shape[0]:
+        return sparse
+    finite_mask = np.isfinite(sparse)
+    if not np.any(finite_mask):
+        return sparse
+    if np.all(finite_mask):
+        return sparse
+
+    gx, gy = _norm_coordinates_to_grid(coordinates, nx, ny, bounds)
+    idw = _idw_fill_grid(gx, gy, values, nx, ny)
+    filled = idw.copy()
+    filled[finite_mask] = sparse[finite_mask]
+    return filled
 
 
 def _surrogate_field_to_display_grid(
@@ -3631,9 +3800,21 @@ def _surrogate_field_to_display_grid(
     display_size: Tuple[int, int],
     warnings: List[str],
 ) -> Optional[np.ndarray]:
-    """Reshape a flattened surrogate model field and align it to the display grid."""
+    """Map a surrogate model field onto the bounds canvas."""
     if values is None:
         return None
+    display_nx, display_ny = display_size
+    pts = surrogate_info.points_to_predict
+    if pts is not None and pts.shape[0] == values.shape[0]:
+        return _scatter_and_interpolate_field_to_display_grid(
+            values,
+            pts,
+            nx=display_nx,
+            ny=display_ny,
+            bounds=surrogate_info.bounds,
+            warnings=warnings,
+        )
+
     length = int(values.shape[0])
     source_size = _surrogate_source_grid_size(
         length,
@@ -3649,7 +3830,12 @@ def _surrogate_field_to_display_grid(
     grid = values.reshape(src_ny, src_nx)
     display_nx, display_ny = display_size
     if (src_nx, src_ny) != (display_nx, display_ny):
-        grid = _align_grid_to_display(grid, display_nx, display_ny)
+        grid = _embed_grid_in_display(
+            grid,
+            display_nx,
+            display_ny,
+            warnings=warnings,
+        )
     return grid
 
 
@@ -4526,46 +4712,84 @@ def _trend_current_index(
     return fallback
 
 
+def uncertainty_trend_from_surrogate_doc(
+    surrogate_doc: Optional[Mapping[str, Any]],
+    *,
+    current_snapshot: str = "latest",
+    grid_size: Tuple[int, int],
+) -> Optional[UncertaintyTrendSeries]:
+    """
+    Build plot-4 trend data from one loaded ``surrogate.json``.
+
+    Prefers ``transformed_stddevs_avg``; when absent, falls back to the mean of the
+    uncertainty grid so early acquisitions still show one trend point.
+    """
+    if not isinstance(surrogate_doc, Mapping):
+        return None
+    full_points, parse_warnings = parse_transformed_stddevs_avg_points(
+        surrogate_doc.get("transformed_stddevs_avg")
+    )
+    current_snapshot = (current_snapshot or "latest").strip() or "latest"
+    if len(full_points) >= 1:
+        step_ids = [point[0] for point in full_points]
+        ys = np.asarray([point[1] for point in full_points], dtype=np.float64)
+        current_index: Optional[int] = None
+        if current_snapshot != "latest":
+            for idx, step_id in enumerate(step_ids):
+                if step_id == current_snapshot:
+                    current_index = idx
+                    break
+        elif step_ids:
+            current_index = len(step_ids) - 1
+        return UncertaintyTrendSeries(
+            step_ids=step_ids,
+            y=ys,
+            labels=list(step_ids),
+            current_index=current_index,
+            source="transformed_stddevs_avg",
+            warnings=parse_warnings,
+        )
+
+    mean_val = _mean_uncertainty_from_surrogate_doc(surrogate_doc, grid_size=grid_size)
+    if mean_val is None:
+        return None
+    step_id = current_snapshot
+    warnings = list(parse_warnings)
+    warnings.append(
+        "transformed_stddevs_avg missing; using mean uncertainty from surrogate grid."
+    )
+    return UncertaintyTrendSeries(
+        step_ids=[step_id],
+        y=np.asarray([mean_val], dtype=np.float64),
+        labels=[step_id],
+        current_index=0,
+        source="uncertainty_grid_mean",
+        warnings=warnings,
+    )
+
+
 def build_uncertainty_trend_from_surrogate_paths(
     surrogate_paths: StrainDashboardPaths,
     *,
     current_snapshot: str = "latest",
+    grid_size: Tuple[int, int] = DEFAULT_GRID_SIZE,
     mongo_s3_auth: Optional[Dict[str, str]] = None,
     remote_linked: bool = False,
 ) -> Optional[UncertaintyTrendSeries]:
     """
-    Fast uncertainty trend from one ``surrogate.json`` (``transformed_stddevs_avg`` only).
+    Fast uncertainty trend from one ``surrogate.json``.
 
-    Returns ``None`` when the selected surrogate has no ``transformed_stddevs_avg`` points.
+    Returns ``None`` when the selected surrogate has no usable trend data.
     """
     trend_doc = load_surrogate_doc_for_paths(
         surrogate_paths,
         mongo_s3_auth=mongo_s3_auth,
         remote_linked=remote_linked,
     )
-    full_points, parse_warnings = parse_transformed_stddevs_avg_points(
-        (trend_doc or {}).get("transformed_stddevs_avg")
-    )
-    if len(full_points) < 1:
-        return None
-    step_ids = [point[0] for point in full_points]
-    ys = np.asarray([point[1] for point in full_points], dtype=np.float64)
-    current_snapshot = (current_snapshot or "latest").strip() or "latest"
-    current_index: Optional[int] = None
-    if current_snapshot != "latest":
-        for idx, step_id in enumerate(step_ids):
-            if step_id == current_snapshot:
-                current_index = idx
-                break
-    if current_index is None and current_snapshot == "latest" and step_ids:
-        current_index = len(step_ids) - 1
-    return UncertaintyTrendSeries(
-        step_ids=step_ids,
-        y=ys,
-        labels=list(step_ids),
-        current_index=current_index,
-        source="transformed_stddevs_avg",
-        warnings=parse_warnings,
+    return uncertainty_trend_from_surrogate_doc(
+        trend_doc,
+        current_snapshot=current_snapshot,
+        grid_size=grid_size,
     )
 
 
@@ -4626,6 +4850,14 @@ def build_uncertainty_trend_series(
             source="transformed_stddevs_avg",
             warnings=warnings,
         )
+
+    quick = uncertainty_trend_from_surrogate_doc(
+        trend_doc,
+        current_snapshot=current_snapshot,
+        grid_size=grid_size,
+    )
+    if quick is not None:
+        return quick
 
     if not allow_per_snapshot_fallback:
         return UncertaintyTrendSeries(
@@ -4723,8 +4955,20 @@ def validate_nsdf_surrogate_doc(
         warnings.append(plot_dim_warning)
     bounds = _validate_bounds(surrogate_doc.get("bounds"))
     points = _parse_nsdf_points(surrogate_doc.get("points"))
+    points_to_predict = _parse_nsdf_points_to_predict(surrogate_doc, warnings)
+    surrogate_arr = _numeric_1d_surrogate_array_or_none(surrogate_doc, "surrogate", warnings)
+    if (
+        points_to_predict is not None
+        and surrogate_arr is not None
+        and points_to_predict.shape[0] != surrogate_arr.shape[0]
+    ):
+        warnings.append(
+            "points_to_predict length does not match surrogate array; "
+            "ignoring coordinate-aligned placement."
+        )
+        points_to_predict = None
     return NSDFSurrogateData(
-        surrogate=_numeric_1d_surrogate_array_or_none(surrogate_doc, "surrogate", warnings),
+        surrogate=surrogate_arr,
         uncertainty=_numeric_1d_surrogate_array_or_none(surrogate_doc, "uncertainty", warnings),
         raw_uncertainty=_numeric_1d_surrogate_array_or_none(
             surrogate_doc,
@@ -4735,6 +4979,7 @@ def validate_nsdf_surrogate_doc(
         plot_dim=plot_dim,
         bounds=bounds,
         points=points,
+        points_to_predict=points_to_predict,
         warnings=warnings,
     )
 
@@ -4981,7 +5226,11 @@ def build_strain_field_grids(
     )
     if est_grid is not None:
         est = est_grid
-        meta["estimate_source"] = "surrogate_grid"
+        meta["estimate_source"] = (
+            "surrogate_points_idw"
+            if surrogate.points_to_predict is not None
+            else "surrogate_grid"
+        )
         if values.shape[0] > 0:
             finite_est = est[np.isfinite(est)]
             if (
@@ -5013,7 +5262,11 @@ def build_strain_field_grids(
     )
     if var_grid is not None and meta["estimate_source"] != "dataset_y_idw":
         var = np.square(np.maximum(var_grid, 0.0))
-        meta["variance_source"] = "uncertainty_squared_grid"
+        meta["variance_source"] = (
+            "uncertainty_squared_points_idw"
+            if surrogate.points_to_predict is not None
+            else "uncertainty_squared_grid"
+        )
     else:
         scale = float(np.nanmean(np.abs(values)) or 1e-6) * 0.25
         var = _distance_weighted_variance_placeholder(mask, scale)
@@ -5073,9 +5326,10 @@ def make_strain_heatmap_figure(
         hi = float(np.nanmax(finite)) if finite.size else 1.0
         if lo == hi:
             hi = lo + 1e-12
-    mapper = LinearColorMapper(palette=palette, low=lo, high=hi)
+    mapper = LinearColorMapper(palette=palette, low=lo, high=hi, nan_color="#ffffff")
 
     p = _strain_plot_figure(title, nx, ny, cfg, layout=layout)
+    _add_strain_white_grid_image(p, nx, ny, cfg)
     p.image(image=[zd], x=0, y=0, dw=nx, dh=ny, color_mapper=mapper)
     if show_colorbar:
         _attach_heatmap_colorbar(p, mapper, lo, hi)
