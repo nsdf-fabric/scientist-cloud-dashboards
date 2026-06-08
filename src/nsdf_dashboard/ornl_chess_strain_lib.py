@@ -1969,6 +1969,9 @@ def promote_gateway_json_url_to_s3_paths(paths: StrainDashboardPaths) -> StrainD
         s3_endpoint_url=(cfg.get("endpoint_url") or paths.s3_endpoint_url or "").strip(),
         s3_region=(cfg.get("region_name") or paths.s3_region or "us-east-1").strip() or "us-east-1",
         version_suffix=paths.version_suffix,
+        surrogate_version_suffix=paths.surrogate_version_suffix,
+        next_x_version_suffix=paths.next_x_version_suffix,
+        strict_triplet_paths=paths.strict_triplet_paths,
     )
 
 
@@ -1994,7 +1997,56 @@ def _paths_without_local_json_files(paths: StrainDashboardPaths) -> StrainDashbo
         s3_endpoint_url=paths.s3_endpoint_url,
         s3_region=paths.s3_region,
         version_suffix=paths.version_suffix,
+        surrogate_version_suffix=paths.surrogate_version_suffix,
+        next_x_version_suffix=paths.next_x_version_suffix,
+        strict_triplet_paths=paths.strict_triplet_paths,
     )
+
+
+def _prepare_nsdf_load_paths(
+    paths: StrainDashboardPaths,
+    *,
+    remote_linked: bool = False,
+) -> StrainDashboardPaths:
+    """
+    Normalize paths for bundle/surrogate loads without widening strict triplet scope.
+
+    Gateway promotion can add ``s3_bucket`` / ``s3_data_key`` after suffix resolution;
+    re-apply suffixes so surrogate/next_x keys exist and ``strict_triplet_paths`` stays on.
+    """
+    load_paths = promote_gateway_json_url_to_s3_paths(_strip_local_data_dir_paths(paths))
+    if remote_linked:
+        load_paths = _paths_without_local_json_files(load_paths)
+    if remote_linked or load_paths.has_s3_source():
+        load_paths = StrainDashboardPaths(
+            local_json_path="",
+            json_url=load_paths.json_url,
+            surrogate_json_path="",
+            surrogate_json_url=load_paths.surrogate_json_url,
+            next_x_json_path="",
+            next_x_json_url=load_paths.next_x_json_url,
+            local_data_dir=load_paths.local_data_dir,
+            s3_env_file=load_paths.s3_env_file,
+            s3_bucket=load_paths.s3_bucket,
+            s3_data_key=load_paths.s3_data_key,
+            s3_surrogate_key=load_paths.s3_surrogate_key,
+            s3_next_x_key=load_paths.s3_next_x_key,
+            s3_endpoint_url=load_paths.s3_endpoint_url,
+            s3_region=load_paths.s3_region,
+            version_suffix=load_paths.version_suffix,
+            surrogate_version_suffix=load_paths.surrogate_version_suffix,
+            next_x_version_suffix=load_paths.next_x_version_suffix,
+            strict_triplet_paths=load_paths.strict_triplet_paths,
+        )
+    if paths.strict_triplet_paths and load_paths.has_s3_source():
+        load_paths = apply_nsdf_file_suffixes(
+            load_paths,
+            data_suffix=paths.version_suffix or "",
+            surrogate_suffix=paths.surrogate_version_suffix,
+            next_x_suffix=paths.next_x_version_suffix,
+            strict=True,
+        )
+    return load_paths
 
 
 def apply_scientistcloud_storage_policy(
@@ -2815,13 +2867,7 @@ def load_nsdf_json_bundle(
             f"(LOCAL_DATA_DIR={local_dir!r})"
         )
 
-    load_paths = promote_gateway_json_url_to_s3_paths(_strip_local_data_dir_paths(paths))
-    if remote_linked:
-        load_paths = _paths_without_local_json_files(load_paths)
-    if remote_linked or load_paths.has_s3_source():
-        load_paths.local_json_path = ""
-        load_paths.surrogate_json_path = ""
-        load_paths.next_x_json_path = ""
+    load_paths = _prepare_nsdf_load_paths(paths, remote_linked=remote_linked)
     if load_paths.has_s3_source():
         return load_nsdf_json_bundle_from_s3(load_paths, mongo_s3_auth=mongo_s3_auth)
     data = load_strain_json(load_paths, mongo_s3_auth=mongo_s3_auth)
@@ -4345,27 +4391,22 @@ def load_surrogate_doc_for_paths(
     remote_linked: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Load only ``surrogate.json`` for the resolved/versioned paths."""
-    load_paths = promote_gateway_json_url_to_s3_paths(_strip_local_data_dir_paths(paths))
-    if remote_linked:
-        load_paths = _paths_without_local_json_files(load_paths)
-    if remote_linked or load_paths.has_s3_source():
-        load_paths.local_json_path = ""
-        load_paths.surrogate_json_path = ""
-        if load_paths.has_s3_source():
-            bucket = (load_paths.s3_bucket or "").strip()
-            data_key = (load_paths.s3_data_key or "").strip()
-            if not bucket or not data_key:
-                return None
-            client = _make_nsdf_s3_client(load_paths, mongo_s3_auth=mongo_s3_auth)
-            for candidate_key in _iter_surrogate_s3_key_candidates(
-                load_paths,
-                data_key,
-                mongo_s3_auth=mongo_s3_auth,
-            ):
-                doc = _read_json_if_exists_s3(client, bucket, candidate_key)
-                if isinstance(doc, Mapping):
-                    return dict(doc)
+    load_paths = _prepare_nsdf_load_paths(paths, remote_linked=remote_linked)
+    if load_paths.has_s3_source():
+        bucket = (load_paths.s3_bucket or "").strip()
+        data_key = (load_paths.s3_data_key or "").strip()
+        if not bucket or not data_key:
             return None
+        client = _make_nsdf_s3_client(load_paths, mongo_s3_auth=mongo_s3_auth)
+        for candidate_key in _iter_surrogate_s3_key_candidates(
+            load_paths,
+            data_key,
+            mongo_s3_auth=mongo_s3_auth,
+        ):
+            doc = _read_json_if_exists_s3(client, bucket, candidate_key)
+            if isinstance(doc, Mapping):
+                return dict(doc)
+        return None
     surrogate, _, _ = load_optional_surrogate_json(
         load_paths,
         mongo_s3_auth=mongo_s3_auth,

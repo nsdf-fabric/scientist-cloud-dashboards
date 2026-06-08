@@ -719,6 +719,49 @@ def test_apply_nsdf_file_suffixes_accepts_latest_selector() -> None:
     assert versioned.next_x_json_path.endswith("next_x.json")
 
 
+def test_promote_gateway_preserves_strict_triplet_paths() -> None:
+    gateway = "https://gateway.example/bucket/prefix/data.json?access_key=a&secret_key=b"
+    paths = StrainDashboardPaths(
+        json_url=gateway,
+        strict_triplet_paths=True,
+        surrogate_version_suffix="20260602T100000Z",
+        next_x_version_suffix="",
+    )
+    promoted = lib.promote_gateway_json_url_to_s3_paths(paths)
+    assert promoted.strict_triplet_paths is True
+    assert promoted.surrogate_version_suffix == "20260602T100000Z"
+    assert promoted.s3_bucket == "bucket"
+    assert promoted.s3_data_key == "prefix/data.json"
+
+
+def test_prepare_nsdf_load_paths_sets_strict_s3_triplet_keys() -> None:
+    gateway = "https://gateway.example/bucket/prefix/data.json?access_key=a&secret_key=b"
+    paths = apply_nsdf_file_suffixes(
+        StrainDashboardPaths(json_url=gateway),
+        strict=True,
+    )
+    prepared = lib._prepare_nsdf_load_paths(paths)
+    assert prepared.strict_triplet_paths is True
+    assert prepared.s3_surrogate_key == "prefix/surrogate.json"
+    assert prepared.s3_next_x_key == "prefix/next_x.json"
+
+
+def test_iter_surrogate_s3_key_candidates_strict_skips_listing(monkeypatch) -> None:
+    def _should_not_run(*args, **kwargs):
+        raise AssertionError("S3 prefix listing should not run in strict mode")
+
+    monkeypatch.setattr(lib, "list_nsdf_version_suffixes_from_s3", _should_not_run)
+    monkeypatch.setattr(lib, "list_nsdf_surrogate_suffixes_from_s3", _should_not_run)
+    paths = StrainDashboardPaths(
+        s3_bucket="b",
+        s3_data_key="prefix/data.json",
+        s3_surrogate_key="prefix/surrogate.json",
+        strict_triplet_paths=True,
+    )
+    keys = lib._iter_surrogate_s3_key_candidates(paths, "prefix/data.json")
+    assert keys == ["prefix/surrogate.json"]
+
+
 def test_apply_nsdf_file_suffixes_independent() -> None:
     base = StrainDashboardPaths(local_data_dir="/tmp/chess-data")
     with _local_files_first_for_testing():

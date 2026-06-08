@@ -183,6 +183,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (  # noqa: E402
     _trend_current_index,
     build_uncertainty_trend_from_surrogate_paths,
     build_uncertainty_trend_series,
+    parse_transformed_stddevs_avg_points,
     apply_nsdf_file_suffixes,
     discover_nsdf_next_x_version_options,
     discover_nsdf_surrogate_version_options,
@@ -574,10 +575,96 @@ else:
         finally:
             grid_state["updating_controls"] = False
 
-    def _fast_latest_triplet_load() -> None:
+    def _uncertainty_trend_from_loaded_surrogate(
+        current_snap: str,
+    ) -> Optional[UncertaintyTrendSeries]:
+        if loaded_bundle is None or not isinstance(loaded_bundle.surrogate, dict):
+            return None
+        full_points, parse_warnings = parse_transformed_stddevs_avg_points(
+            loaded_bundle.surrogate.get("transformed_stddevs_avg")
+        )
+        if len(full_points) < 2:
+            return None
+        step_ids = [point[0] for point in full_points]
+        ys = np.asarray([point[1] for point in full_points], dtype=np.float64)
+        current_snapshot = (current_snap or "latest").strip() or "latest"
+        current_index: Optional[int] = None
+        if current_snapshot != "latest":
+            for idx, step_id in enumerate(step_ids):
+                if step_id == current_snapshot:
+                    current_index = idx
+                    break
+        return UncertaintyTrendSeries(
+            step_ids=step_ids,
+            y=ys,
+            labels=list(step_ids),
+            current_index=current_index,
+            source="transformed_stddevs_avg",
+            warnings=parse_warnings,
+        )
+
+    def _fast_latest_triplet_load_data() -> None:
         _bootstrap_minimal_ui_state()
-        _reload_figures_view()
+        load_payload()
         _update_workflow_hint_from_bundle()
+
+    def _fast_latest_triplet_load_figures() -> None:
+        rebuild_figures()
+
+    def _fast_latest_triplet_load() -> None:
+        _fast_latest_triplet_load_data()
+        _fast_latest_triplet_load_figures()
+
+    def _defer_fast_latest_triplet_load() -> None:
+        """Load JSON on one tick, paint figures on the next so the spinner can render."""
+        token = _begin_figures_loading("Loading latest triplet...")
+
+        def _load_data_tick() -> None:
+            if grid_state.get("loading_generation") != token:
+                return
+            try:
+                _fast_latest_triplet_load_data()
+            except Exception as exc:
+                traceback.print_exc()
+                if grid_state.get("loading_generation") == token:
+                    figures_column.children = [
+                        Div(
+                            text=(
+                                "<pre>Dashboard update failed: "
+                                f"{html.escape(str(exc))}</pre>"
+                            )
+                        )
+                    ]
+                    _set_controls_busy(False)
+                return
+            if grid_state.get("loading_generation") != token:
+                return
+            figures_column.children = [_loading_placeholder_div("Building plots...")]
+
+            def _build_figures_tick() -> None:
+                if grid_state.get("loading_generation") != token:
+                    return
+                try:
+                    _fast_latest_triplet_load_figures()
+                    _schedule_background_catalog()
+                except Exception as exc:
+                    traceback.print_exc()
+                    if grid_state.get("loading_generation") == token:
+                        figures_column.children = [
+                            Div(
+                                text=(
+                                    "<pre>Dashboard update failed: "
+                                    f"{html.escape(str(exc))}</pre>"
+                                )
+                            )
+                        ]
+                finally:
+                    if grid_state.get("loading_generation") == token:
+                        _set_controls_busy(False)
+
+            doc.add_next_tick_callback(_build_figures_tick)
+
+        doc.add_next_tick_callback(_load_data_tick)
 
     def _cancel_background_catalog() -> None:
         callback_id = grid_state.get("catalog_callback_id")
@@ -624,13 +711,7 @@ else:
         grid_state["catalog_callback_id"] = callback_id
 
     def _initial_dashboard_load() -> None:
-        _fast_latest_triplet_load()
-        _schedule_background_catalog()
-
-    def _reload_dashboard_fast_then_catalog() -> None:
-        grid_state["catalog_ready"] = False
-        _fast_latest_triplet_load()
-        _schedule_background_catalog()
+        _defer_fast_latest_triplet_load()
 
     def _full_catalog_reload() -> None:
         _cancel_background_catalog()
@@ -1100,12 +1181,14 @@ else:
     def _uncertainty_trend_for_dashboard() -> Optional[UncertaintyTrendSeries]:
         current_snap = str(grid_state.get("version_suffix") or "latest")
         if not grid_state.get("catalog_ready"):
-            quick = build_uncertainty_trend_from_surrogate_paths(
-                _resolve_paths(),
-                current_snapshot=current_snap,
-                mongo_s3_auth=_dataset_s3_auth_override(),
-                remote_linked=_remote_linked,
-            )
+            quick = _uncertainty_trend_from_loaded_surrogate(current_snap)
+            if quick is None:
+                quick = build_uncertainty_trend_from_surrogate_paths(
+                    _resolve_paths(),
+                    current_snapshot=current_snap,
+                    mongo_s3_auth=_dataset_s3_auth_override(),
+                    remote_linked=_remote_linked,
+                )
             if quick is not None:
                 return quick
             return UncertaintyTrendSeries(
@@ -1228,10 +1311,8 @@ else:
         )
 
     def on_reload() -> None:
-        _defer_figures_work(
-            _reload_dashboard_fast_then_catalog,
-            message="Reloading latest triplet...",
-        )
+        grid_state["catalog_ready"] = False
+        _defer_fast_latest_triplet_load()
 
     def on_external_refresh(_doc: Any = doc, _on_reload: Callable[[], None] = on_reload) -> None:
         _doc.add_next_tick_callback(_on_reload)
@@ -1329,7 +1410,7 @@ else:
     doc.add_root(root)
 
     if paths.local_data_dir or paths.has_s3_source() or paths.local_json_path or paths.json_url:
-        _defer_figures_work(_initial_dashboard_load, message="Loading latest triplet...")
+        _initial_dashboard_load()
     else:
         _set_controls_busy(False)
         figures_column.children = [
