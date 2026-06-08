@@ -381,6 +381,42 @@ def test_next_x_grid_coords_for_active_workflow() -> None:
     assert float(py[0]) == 0.5
 
 
+def test_next_x_grid_coords_use_entry_when_workflow_ids_differ() -> None:
+    next_x = validate_nsdf_next_x_doc(
+        [
+            {
+                "workflow_id": "6a2703cf602e29e5f9e92e02",
+                "data": [[26.89545926444786, 29.734165857560694]],
+            },
+        ],
+    )
+    bounds = ((0.0, 30.0), (0.0, 39.0))
+    gx, gy = next_x_grid_coords_for_workflow(
+        next_x,
+        "6a26fb54602e29e5f9e92e01",
+        30,
+        39,
+        bounds,
+    )
+    assert gx.shape == (1,)
+    assert gy.shape == (1,)
+    assert abs(float(gx[0]) - 25.999) < 0.01
+    assert abs(float(gy[0]) - 28.972) < 0.01
+    px, py = _grid_display_coords(gx, gy, 30, 39, flip_y=False)
+    assert abs(float(px[0]) - 26.5) < 0.01
+    assert abs(float(py[0]) - 29.5) < 0.01
+
+
+def test_resolve_strain_plot_bounds_falls_back_to_surrogate_bounds() -> None:
+    from nsdf_dashboard.ornl_chess_strain_lib import _resolve_strain_plot_bounds
+
+    meta = {
+        "measurement_bounds": None,
+        "surrogate_bounds": ((0.0, 30.0), (0.0, 39.0)),
+    }
+    assert _resolve_strain_plot_bounds(meta) == ((0.0, 30.0), (0.0, 39.0))
+
+
 def test_parse_nsdf_plot_dim() -> None:
     assert parse_nsdf_plot_dim("2D") == ("2D", None)
     assert parse_nsdf_plot_dim("3d") == ("3D", None)
@@ -633,6 +669,24 @@ def test_next_x_object_schema_single_point() -> None:
     assert float(info.entries[0].coordinates[0, 0]) == 1.0
     assert float(info.entries[0].coordinates[0, 1]) == 2.0
     assert info.total_points == 1
+
+
+def test_next_x_accepts_lab_pair_when_dataset_x_size_is_gp_dim() -> None:
+    """dataset_x_size describes GP input width, not the labx/labz row length."""
+    doc = [
+        {
+            "workflow_id": "6a2735dc9e0fe89c4479904a",
+            "data": [[14.072018275201788, 33.247209043840385]],
+            "dataset_x_size": 16,
+        },
+    ]
+    info = validate_nsdf_next_x_doc(doc)
+    assert not info.warnings
+    assert len(info.entries) == 1
+    assert info.entries[0].workflow_id == "6a2735dc9e0fe89c4479904a"
+    assert info.entries[0].coordinates.shape == (1, 2)
+    assert float(info.entries[0].coordinates[0, 0]) == 14.072018275201788
+    assert float(info.entries[0].coordinates[0, 1]) == 33.247209043840385
 
 
 def test_next_x_object_schema_loads_from_local_bundle() -> None:
@@ -1322,6 +1376,15 @@ def test_triplet_index_groups_snapshots_by_workflow() -> None:
         wf_b_opts = index.snapshot_select_options("wf-b")
         assert ("20260607T100000Z", "20260607T100000Z") in wf_b_opts
         assert ("20260607T110000Z", "20260607T110000Z") in wf_b_opts
+        sur_b_opts = index.surrogate_select_options("wf-b")
+        nx_b_opts = index.next_x_select_options("wf-b")
+        assert len(sur_b_opts) == len(wf_b_opts)
+        assert [value for value, _label in sur_b_opts] == [
+            value for value, _label in wf_b_opts
+        ]
+        assert [value for value, _label in nx_b_opts] == [
+            value for value, _label in wf_b_opts
+        ]
 
 
 def test_triplet_index_infers_workflow_from_nearby_auxiliary_timestamps() -> None:

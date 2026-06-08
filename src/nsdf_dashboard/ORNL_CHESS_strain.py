@@ -212,6 +212,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (  # noqa: E402
     scientistcloud_dataset_is_remote_linked,
     surrogate_doc_defines_grid_size,
     validate_nsdf_measurement_doc,
+    _select_next_x_entry,
     validate_nsdf_next_x_doc,
     validate_nsdf_surrogate_doc,
     workflow_id_from_dataset_doc,
@@ -810,8 +811,14 @@ else:
         else:
             workflow_div.text = _workflow_placeholder
 
-    def _refresh_auxiliary_suffix_options() -> None:
+    def _refresh_auxiliary_suffix_options(workflow_id: Optional[str] = None) -> None:
         base_paths = _resolve_base_paths()
+        index = grid_state.get("triplet_index")
+        wf = (workflow_id or grid_state.get("workflow_id") or "").strip()
+        if grid_state.get("catalog_ready") and index is not None and wf and index.has_workflow(wf):
+            grid_state["surrogate_suffix_options"] = index.surrogate_select_options(wf)
+            grid_state["next_x_suffix_options"] = index.next_x_select_options(wf)
+            return
         grid_state["surrogate_suffix_options"] = discover_nsdf_surrogate_version_options(
             base_paths,
             base_dir=_bd,
@@ -888,7 +895,6 @@ else:
         grid_state["catalog_ready"] = True
         grid_state["uncertainty_trend_points_key"] = ""
         grid_state["uncertainty_trend_points"] = None
-        _refresh_auxiliary_suffix_options()
 
         workflow_options = index.workflow_select_options()
         if not workflow_options:
@@ -916,6 +922,7 @@ else:
         if not preserve_snapshot or current_snapshot not in valid_snapshots:
             current_snapshot = index.default_snapshot_value(current_workflow)
         grid_state["version_suffix"] = current_snapshot
+        _refresh_auxiliary_suffix_options(current_workflow)
 
         grid_state["updating_controls"] = True
         try:
@@ -938,6 +945,7 @@ else:
                 snapshot_options = [("latest", "Latest (data.json)")]
             current_snapshot = index.default_snapshot_value(workflow_id)
         grid_state["version_suffix"] = current_snapshot
+        _refresh_auxiliary_suffix_options(workflow_id)
         grid_state["updating_controls"] = True
         try:
             version_select.options = snapshot_options
@@ -1076,16 +1084,15 @@ else:
         active_workflow_id = active_workflow_id_from_grid_state(selected_workflow)
         if active_workflow_id is None and selected_workflow != NSDF_UNKNOWN_WORKFLOW_ID:
             active_workflow_id = resolve_nsdf_workflow_id(surrogate_info, next_x_info)
-        if next_x_info.entries and active_workflow_id:
-            active_points = sum(
-                int(entry.coordinates.shape[0])
-                for entry in next_x_info.entries
-                if entry.workflow_id == active_workflow_id
+        overlay_entry = _select_next_x_entry(next_x_info, active_workflow_id)
+        if overlay_entry is not None and overlay_entry.coordinates.size:
+            active_points = int(overlay_entry.coordinates.shape[0])
+            next_x_summary = (
+                f"next_x: {active_points} proposed point(s) for workflow "
+                f"{overlay_entry.workflow_id}."
             )
-            if active_points:
-                next_x_summary = (
-                    f"next_x: {active_points} proposed point(s) for workflow {active_workflow_id}."
-                )
+        elif next_x_info.entries and active_workflow_id:
+            active_points = 0
         elif next_x_info.entries:
             next_x_summary = "next_x: loaded but no active non-demo workflow entry."
         elif bundle.next_x is not None:

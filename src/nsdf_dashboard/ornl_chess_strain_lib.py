@@ -562,13 +562,33 @@ class NSDFTripletIndex:
         return list(self.by_workflow.get((workflow_id or "").strip()) or [])
 
     def snapshot_select_options(self, workflow_id: str) -> List[Tuple[str, str]]:
+        return self._suffix_select_options(
+            workflow_id,
+            latest_label="Latest (data.json)",
+        )
+
+    def surrogate_select_options(self, workflow_id: str) -> List[Tuple[str, str]]:
+        return self._suffix_select_options(
+            workflow_id,
+            latest_label="Latest (surrogate.json)",
+        )
+
+    def next_x_select_options(self, workflow_id: str) -> List[Tuple[str, str]]:
+        return self._suffix_select_options(
+            workflow_id,
+            latest_label="Latest (next_x.json)",
+        )
+
+    def _suffix_select_options(
+        self,
+        workflow_id: str,
+        *,
+        latest_label: str,
+    ) -> List[Tuple[str, str]]:
         options: List[Tuple[str, str]] = []
         for snap in self.snapshots_for_workflow(workflow_id):
             value = "latest" if not snap.suffix else snap.suffix
-            if value == "latest":
-                label = "Latest (data.json)"
-            else:
-                label = snap.suffix
+            label = latest_label if value == "latest" else snap.suffix
             options.append((value, label))
         return options
 
@@ -1481,15 +1501,22 @@ def _next_x_doc_is_recognized_format(doc: Any) -> bool:
     return isinstance(doc, list)
 
 
-def _next_x_coord_size(item: Mapping[str, Any]) -> int:
-    raw = item.get("dataset_x_size")
-    if isinstance(raw, int) and raw > 0:
-        return raw
-    if _is_number(raw):
-        parsed = int(raw)
-        if parsed > 0:
-            return parsed
-    return 2
+def _parse_next_x_coordinate_row(row_value: Any) -> Optional[Tuple[float, float]]:
+    """
+    Extract ``(labx, labz)`` from one ``next_x`` row.
+
+    The pipeline stores a single scan location as ``[labx, labz]`` even when
+    ``dataset_x_size`` describes the full GP input dimension (e.g. 16), not
+    the row width.
+    """
+    if not isinstance(row_value, list) or len(row_value) < 2:
+        return None
+    if not (_is_number(row_value[0]) and _is_number(row_value[1])):
+        return None
+    labx, labz = float(row_value[0]), float(row_value[1])
+    if not (math.isfinite(labx) and math.isfinite(labz)):
+        return None
+    return labx, labz
 
 
 def _iter_next_x_workflow_blocks(doc: Any) -> List[Mapping[str, Any]]:
@@ -1515,33 +1542,16 @@ def _parse_next_x_workflow_block(
     if not isinstance(data, list) or not data:
         warnings.append(f"Skipping {label} ({workflow_id!r}): data must be a non-empty list.")
         return None
-    coord_size = _next_x_coord_size(item)
     coords: List[Tuple[float, float]] = []
     for j, row_value in enumerate(data):
-        if not isinstance(row_value, list) or len(row_value) < coord_size:
+        parsed = _parse_next_x_coordinate_row(row_value)
+        if parsed is None:
             warnings.append(
-                f"Skipping {label} ({workflow_id!r}): data[{j}] must contain "
-                f"at least {coord_size} numeric coordinate value(s)."
+                f"Skipping {label} ({workflow_id!r}): data[{j}] must contain at least "
+                "two numeric labx/labz values."
             )
             return None
-        values = row_value[:coord_size]
-        if not all(_is_number(value) for value in values):
-            warnings.append(
-                f"Skipping {label} ({workflow_id!r}): data[{j}] must contain numeric values."
-            )
-            return None
-        floats = [float(value) for value in values]
-        if not all(math.isfinite(value) for value in floats):
-            warnings.append(
-                f"Skipping {label} ({workflow_id!r}): data[{j}] values must be finite."
-            )
-            return None
-        if coord_size < 2:
-            warnings.append(
-                f"Skipping {label} ({workflow_id!r}): dataset_x_size must be at least 2 for plotting."
-            )
-            return None
-        coords.append((floats[0], floats[1]))
+        coords.append(parsed)
     return NSDFNextXEntry(
         workflow_id=workflow_id,
         coordinates=np.asarray(coords, dtype=np.float64),
@@ -2679,9 +2689,11 @@ def validate_nsdf_next_x_doc(value: Any) -> NSDFNextXData:
 
     Current schema (single proposed point)::
 
-        {"workflow_id": "...", "dataset_x_size": 2, "data": [[labx, labz]]}
+        {"workflow_id": "...", "dataset_x_size": 16, "data": [[labx, labz]]}
 
-    Legacy schema (array of workflow blocks) is still accepted.
+    ``dataset_x_size`` is GP input metadata; plotting uses the first two values
+    in each ``data`` row as ``(labx, labz)``. Legacy array-of-blocks schema
+    is still accepted.
     """
     warnings: List[str] = []
     if value is None:
@@ -4035,6 +4047,35 @@ def _validate_bounds(value: Any) -> Optional[Tuple[Tuple[float, float], Tuple[fl
     return out[0], out[1]
 
 
+def _coerce_bounds_pair(
+    value: Any,
+) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
+    """Normalize bounds stored as nested lists or tuples."""
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return _validate_bounds(value)
+    if (
+        isinstance(value, tuple)
+        and len(value) == 2
+        and all(isinstance(axis, (list, tuple)) and len(axis) >= 2 for axis in value)
+    ):
+        as_list = [list(axis[:2]) for axis in value]
+        return _validate_bounds(as_list)
+    return None
+
+
+def _resolve_strain_plot_bounds(
+    meta: Mapping[str, Any],
+) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
+    """Bounds for mapping lab coordinates onto the dashboard grid."""
+    for key in ("measurement_bounds", "surrogate_bounds"):
+        bounds = _coerce_bounds_pair(meta.get(key))
+        if bounds is not None:
+            return bounds
+    return None
+
+
 def validate_nsdf_measurement_doc(doc: Mapping[str, Any]) -> NSDFMeasurementData:
     """Validate native NSDF ``data.json`` and return normalized arrays."""
     if not isinstance(doc, Mapping):
@@ -4186,6 +4227,22 @@ def resolve_nsdf_workflow_id(
     return None
 
 
+def _select_next_x_entry(
+    next_x_info: NSDFNextXData,
+    workflow_id: Optional[str],
+) -> Optional[NSDFNextXEntry]:
+    """Pick the next_x workflow block to plot (preferred id, else first real entry)."""
+    preferred = (workflow_id or "").strip()
+    if preferred:
+        for entry in next_x_info.entries:
+            if entry.workflow_id == preferred:
+                return entry
+    for entry in next_x_info.entries:
+        if entry.workflow_id and not _is_demo_workflow_id(entry.workflow_id):
+            return entry
+    return None
+
+
 def next_x_grid_coords_for_workflow(
     next_x_info: NSDFNextXData,
     workflow_id: Optional[str],
@@ -4194,17 +4251,10 @@ def next_x_grid_coords_for_workflow(
     bounds: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Map proposed next-scan coordinates onto the dashboard grid for one workflow."""
-    if not workflow_id:
+    entry = _select_next_x_entry(next_x_info, workflow_id)
+    if entry is None or entry.coordinates.size == 0:
         return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
-    coords: List[Tuple[float, float]] = []
-    for entry in next_x_info.entries:
-        if entry.workflow_id != workflow_id:
-            continue
-        for row in entry.coordinates:
-            coords.append((float(row[0]), float(row[1])))
-    if not coords:
-        return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
-    arr = np.asarray(coords, dtype=np.float64)
+    arr = np.asarray(entry.coordinates, dtype=np.float64)
     return _norm_positions_to_grid(arr[:, 0], arr[:, 1], nx, ny, bounds)
 
 
@@ -5387,6 +5437,7 @@ def build_strain_field_grids(
         "n_points": int(values.shape[0]),
         "bounds_source": measurement.bounds_source,
         "measurement_bounds": measurement.bounds,
+        "surrogate_bounds": surrogate.bounds,
         "measurement_gx": gx,
         "measurement_gy": gy,
         "measurement_values": values.copy(),
@@ -5561,9 +5612,7 @@ def _build_strain_triplet_figures(
     sub = f" — {row_subtitle}" if row_subtitle else ""
     est = grids.estimate
     nx, ny = cfg.grid_size
-    bounds = grids.meta.get("measurement_bounds")
-    if not isinstance(bounds, tuple):
-        bounds = None
+    bounds = _resolve_strain_plot_bounds(grids.meta)
 
     measured_gx = grids.meta.get("measurement_gx")
     measured_gy = grids.meta.get("measurement_gy")
