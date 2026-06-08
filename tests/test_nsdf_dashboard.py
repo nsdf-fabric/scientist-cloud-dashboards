@@ -15,11 +15,25 @@ import nsdf_dashboard.ornl_chess_strain_lib as lib
 from nsdf_dashboard import refresh_api, refresh_bus
 from nsdf_dashboard.ornl_chess_strain_lib import (
     NSDFLoadedBundle,
+    NSDFSnapshotRef,
+    NSDFTripletIndex,
+    UncertaintyTrendSeries,
+    NSDF_UNKNOWN_WORKFLOW_ID,
     StrainDashboardPaths,
     StrainFieldPlotConfig,
+    apply_nsdf_file_suffixes,
     apply_nsdf_version_suffix,
+    discover_nsdf_next_x_version_options,
+    discover_nsdf_surrogate_version_options,
+    resolve_auxiliary_suffix_for_data_snapshot,
     build_strain_field_grids,
+    build_uncertainty_trend_from_surrogate_paths,
+    build_uncertainty_trend_series,
+    parse_transformed_stddevs_avg_points,
+    _sparse_trend_axis_ticks,
+    _trend_axis_label_budget,
     collect_nsdf_triplet_load_issues,
+    discover_nsdf_triplet_index,
     discover_nsdf_version_options,
     enrich_strain_paths_from_dataset_doc,
     infer_nsdf_bounds_grid_size,
@@ -28,8 +42,12 @@ from nsdf_dashboard.ornl_chess_strain_lib import (
     parse_nsdf_plot_dim,
     format_nsdf_workflow_display,
     next_x_grid_coords_for_workflow,
+    _build_triplet_index_from_directory,
     _grid_display_coords,
+    resolve_default_workflow_selection,
     resolve_nsdf_workflow_id,
+    resolve_strain_paths_for_session,
+    scientistcloud_dataset_is_remote_linked,
     list_nsdf_field_headers,
     list_nsdf_version_suffixes_from_directory,
     load_simple_env_file,
@@ -46,6 +64,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (
     validate_nsdf_measurement_doc,
     validate_nsdf_next_x_doc,
     validate_nsdf_surrogate_doc,
+    workflow_id_from_dataset_doc,
 )
 
 
@@ -457,6 +476,188 @@ def test_next_x_validation_skips_bad_rows() -> None:
     assert info.warnings
 
 
+def test_trend_axis_label_budget_scales_with_points() -> None:
+    assert _trend_axis_label_budget(5, panel_width=360) == 5
+    assert _trend_axis_label_budget(12, panel_width=360) == 7
+    assert _trend_axis_label_budget(48, panel_width=360) == 7
+    assert _trend_axis_label_budget(48, panel_width=250) == 5
+    assert _trend_axis_label_budget(120, panel_width=360) == 7
+
+
+def test_sparse_trend_axis_ticks() -> None:
+    ids = [f"step-{i:02d}" for i in range(48)]
+    budget = _trend_axis_label_budget(len(ids), panel_width=360)
+    ticks = _sparse_trend_axis_ticks(ids, panel_width=360)
+    assert len(ticks) == budget
+    assert ticks[0] == "step-00"
+    assert ticks[-1] == "step-47"
+
+    with_highlight = _sparse_trend_axis_ticks(
+        ids,
+        panel_width=360,
+        highlight_id="step-05",
+    )
+    assert "step-05" in with_highlight
+
+
+def test_parse_transformed_stddevs_avg_points() -> None:
+    points, warnings = parse_transformed_stddevs_avg_points(
+        [["20260601T100000Z", 0.5], ["20260602T100000Z", 0.3]]
+    )
+    assert points == [("20260601T100000Z", 0.5), ("20260602T100000Z", 0.3)]
+    assert not warnings
+
+    points, _ = parse_transformed_stddevs_avg_points(
+        {
+            "id": ["step-1", "step-2"],
+            "transformed_stddevs_avg": [0.5, 0.3],
+        }
+    )
+    assert points == [("step-1", 0.5), ("step-2", 0.3)]
+
+    points, _ = parse_transformed_stddevs_avg_points(
+        [{"id": "step-3", "transformed_stddevs_avg": 0.2}]
+    )
+    assert points == [("step-3", 0.2)]
+
+    points, _ = parse_transformed_stddevs_avg_points([[1.0, 0.5], [2.0, 0.3]])
+    assert points == [("1", 0.5), ("2", 0.3)]
+
+
+def test_build_uncertainty_trend_skips_per_snapshot_when_disabled() -> None:
+    index = NSDFTripletIndex(
+        snapshots=[
+            NSDFSnapshotRef(suffix="20260601T100000Z", workflow_id="wf-trend", sort_key="20260601T100000Z"),
+        ],
+        by_workflow={
+            "wf-trend": [
+                NSDFSnapshotRef(suffix="20260601T100000Z", workflow_id="wf-trend", sort_key="20260601T100000Z"),
+            ],
+        },
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "surrogate.json"), "w", encoding="utf-8") as fh:
+            json.dump({"workflow_id": "wf-trend", "surrogate": [1.0, 2.0, 3.0, 4.0]}, fh)
+        paths = StrainDashboardPaths(local_json_path=os.path.join(tmp, "data.json"))
+        series = build_uncertainty_trend_series(
+            index,
+            paths,
+            workflow_id="wf-trend",
+            grid_size=(2, 2),
+            allow_per_snapshot_fallback=False,
+        )
+        assert series.step_ids == []
+        assert "catalog" in " ".join(series.warnings).lower()
+
+
+def test_build_uncertainty_trend_from_surrogate_paths() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "surrogate.json"), "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "workflow_id": "wf-trend",
+                    "transformed_stddevs_avg": [["a", 0.9], ["b", 0.4]],
+                },
+                fh,
+            )
+        paths = StrainDashboardPaths(
+            local_json_path=os.path.join(tmp, "data.json"),
+            surrogate_json_path=os.path.join(tmp, "surrogate.json"),
+            strict_triplet_paths=True,
+        )
+        series = build_uncertainty_trend_from_surrogate_paths(paths)
+        assert series is not None
+        assert series.step_ids == ["a", "b"]
+        assert series.y.tolist() == [0.9, 0.4]
+
+
+def test_build_uncertainty_trend_series_from_local_surrogates() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "surrogate.json"), "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "workflow_id": "wf-trend",
+                    "transformed_stddevs_avg": [
+                        ["20260601T100000Z", 0.9],
+                        ["20260602T100000Z", 0.6],
+                        ["20260603T100000Z", 0.4],
+                    ],
+                },
+                fh,
+            )
+        with open(os.path.join(tmp, "data.json"), "w", encoding="utf-8") as fh:
+            json.dump(_base_data(), fh)
+
+        index = NSDFTripletIndex(
+            snapshots=[
+                NSDFSnapshotRef(suffix="20260603T100000Z", workflow_id="wf-trend", sort_key="20260603T100000Z"),
+                NSDFSnapshotRef(suffix="20260602T100000Z", workflow_id="wf-trend", sort_key="20260602T100000Z"),
+                NSDFSnapshotRef(suffix="20260601T100000Z", workflow_id="wf-trend", sort_key="20260601T100000Z"),
+            ],
+            by_workflow={
+                "wf-trend": [
+                    NSDFSnapshotRef(suffix="20260603T100000Z", workflow_id="wf-trend", sort_key="20260603T100000Z"),
+                    NSDFSnapshotRef(suffix="20260602T100000Z", workflow_id="wf-trend", sort_key="20260602T100000Z"),
+                    NSDFSnapshotRef(suffix="20260601T100000Z", workflow_id="wf-trend", sort_key="20260601T100000Z"),
+                ],
+            },
+        )
+        paths = StrainDashboardPaths(local_json_path=os.path.join(tmp, "data.json"))
+        series = build_uncertainty_trend_series(
+            index,
+            paths,
+            workflow_id="wf-trend",
+            current_snapshot="20260602T100000Z",
+            grid_size=(11, 11),
+            surrogate_paths=StrainDashboardPaths(local_json_path=os.path.join(tmp, "data.json")),
+        )
+        assert series.step_ids == [
+            "20260601T100000Z",
+            "20260602T100000Z",
+            "20260603T100000Z",
+        ]
+        assert series.y.tolist() == [0.9, 0.6, 0.4]
+        assert series.current_index == 1
+
+
+def test_next_x_object_schema_single_point() -> None:
+    doc = {
+        "workflow_id": "workflow-id",
+        "dataset_x_size": 2,
+        "data": [[1.0, 2.0]],
+    }
+    info = validate_nsdf_next_x_doc(doc)
+    assert len(info.entries) == 1
+    assert info.entries[0].workflow_id == "workflow-id"
+    assert info.entries[0].coordinates.shape == (1, 2)
+    assert float(info.entries[0].coordinates[0, 0]) == 1.0
+    assert float(info.entries[0].coordinates[0, 1]) == 2.0
+    assert info.total_points == 1
+
+
+def test_next_x_object_schema_loads_from_local_bundle() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        data_path = os.path.join(tmp, "data.json")
+        next_x_path = os.path.join(tmp, "next_x.json")
+        with open(data_path, "w", encoding="utf-8") as fh:
+            json.dump(_base_data(), fh)
+        with open(next_x_path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "workflow_id": "wf-single",
+                    "dataset_x_size": 2,
+                    "data": [[4.0, 5.0]],
+                },
+                fh,
+            )
+
+        bundle = load_nsdf_json_bundle(StrainDashboardPaths(local_json_path=data_path))
+        assert isinstance(bundle.next_x, dict)
+        info = validate_nsdf_next_x_doc(bundle.next_x)
+        assert info.entries[0].workflow_id == "wf-single"
+        assert info.total_points == 1
+
+
 def test_normalize_gateway_prefix_to_data_json() -> None:
     base = (
         "https://us-east-1.gw.example.com/scientistcloud/test-chess"
@@ -501,6 +702,152 @@ def test_nsdf_version_suffix_triplet_and_apply() -> None:
     assert "data_20260606T223505Z.json" in versioned_remote.json_url
     assert versioned_remote.s3_data_key.endswith("data_20260606T223505Z.json")
     assert versioned_remote.s3_surrogate_key.endswith("surrogate_20260606T223505Z.json")
+
+
+def test_apply_nsdf_file_suffixes_accepts_latest_selector() -> None:
+    base = StrainDashboardPaths(local_data_dir="/tmp/chess-data")
+    with _local_files_first_for_testing():
+        versioned = apply_nsdf_file_suffixes(
+            base,
+            data_suffix="latest",
+            surrogate_suffix="latest",
+            next_x_suffix="latest",
+            strict=True,
+        )
+    assert versioned.local_json_path.endswith("data.json")
+    assert versioned.surrogate_json_path.endswith("surrogate.json")
+    assert versioned.next_x_json_path.endswith("next_x.json")
+
+
+def test_promote_gateway_preserves_strict_triplet_paths() -> None:
+    gateway = "https://gateway.example/bucket/prefix/data.json?access_key=a&secret_key=b"
+    paths = StrainDashboardPaths(
+        json_url=gateway,
+        strict_triplet_paths=True,
+        surrogate_version_suffix="20260602T100000Z",
+        next_x_version_suffix="",
+    )
+    promoted = lib.promote_gateway_json_url_to_s3_paths(paths)
+    assert promoted.strict_triplet_paths is True
+    assert promoted.surrogate_version_suffix == "20260602T100000Z"
+    assert promoted.s3_bucket == "bucket"
+    assert promoted.s3_data_key == "prefix/data.json"
+
+
+def test_prepare_nsdf_load_paths_sets_strict_s3_triplet_keys() -> None:
+    gateway = "https://gateway.example/bucket/prefix/data.json?access_key=a&secret_key=b"
+    paths = apply_nsdf_file_suffixes(
+        StrainDashboardPaths(json_url=gateway),
+        strict=True,
+    )
+    prepared = lib._prepare_nsdf_load_paths(paths)
+    assert prepared.strict_triplet_paths is True
+    assert prepared.s3_surrogate_key == "prefix/surrogate.json"
+    assert prepared.s3_next_x_key == "prefix/next_x.json"
+
+
+def test_iter_surrogate_s3_key_candidates_strict_skips_listing(monkeypatch) -> None:
+    def _should_not_run(*args, **kwargs):
+        raise AssertionError("S3 prefix listing should not run in strict mode")
+
+    monkeypatch.setattr(lib, "list_nsdf_version_suffixes_from_s3", _should_not_run)
+    monkeypatch.setattr(lib, "list_nsdf_surrogate_suffixes_from_s3", _should_not_run)
+    paths = StrainDashboardPaths(
+        s3_bucket="b",
+        s3_data_key="prefix/data.json",
+        s3_surrogate_key="prefix/surrogate.json",
+        strict_triplet_paths=True,
+    )
+    keys = lib._iter_surrogate_s3_key_candidates(paths, "prefix/data.json")
+    assert keys == ["prefix/surrogate.json"]
+
+
+def test_apply_nsdf_file_suffixes_keeps_explicit_s3_keys_for_latest() -> None:
+    paths = StrainDashboardPaths(
+        s3_bucket="b",
+        s3_data_key="chess-data/data.json",
+        s3_surrogate_key="test-chess/surrogate.json",
+        s3_next_x_key="test-chess/next_x.json",
+    )
+    versioned = apply_nsdf_file_suffixes(paths, strict=True)
+    assert versioned.s3_surrogate_key == "test-chess/surrogate.json"
+    assert versioned.s3_next_x_key == "test-chess/next_x.json"
+
+
+def test_apply_nsdf_file_suffixes_aligns_next_x_with_surrogate_prefix() -> None:
+    paths = StrainDashboardPaths(
+        s3_bucket="b",
+        s3_data_key="chess-data/data.json",
+        s3_surrogate_key="test-chess/surrogate.json",
+    )
+    versioned = apply_nsdf_file_suffixes(paths, strict=True)
+    assert versioned.s3_next_x_key == "test-chess/next_x.json"
+
+
+def test_data_s3_key_candidates_include_auxiliary_prefix() -> None:
+    paths = apply_nsdf_file_suffixes(
+        StrainDashboardPaths(
+            s3_bucket="b",
+            s3_data_key="chess-data/data.json",
+            s3_surrogate_key="test-chess/surrogate.json",
+        ),
+        strict=True,
+    )
+    assert lib._data_s3_key_candidates(paths) == [
+        "chess-data/data.json",
+        "test-chess/data.json",
+    ]
+
+
+def test_apply_nsdf_file_suffixes_independent() -> None:
+    base = StrainDashboardPaths(local_data_dir="/tmp/chess-data")
+    with _local_files_first_for_testing():
+        versioned = apply_nsdf_file_suffixes(
+            base,
+            data_suffix="20260601T100000Z",
+            surrogate_suffix="20260602T100000Z",
+            next_x_suffix="",
+            strict=True,
+        )
+    assert versioned.local_json_path.endswith("data_20260601T100000Z.json")
+    assert versioned.surrogate_json_path.endswith("surrogate_20260602T100000Z.json")
+    assert versioned.next_x_json_path.endswith("next_x.json")
+    assert versioned.strict_triplet_paths is True
+
+
+def test_resolve_auxiliary_suffix_for_data_snapshot() -> None:
+    available = ["20260601T100000Z", "20260603T100000Z"]
+    assert resolve_auxiliary_suffix_for_data_snapshot("latest", available) == "latest"
+    assert (
+        resolve_auxiliary_suffix_for_data_snapshot("20260601T100000Z", available)
+        == "20260601T100000Z"
+    )
+    assert (
+        resolve_auxiliary_suffix_for_data_snapshot("20260602T100000Z", available)
+        == "20260603T100000Z"
+    )
+    assert (
+        resolve_auxiliary_suffix_for_data_snapshot(
+            "20260607T201904Z",
+            ["20260607T201907Z", "20260607T201906Z"],
+        )
+        == "20260607T201906Z"
+    )
+
+
+def test_discover_auxiliary_version_options_from_directory() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        open(os.path.join(tmp, "surrogate.json"), "w", encoding="utf-8").close()
+        open(os.path.join(tmp, "surrogate_20260606T215241Z.json"), "w", encoding="utf-8").close()
+        open(os.path.join(tmp, "next_x_20260607T023932Z.json"), "w", encoding="utf-8").close()
+        paths = StrainDashboardPaths(local_data_dir=tmp)
+        with _local_files_first_for_testing():
+            sur_options = discover_nsdf_surrogate_version_options(paths)
+            nx_options = discover_nsdf_next_x_version_options(paths)
+        assert sur_options[0] == ("latest", "Latest (surrogate.json)")
+        assert ("20260606T215241Z", "20260606T215241Z") in sur_options
+        assert nx_options[0] == ("latest", "Latest (next_x.json)")
+        assert ("20260607T023932Z", "20260607T023932Z") in nx_options
 
 
 def test_list_nsdf_version_suffixes_from_directory() -> None:
@@ -944,6 +1291,198 @@ def test_nsdf_suffixes_after_reference() -> None:
         "20260606T223505Z",
     )
     assert after == ["20260606T223507Z"]
+
+
+def test_triplet_index_groups_snapshots_by_workflow() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "data.json"), "w", encoding="utf-8") as fh:
+            json.dump(_base_data(), fh)
+        with open(os.path.join(tmp, "surrogate.json"), "w", encoding="utf-8") as fh:
+            json.dump({"workflow_id": "wf-a", "surrogate": [1.0, 2.0, 3.0, 4.0]}, fh)
+        with open(os.path.join(tmp, "data_20260607T100000Z.json"), "w", encoding="utf-8") as fh:
+            json.dump(_base_data(), fh)
+        with open(os.path.join(tmp, "surrogate_20260607T100000Z.json"), "w", encoding="utf-8") as fh:
+            json.dump({"workflow_id": "wf-b", "surrogate": [1.0, 2.0, 3.0, 4.0]}, fh)
+        with open(os.path.join(tmp, "data_20260607T110000Z.json"), "w", encoding="utf-8") as fh:
+            json.dump(_base_data(), fh)
+        index = _build_triplet_index_from_directory(tmp)
+        assert index.has_workflow("wf-a")
+        assert index.has_workflow("wf-b")
+        assert not index.has_workflow(NSDF_UNKNOWN_WORKFLOW_ID)
+        assert index.default_snapshot_value("wf-b") == "20260607T110000Z"
+        assert resolve_default_workflow_selection(index) == "wf-a"
+        assert resolve_default_workflow_selection(
+            index,
+            dataset_workflow_id="wf-a",
+        ) == "wf-a"
+        assert resolve_default_workflow_selection(
+            index,
+            dataset_workflow_id="wf-b",
+        ) == "wf-b"
+        wf_b_opts = index.snapshot_select_options("wf-b")
+        assert ("20260607T100000Z", "20260607T100000Z") in wf_b_opts
+        assert ("20260607T110000Z", "20260607T110000Z") in wf_b_opts
+
+
+def test_triplet_index_infers_workflow_from_nearby_auxiliary_timestamps() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "data_20260607T201904Z.json"), "w", encoding="utf-8") as fh:
+            json.dump(_base_data(), fh)
+        with open(os.path.join(tmp, "surrogate_20260607T201907Z.json"), "w", encoding="utf-8") as fh:
+            json.dump({"workflow_id": "wf-offset", "surrogate": [1.0, 2.0, 3.0, 4.0]}, fh)
+        with open(os.path.join(tmp, "next_x_20260607T201906Z.json"), "w", encoding="utf-8") as fh:
+            json.dump({"workflow_id": "wf-offset", "data": [[1.0, 2.0]]}, fh)
+        index = _build_triplet_index_from_directory(tmp)
+        assert index.has_workflow("wf-offset")
+        assert index.snapshots_for_workflow("wf-offset")[0].suffix == "20260607T201904Z"
+
+
+def test_triplet_index_prefers_data_json_workflow_id_when_present() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "data_20260607T120000Z.json"), "w", encoding="utf-8") as fh:
+            json.dump({**_base_data(), "workflow_id": "wf-from-data"}, fh)
+        with open(os.path.join(tmp, "surrogate_20260607T120500Z.json"), "w", encoding="utf-8") as fh:
+            json.dump({"workflow_id": "wf-from-surrogate", "surrogate": [1.0, 2.0, 3.0, 4.0]}, fh)
+        index = _build_triplet_index_from_directory(tmp)
+        assert index.has_workflow("wf-from-data")
+        assert not index.has_workflow("wf-from-surrogate")
+
+
+def test_scientistcloud_dataset_is_remote_linked() -> None:
+    assert scientistcloud_dataset_is_remote_linked({"server": "true"})
+    assert scientistcloud_dataset_is_remote_linked(
+        {"google_drive_link": "https://gateway.example/bucket/data.json"}
+    )
+    assert not scientistcloud_dataset_is_remote_linked(
+        {"google_drive_link": "/mnt/visus_datasets/upload/uuid/data.json"}
+    )
+    assert scientistcloud_dataset_is_remote_linked(
+        None,
+        server_param="true",
+    )
+
+
+def test_resolve_strain_paths_remote_linked_skips_upload_mirror() -> None:
+    with tempfile.TemporaryDirectory() as upload_dir:
+        data_path = os.path.join(upload_dir, "data.json")
+        with open(data_path, "w", encoding="utf-8") as fh:
+            json.dump(_base_data(), fh)
+        gateway = "https://gateway.example/bucket/prefix/data.json?access_key=a&secret_key=b"
+        paths = resolve_strain_paths_for_session(
+            base_dir=upload_dir,
+            save_dir="",
+            query_strain_json_url=gateway,
+            remote_linked=True,
+        )
+        assert paths.local_json_path == ""
+        assert paths.json_url == gateway
+
+
+def test_discover_triplet_index_remote_linked_never_uses_local(monkeypatch) -> None:
+    with tempfile.TemporaryDirectory() as upload_dir:
+        with open(os.path.join(upload_dir, "data.json"), "w", encoding="utf-8") as fh:
+            json.dump(_base_data(), fh)
+
+        local_calls: list[str] = []
+
+        def _fake_empty_s3(paths, mongo_s3_auth=None):
+            return NSDFTripletIndex()
+
+        def _fake_local_index(directory: str) -> NSDFTripletIndex:
+            local_calls.append(directory)
+            raise AssertionError("local index should not run for remote-linked datasets")
+
+        monkeypatch.setattr(lib, "_build_triplet_index_from_s3", _fake_empty_s3)
+        monkeypatch.setattr(lib, "_build_triplet_index_from_directory", _fake_local_index)
+
+        paths = StrainDashboardPaths(
+            s3_bucket="my-bucket",
+            s3_data_key="prefix/data.json",
+            local_json_path=os.path.join(upload_dir, "data.json"),
+        )
+        discover_nsdf_triplet_index(
+            paths,
+            base_dir=upload_dir,
+            save_dir="",
+            remote_linked=True,
+        )
+        assert local_calls == []
+
+
+def test_discover_triplet_index_prefers_s3_over_sparse_portal_mirror(monkeypatch) -> None:
+    """Portal upload dirs often mirror only latest JSON; catalog must list S3 prefix."""
+    with tempfile.TemporaryDirectory() as upload_dir:
+        with open(os.path.join(upload_dir, "data.json"), "w", encoding="utf-8") as fh:
+            json.dump(_base_data(), fh)
+
+        s3_snap = NSDFSnapshotRef(
+            suffix="",
+            workflow_id="wf-from-s3",
+            sort_key="z_latest",
+        )
+        s3_index = NSDFTripletIndex(
+            snapshots=[s3_snap],
+            by_workflow={"wf-from-s3": [s3_snap]},
+        )
+        local_calls: list[str] = []
+
+        def _fake_s3_index(paths, mongo_s3_auth=None):
+            return s3_index
+
+        def _fake_local_index(directory: str) -> NSDFTripletIndex:
+            local_calls.append(directory)
+            unknown_snap = NSDFSnapshotRef(
+                suffix="",
+                workflow_id=NSDF_UNKNOWN_WORKFLOW_ID,
+                sort_key="z_latest",
+            )
+            return NSDFTripletIndex(
+                snapshots=[unknown_snap],
+                by_workflow={NSDF_UNKNOWN_WORKFLOW_ID: [unknown_snap]},
+            )
+
+        monkeypatch.setattr(lib, "_build_triplet_index_from_s3", _fake_s3_index)
+        monkeypatch.setattr(lib, "_build_triplet_index_from_directory", _fake_local_index)
+
+        paths = StrainDashboardPaths(
+            local_json_path=os.path.join(upload_dir, "data.json"),
+            json_url="https://gateway.example/bucket/prefix/data.json",
+            s3_bucket="my-bucket",
+            s3_data_key="prefix/data.json",
+        )
+        index = discover_nsdf_triplet_index(
+            paths,
+            base_dir=upload_dir,
+            save_dir="",
+        )
+        assert index.has_workflow("wf-from-s3")
+        assert local_calls == []
+
+
+def test_discover_triplet_index_falls_back_to_local_when_s3_empty(monkeypatch) -> None:
+    with tempfile.TemporaryDirectory() as upload_dir:
+        with open(os.path.join(upload_dir, "data.json"), "w", encoding="utf-8") as fh:
+            json.dump(_base_data(), fh)
+
+        local_calls: list[str] = []
+
+        def _fake_empty_s3(paths, mongo_s3_auth=None):
+            return NSDFTripletIndex()
+
+        def _fake_local_index(directory: str) -> NSDFTripletIndex:
+            local_calls.append(directory)
+            return _build_triplet_index_from_directory(directory)
+
+        monkeypatch.setattr(lib, "_build_triplet_index_from_s3", _fake_empty_s3)
+        monkeypatch.setattr(lib, "_build_triplet_index_from_directory", _fake_local_index)
+
+        paths = StrainDashboardPaths(
+            s3_bucket="my-bucket",
+            s3_data_key="prefix/data.json",
+        )
+        index = discover_nsdf_triplet_index(paths, base_dir=upload_dir, save_dir="")
+        assert local_calls == [upload_dir]
+        assert index.has_workflow(NSDF_UNKNOWN_WORKFLOW_ID)
 
 
 def test_s3_surrogate_fallback_when_latest_triplet_missing() -> None:
