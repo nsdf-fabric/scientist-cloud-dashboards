@@ -474,28 +474,43 @@ def test_next_x_validation_skips_bad_rows() -> None:
 
 
 def test_parse_transformed_stddevs_avg_points() -> None:
-    points, warnings = parse_transformed_stddevs_avg_points([[1.0, 0.5], [2.0, 0.3]])
-    assert points == [(1.0, 0.5), (2.0, 0.3)]
+    points, warnings = parse_transformed_stddevs_avg_points(
+        [["20260601T100000Z", 0.5], ["20260602T100000Z", 0.3]]
+    )
+    assert points == [("20260601T100000Z", 0.5), ("20260602T100000Z", 0.3)]
     assert not warnings
 
-    points, _ = parse_transformed_stddevs_avg_points({"x": [1, 2], "y": [0.5, 0.3]})
-    assert points == [(1.0, 0.5), (2.0, 0.3)]
+    points, _ = parse_transformed_stddevs_avg_points(
+        {
+            "id": ["step-1", "step-2"],
+            "transformed_stddevs_avg": [0.5, 0.3],
+        }
+    )
+    assert points == [("step-1", 0.5), ("step-2", 0.3)]
 
-    points, _ = parse_transformed_stddevs_avg_points({"x": 3, "y": 0.2})
-    assert points == [(3.0, 0.2)]
+    points, _ = parse_transformed_stddevs_avg_points(
+        [{"id": "step-3", "transformed_stddevs_avg": 0.2}]
+    )
+    assert points == [("step-3", 0.2)]
+
+    points, _ = parse_transformed_stddevs_avg_points([[1.0, 0.5], [2.0, 0.3]])
+    assert points == [("1", 0.5), ("2", 0.3)]
 
 
 def test_build_uncertainty_trend_series_from_local_surrogates() -> None:
     with tempfile.TemporaryDirectory() as tmp:
-        for idx, y_val in enumerate((0.9, 0.6, 0.4), start=1):
-            with open(os.path.join(tmp, f"surrogate_2026060{idx}T100000Z.json"), "w", encoding="utf-8") as fh:
-                json.dump(
-                    {
-                        "workflow_id": "wf-trend",
-                        "transformed_stddevs_avg": [[float(idx), y_val]],
-                    },
-                    fh,
-                )
+        with open(os.path.join(tmp, "surrogate.json"), "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "workflow_id": "wf-trend",
+                    "transformed_stddevs_avg": [
+                        ["20260601T100000Z", 0.9],
+                        ["20260602T100000Z", 0.6],
+                        ["20260603T100000Z", 0.4],
+                    ],
+                },
+                fh,
+            )
         with open(os.path.join(tmp, "data.json"), "w", encoding="utf-8") as fh:
             json.dump(_base_data(), fh)
 
@@ -520,8 +535,13 @@ def test_build_uncertainty_trend_series_from_local_surrogates() -> None:
             workflow_id="wf-trend",
             current_snapshot="20260602T100000Z",
             grid_size=(11, 11),
+            surrogate_paths=StrainDashboardPaths(local_json_path=os.path.join(tmp, "data.json")),
         )
-        assert series.x.tolist() == [1.0, 2.0, 3.0]
+        assert series.step_ids == [
+            "20260601T100000Z",
+            "20260602T100000Z",
+            "20260603T100000Z",
+        ]
         assert series.y.tolist() == [0.9, 0.6, 0.4]
         assert series.current_index == 1
 
@@ -1134,8 +1154,8 @@ def test_triplet_index_groups_snapshots_by_workflow() -> None:
         index = _build_triplet_index_from_directory(tmp)
         assert index.has_workflow("wf-a")
         assert index.has_workflow("wf-b")
-        assert index.has_workflow(NSDF_UNKNOWN_WORKFLOW_ID)
-        assert index.default_snapshot_value("wf-b") == "20260607T100000Z"
+        assert not index.has_workflow(NSDF_UNKNOWN_WORKFLOW_ID)
+        assert index.default_snapshot_value("wf-b") == "20260607T110000Z"
         assert resolve_default_workflow_selection(index) == "wf-a"
         assert resolve_default_workflow_selection(
             index,
@@ -1145,8 +1165,33 @@ def test_triplet_index_groups_snapshots_by_workflow() -> None:
             index,
             dataset_workflow_id="wf-b",
         ) == "wf-b"
-        unknown_opts = index.snapshot_select_options(NSDF_UNKNOWN_WORKFLOW_ID)
-        assert unknown_opts == [("20260607T110000Z", "20260607T110000Z")]
+        wf_b_opts = index.snapshot_select_options("wf-b")
+        assert ("20260607T100000Z", "20260607T100000Z") in wf_b_opts
+        assert ("20260607T110000Z", "20260607T110000Z") in wf_b_opts
+
+
+def test_triplet_index_infers_workflow_from_nearby_auxiliary_timestamps() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "data_20260607T201904Z.json"), "w", encoding="utf-8") as fh:
+            json.dump(_base_data(), fh)
+        with open(os.path.join(tmp, "surrogate_20260607T201907Z.json"), "w", encoding="utf-8") as fh:
+            json.dump({"workflow_id": "wf-offset", "surrogate": [1.0, 2.0, 3.0, 4.0]}, fh)
+        with open(os.path.join(tmp, "next_x_20260607T201906Z.json"), "w", encoding="utf-8") as fh:
+            json.dump({"workflow_id": "wf-offset", "data": [[1.0, 2.0]]}, fh)
+        index = _build_triplet_index_from_directory(tmp)
+        assert index.has_workflow("wf-offset")
+        assert index.snapshots_for_workflow("wf-offset")[0].suffix == "20260607T201904Z"
+
+
+def test_triplet_index_prefers_data_json_workflow_id_when_present() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "data_20260607T120000Z.json"), "w", encoding="utf-8") as fh:
+            json.dump({**_base_data(), "workflow_id": "wf-from-data"}, fh)
+        with open(os.path.join(tmp, "surrogate_20260607T120500Z.json"), "w", encoding="utf-8") as fh:
+            json.dump({"workflow_id": "wf-from-surrogate", "surrogate": [1.0, 2.0, 3.0, 4.0]}, fh)
+        index = _build_triplet_index_from_directory(tmp)
+        assert index.has_workflow("wf-from-data")
+        assert not index.has_workflow("wf-from-surrogate")
 
 
 def test_scientistcloud_dataset_is_remote_linked() -> None:

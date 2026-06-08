@@ -152,6 +152,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (  # noqa: E402
     UncertaintyTrendSeries,
     _snapshot_index_in_series,
     _snapshots_chronological,
+    _trend_current_index,
     build_uncertainty_trend_series,
     apply_nsdf_file_suffixes,
     discover_nsdf_next_x_version_options,
@@ -901,10 +902,11 @@ else:
         plot_cfg.grid_size = _grid_size_from_controls()
 
     def _uncertainty_trend_points_cache_key(workflow_id: str, index: NSDFTripletIndex) -> str:
-        base_paths = _resolve_base_paths()
+        resolved = _resolve_paths()
         return (
             f"{workflow_id}|{len(index.snapshots_for_workflow(workflow_id))}|"
-            f"{base_paths.s3_data_key}|{base_paths.local_json_path}|{_remote_linked}|"
+            f"{resolved.s3_surrogate_key}|{resolved.surrogate_json_path}|"
+            f"{resolved.surrogate_version_suffix}|{_remote_linked}|"
             f"{plot_cfg.grid_size[0]}x{plot_cfg.grid_size[1]}"
         )
 
@@ -923,7 +925,11 @@ else:
             and isinstance(cached, UncertaintyTrendSeries)
         ):
             chrono = _snapshots_chronological(index.snapshots_for_workflow(workflow))
-            current_index = _snapshot_index_in_series(chrono, current_snap, int(cached.x.size))
+            current_index = _trend_current_index(
+                cached.step_ids,
+                current_snapshot=current_snap,
+                chrono_snaps=chrono,
+            )
             return replace(cached, current_index=current_index)
 
         series = build_uncertainty_trend_series(
@@ -934,6 +940,7 @@ else:
             grid_size=plot_cfg.grid_size,
             mongo_s3_auth=_dataset_s3_auth_override(),
             remote_linked=_remote_linked,
+            surrogate_paths=_resolve_paths(),
         )
         grid_state["uncertainty_trend_points_key"] = cache_key
         grid_state["uncertainty_trend_points"] = replace(series, current_index=None)

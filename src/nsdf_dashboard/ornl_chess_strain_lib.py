@@ -416,7 +416,7 @@ class StrainFieldPlotConfig:
     title_estimate: str = "Prediction"
     title_variance: str = "Uncertainty"
     title_uncertainty_trend: str = "Uncertainty trend"
-    trend_x_axis_label: str = "scan step"
+    trend_x_axis_label: str = "time step"
     trend_y_axis_label: str = "avg uncertainty"
     flip_y_for_display: bool = True
     colormap_estimate: str = "Viridis256"
@@ -436,9 +436,9 @@ class StrainFieldGrids:
 
 @dataclass
 class UncertaintyTrendSeries:
-    """Average uncertainty (plot 3) vs scan step for one workflow."""
+    """Average uncertainty (plot 3) vs time-step id for one workflow."""
 
-    x: np.ndarray
+    step_ids: List[str]
     y: np.ndarray
     labels: List[str]
     current_index: Optional[int] = None
@@ -1531,20 +1531,150 @@ def _parse_next_x_workflow_block(
     )
 
 
+def _collect_auxiliary_workflow_maps(
+    groups: Dict[str, Dict[str, str]],
+    read_doc: Any,
+) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Map timestamp suffix -> workflow_id from surrogate and next_x files."""
+    surrogate_wf: Dict[str, str] = {}
+    next_x_wf: Dict[str, str] = {}
+    for suffix, files in groups.items():
+        sur_path = (files.get("surrogate") or "").strip()
+        if sur_path:
+            wf = _peek_workflow_id_from_json_doc(read_doc(sur_path))
+            if wf:
+                surrogate_wf[suffix] = wf
+        nx_path = (files.get("next_x") or "").strip()
+        if nx_path:
+            wf = _peek_workflow_id_from_next_x_doc(read_doc(nx_path))
+            if wf:
+                next_x_wf[suffix] = wf
+    return surrogate_wf, next_x_wf
+
+
+def _nearest_auxiliary_workflow_id(
+    data_suffix: str,
+    surrogate_wf: Mapping[str, str],
+    next_x_wf: Mapping[str, str],
+) -> Optional[str]:
+    """
+    Infer workflow_id for a data snapshot from nearby surrogate/next_x timestamps.
+
+    Prefers surrogate workflow_id when surrogate and next_x are equally close.
+    """
+    key = (data_suffix or "").strip()
+    if not key:
+        return surrogate_wf.get("") or next_x_wf.get("")
+
+    target_dt = _parse_nsdf_iso_suffix_timestamp(key)
+    if target_dt is None:
+        return None
+
+    best_wf: Optional[str] = None
+    best_delta: Optional[float] = None
+    best_is_surrogate = False
+
+    for wf_map, is_surrogate in ((surrogate_wf, True), (next_x_wf, False)):
+        for suffix, workflow_id in wf_map.items():
+            if not (suffix or "").strip():
+                continue
+            candidate_dt = _parse_nsdf_iso_suffix_timestamp(suffix)
+            if candidate_dt is None:
+                continue
+            delta = abs((candidate_dt - target_dt).total_seconds())
+            if best_wf is None or delta < best_delta or (
+                delta == best_delta and is_surrogate and not best_is_surrogate
+            ):
+                best_wf = workflow_id
+                best_delta = delta
+                best_is_surrogate = is_surrogate
+    return best_wf
+
+
+def _attribute_workflow_for_data_snapshot(
+    *,
+    data_suffix: str,
+    data_doc: Any = None,
+    surrogate_doc: Any = None,
+    next_x_doc: Any = None,
+    surrogate_wf_by_suffix: Optional[Mapping[str, str]] = None,
+    next_x_wf_by_suffix: Optional[Mapping[str, str]] = None,
+) -> str:
+    """
+    Resolve workflow_id for a ``data.json`` snapshot.
+
+    Order: explicit ``data.json`` id (new files), same-suffix surrogate/next_x,
+    then nearest-timestamp surrogate/next_x for backward compatibility.
+    """
+    workflow_id = _peek_workflow_id_from_json_doc(data_doc)
+    if workflow_id:
+        return workflow_id
+    workflow_id = _peek_workflow_id_from_json_doc(surrogate_doc)
+    if workflow_id:
+        return workflow_id
+    workflow_id = _peek_workflow_id_from_next_x_doc(next_x_doc)
+    if workflow_id:
+        return workflow_id
+
+    surrogate_wf = surrogate_wf_by_suffix or {}
+    next_x_wf = next_x_wf_by_suffix or {}
+    nearest = _nearest_auxiliary_workflow_id(data_suffix, surrogate_wf, next_x_wf)
+    if nearest:
+        return nearest
+    return NSDF_UNKNOWN_WORKFLOW_ID
+
+
 def _attribute_workflow_to_triplet_files(
     *,
     surrogate_doc: Any = None,
     data_doc: Any = None,
     next_x_doc: Any = None,
 ) -> str:
-    for doc in (surrogate_doc, data_doc, next_x_doc):
-        workflow_id = _peek_workflow_id_from_json_doc(doc)
-        if workflow_id:
-            return workflow_id
-    workflow_id = _peek_workflow_id_from_next_x_doc(next_x_doc)
-    if workflow_id:
-        return workflow_id
-    return NSDF_UNKNOWN_WORKFLOW_ID
+    return _attribute_workflow_for_data_snapshot(
+        data_suffix="",
+        data_doc=data_doc,
+        surrogate_doc=surrogate_doc,
+        next_x_doc=next_x_doc,
+    )
+
+
+def _build_triplet_index_from_groups(
+    groups: Dict[str, Dict[str, str]],
+    *,
+    read_doc: Any,
+) -> NSDFTripletIndex:
+    surrogate_wf_by_suffix, next_x_wf_by_suffix = _collect_auxiliary_workflow_maps(
+        groups,
+        read_doc,
+    )
+    snapshots: List[NSDFSnapshotRef] = []
+    by_workflow: Dict[str, List[NSDFSnapshotRef]] = {}
+    for suffix in sorted(groups.keys(), key=_snapshot_sort_key, reverse=True):
+        files = groups[suffix]
+        data_loc = (files.get("data") or "").strip()
+        if not data_loc:
+            continue
+        surrogate_doc = read_doc((files.get("surrogate") or "").strip())
+        data_doc = read_doc(data_loc)
+        next_x_doc = read_doc((files.get("next_x") or "").strip())
+        workflow_id = _attribute_workflow_for_data_snapshot(
+            data_suffix=suffix,
+            data_doc=data_doc,
+            surrogate_doc=surrogate_doc,
+            next_x_doc=next_x_doc,
+            surrogate_wf_by_suffix=surrogate_wf_by_suffix,
+            next_x_wf_by_suffix=next_x_wf_by_suffix,
+        )
+        ref = NSDFSnapshotRef(
+            suffix=suffix,
+            workflow_id=workflow_id,
+            sort_key=_snapshot_sort_key(suffix),
+        )
+        snapshots.append(ref)
+        by_workflow.setdefault(workflow_id, []).append(ref)
+    for workflow_id in by_workflow:
+        by_workflow[workflow_id].sort(key=lambda snap: snap.sort_key, reverse=True)
+    return NSDFTripletIndex(snapshots=snapshots, by_workflow=by_workflow)
 
 
 def _triplet_groups_from_object_keys(keys: Sequence[str]) -> Dict[str, Dict[str, str]]:
@@ -1586,31 +1716,11 @@ def _build_triplet_index_from_directory(directory: str) -> NSDFTripletIndex:
         return NSDFTripletIndex()
     keys = [os.path.join(d, name) for name in names if name.endswith(".json")]
     groups = _triplet_groups_from_object_keys(keys)
-    snapshots: List[NSDFSnapshotRef] = []
-    by_workflow: Dict[str, List[NSDFSnapshotRef]] = {}
-    for suffix in sorted(groups.keys(), key=_snapshot_sort_key, reverse=True):
-        files = groups[suffix]
-        data_path = files.get("data") or ""
-        if not data_path:
-            continue
-        surrogate_doc = _read_json_if_exists_local(files.get("surrogate") or "")
-        data_doc = _read_json_if_exists_local(data_path)
-        next_x_doc = _read_json_if_exists_local(files.get("next_x") or "")
-        workflow_id = _attribute_workflow_to_triplet_files(
-            surrogate_doc=surrogate_doc,
-            data_doc=data_doc,
-            next_x_doc=next_x_doc,
-        )
-        ref = NSDFSnapshotRef(
-            suffix=suffix,
-            workflow_id=workflow_id,
-            sort_key=_snapshot_sort_key(suffix),
-        )
-        snapshots.append(ref)
-        by_workflow.setdefault(workflow_id, []).append(ref)
-    for workflow_id in by_workflow:
-        by_workflow[workflow_id].sort(key=lambda snap: snap.sort_key, reverse=True)
-    return NSDFTripletIndex(snapshots=snapshots, by_workflow=by_workflow)
+
+    def read_doc(path: str) -> Any:
+        return _read_json_if_exists_local(path)
+
+    return _build_triplet_index_from_groups(groups, read_doc=read_doc)
 
 
 def _list_nsdf_object_keys_from_s3(
@@ -1701,31 +1811,10 @@ def _build_triplet_index_from_s3(
     except Exception:
         return NSDFTripletIndex()
 
-    snapshots: List[NSDFSnapshotRef] = []
-    by_workflow: Dict[str, List[NSDFSnapshotRef]] = {}
-    for suffix in sorted(groups.keys(), key=_snapshot_sort_key, reverse=True):
-        files = groups[suffix]
-        data_key = files.get("data") or ""
-        if not data_key:
-            continue
-        surrogate_doc = _read_json_if_exists_s3(client, bucket, files.get("surrogate") or "")
-        data_doc = _read_json_if_exists_s3(client, bucket, data_key)
-        next_x_doc = _read_json_if_exists_s3(client, bucket, files.get("next_x") or "")
-        workflow_id = _attribute_workflow_to_triplet_files(
-            surrogate_doc=surrogate_doc,
-            data_doc=data_doc,
-            next_x_doc=next_x_doc,
-        )
-        ref = NSDFSnapshotRef(
-            suffix=suffix,
-            workflow_id=workflow_id,
-            sort_key=_snapshot_sort_key(suffix),
-        )
-        snapshots.append(ref)
-        by_workflow.setdefault(workflow_id, []).append(ref)
-    for workflow_id in by_workflow:
-        by_workflow[workflow_id].sort(key=lambda snap: snap.sort_key, reverse=True)
-    return NSDFTripletIndex(snapshots=snapshots, by_workflow=by_workflow)
+    def read_doc(key: str) -> Any:
+        return _read_json_if_exists_s3(client, bucket, key)
+
+    return _build_triplet_index_from_groups(groups, read_doc=read_doc)
 
 
 def discover_nsdf_triplet_index(
@@ -4055,79 +4144,142 @@ def format_nsdf_workflow_display(
     return f"Workflow ID: {workflow_id}"
 
 
+def _coerce_trend_step_id(value: Any) -> Optional[str]:
+    """Normalize a time-step id for the uncertainty trend x-axis."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        step_id = value.strip()
+        return step_id or None
+    if _is_number(value):
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            return None
+        if numeric == int(numeric):
+            return str(int(numeric))
+        return str(numeric)
+    text = str(value).strip()
+    return text or None
+
+
+def _parse_trend_y_value(value: Any) -> Optional[float]:
+    if not _is_number(value):
+        return None
+    numeric = float(value)
+    return numeric if math.isfinite(numeric) else None
+
+
+def _append_transformed_stddevs_avg_point(
+    points: List[Tuple[str, float]],
+    *,
+    step_id_raw: Any,
+    y_raw: Any,
+    index: int,
+    warnings: List[str],
+) -> None:
+    step_id = _coerce_trend_step_id(step_id_raw)
+    y_val = _parse_trend_y_value(y_raw)
+    if step_id is None:
+        warnings.append(
+            f"Skipping transformed_stddevs_avg[{index}]: time-step id must be a non-empty string."
+        )
+        return
+    if y_val is None:
+        warnings.append(
+            f"Skipping transformed_stddevs_avg[{index}]: average uncertainty must be numeric."
+        )
+        return
+    points.append((step_id, y_val))
+
+
 def parse_transformed_stddevs_avg_points(
     value: Any,
-) -> Tuple[List[Tuple[float, float]], List[str]]:
+) -> Tuple[List[Tuple[str, float]], List[str]]:
     """
     Parse ``transformed_stddevs_avg`` from ``surrogate.json``.
 
-    Accepts ``[[x, y], ...]``, ``{"x": [...], "y": [...]}``, or a single
-    ``{"x": n, "y": m}`` / ``[x, y]`` point.
+    Primary format: ``[[id, avg], ...]`` where ``id`` is a time-step string and
+    ``avg`` is a float. Also accepts legacy numeric ``[[x, y], ...]``,
+    ``{"id": [...], "transformed_stddevs_avg": [...]}``, and ``{"x": [...], "y": [...]}``.
     """
     warnings: List[str] = []
     if value is None:
         return [], warnings
     if isinstance(value, Mapping):
-        xs = value.get("x")
-        ys = value.get("y")
-        if isinstance(xs, list) and isinstance(ys, list):
-            if len(xs) != len(ys):
+        ids = value.get("id")
+        if ids is None:
+            ids = value.get("x")
+        ys = value.get("transformed_stddevs_avg")
+        if ys is None:
+            ys = value.get("y")
+        if isinstance(ids, list) and isinstance(ys, list):
+            if len(ids) != len(ys):
                 warnings.append(
-                    "Skipping transformed_stddevs_avg: x and y arrays have different lengths."
+                    "Skipping transformed_stddevs_avg: id and value arrays have different lengths."
                 )
                 return [], warnings
-            points: List[Tuple[float, float]] = []
-            for i, (x_raw, y_raw) in enumerate(zip(xs, ys)):
-                if not (_is_number(x_raw) and _is_number(y_raw)):
-                    warnings.append(
-                        f"Skipping transformed_stddevs_avg[{i}]: x and y must be numeric."
-                    )
-                    continue
-                x_val, y_val = float(x_raw), float(y_raw)
-                if not (math.isfinite(x_val) and math.isfinite(y_val)):
-                    warnings.append(
-                        f"Skipping transformed_stddevs_avg[{i}]: x and y must be finite."
-                    )
-                    continue
-                points.append((x_val, y_val))
+            points: List[Tuple[str, float]] = []
+            for i, (id_raw, y_raw) in enumerate(zip(ids, ys)):
+                _append_transformed_stddevs_avg_point(
+                    points,
+                    step_id_raw=id_raw,
+                    y_raw=y_raw,
+                    index=i,
+                    warnings=warnings,
+                )
             return points, warnings
-        if _is_number(xs) and _is_number(ys):
-            return [(float(xs), float(ys))], warnings
+        if ids is not None or ys is not None:
+            _append_transformed_stddevs_avg_point(
+                points := [],
+                step_id_raw=ids,
+                y_raw=ys,
+                index=0,
+                warnings=warnings,
+            )
+            return points, warnings
         warnings.append(
-            "Skipping transformed_stddevs_avg: expected point pairs or parallel x/y arrays."
+            "Skipping transformed_stddevs_avg: expected [id, avg] pairs or parallel id/value arrays."
         )
         return [], warnings
     if isinstance(value, list):
         if not value:
             return [], warnings
-        if len(value) == 2 and _is_number(value[0]) and _is_number(value[1]):
-            return [(float(value[0]), float(value[1]))], warnings
+        if len(value) == 2 and not isinstance(value[0], (list, Mapping)):
+            points = []
+            _append_transformed_stddevs_avg_point(
+                points,
+                step_id_raw=value[0],
+                y_raw=value[1],
+                index=0,
+                warnings=warnings,
+            )
+            return points, warnings
         points = []
         for i, item in enumerate(value):
             if isinstance(item, list) and len(item) >= 2:
-                x_raw, y_raw = item[0], item[1]
+                id_raw, y_raw = item[0], item[1]
             elif isinstance(item, Mapping):
-                x_raw, y_raw = item.get("x"), item.get("y")
+                id_raw = item.get("id")
+                if id_raw is None:
+                    id_raw = item.get("x")
+                y_raw = item.get("transformed_stddevs_avg")
+                if y_raw is None:
+                    y_raw = item.get("y")
             else:
                 warnings.append(
-                    f"Skipping transformed_stddevs_avg[{i}]: expected [x, y] or {{x, y}}."
+                    f"Skipping transformed_stddevs_avg[{i}]: expected [id, avg] or {{id, transformed_stddevs_avg}}."
                 )
                 continue
-            if not (_is_number(x_raw) and _is_number(y_raw)):
-                warnings.append(
-                    f"Skipping transformed_stddevs_avg[{i}]: x and y must be numeric."
-                )
-                continue
-            x_val, y_val = float(x_raw), float(y_raw)
-            if not (math.isfinite(x_val) and math.isfinite(y_val)):
-                warnings.append(
-                    f"Skipping transformed_stddevs_avg[{i}]: x and y must be finite."
-                )
-                continue
-            points.append((x_val, y_val))
+            _append_transformed_stddevs_avg_point(
+                points,
+                step_id_raw=id_raw,
+                y_raw=y_raw,
+                index=i,
+                warnings=warnings,
+            )
         return points, warnings
     warnings.append(
-        "Skipping transformed_stddevs_avg: expected a list or object with x/y coordinates."
+        "Skipping transformed_stddevs_avg: expected a list or object with id/value pairs."
     )
     return [], warnings
 
@@ -4166,8 +4318,9 @@ def _uncertainty_point_from_surrogate_doc(
     *,
     grid_size: Tuple[int, int],
     step_index: int,
-) -> Tuple[Optional[float], Optional[float], str]:
-    """Return (x, y, source) for one snapshot's contribution to the trend line."""
+    step_id: str = "",
+) -> Tuple[Optional[str], Optional[float], str]:
+    """Return (step_id, y, source) for one snapshot's contribution to the trend line."""
     if not isinstance(surrogate_doc, Mapping):
         return None, None, "none"
     points, _ = parse_transformed_stddevs_avg_points(
@@ -4176,11 +4329,12 @@ def _uncertainty_point_from_surrogate_doc(
     if len(points) == 1:
         return points[0][0], points[0][1], "transformed_stddevs_avg"
     if len(points) > 1:
-        x_val, y_val = points[-1]
-        return x_val, y_val, "transformed_stddevs_avg"
+        step, y_val = points[-1]
+        return step, y_val, "transformed_stddevs_avg"
     mean_val = _mean_uncertainty_from_surrogate_doc(surrogate_doc, grid_size=grid_size)
     if mean_val is not None:
-        return float(step_index), mean_val, "uncertainty_grid_mean"
+        fallback_id = (step_id or "").strip() or str(step_index)
+        return fallback_id, mean_val, "uncertainty_grid_mean"
     return None, None, "none"
 
 
@@ -4223,6 +4377,24 @@ def _snapshots_chronological(snaps: Sequence[NSDFSnapshotRef]) -> List[NSDFSnaps
     return sorted(snaps, key=lambda snap: snap.sort_key)
 
 
+def _trend_current_index(
+    step_ids: Sequence[str],
+    *,
+    current_snapshot: str,
+    chrono_snaps: Sequence[NSDFSnapshotRef],
+) -> Optional[int]:
+    """Highlight the point matching the active data snapshot when possible."""
+    current_snapshot = (current_snapshot or "latest").strip() or "latest"
+    if not step_ids:
+        return None
+    if current_snapshot != "latest":
+        for idx, step_id in enumerate(step_ids):
+            if step_id == current_snapshot:
+                return idx
+    fallback = _snapshot_index_in_series(chrono_snaps, current_snapshot, len(step_ids))
+    return fallback
+
+
 def build_uncertainty_trend_series(
     triplet_index: NSDFTripletIndex,
     base_paths: StrainDashboardPaths,
@@ -4232,53 +4404,53 @@ def build_uncertainty_trend_series(
     grid_size: Tuple[int, int],
     mongo_s3_auth: Optional[Dict[str, str]] = None,
     remote_linked: bool = False,
+    surrogate_paths: Optional[StrainDashboardPaths] = None,
 ) -> UncertaintyTrendSeries:
     """
-    Build avg-uncertainty vs scan-step series for the active workflow.
+    Build avg-uncertainty vs time-step series for the active workflow.
 
-    Prefers ``transformed_stddevs_avg`` from each snapshot's ``surrogate.json``;
-    falls back to the mean of that snapshot's uncertainty grid.
+    Prefers ``transformed_stddevs_avg`` ``[[id, avg], ...]`` from the selected
+    ``surrogate.json``; falls back to per-snapshot means from uncertainty grids.
     """
     warnings: List[str] = []
     snaps = triplet_index.snapshots_for_workflow(workflow_id)
     if not snaps:
         return UncertaintyTrendSeries(
-            x=np.zeros(0, dtype=np.float64),
+            step_ids=[],
             y=np.zeros(0, dtype=np.float64),
             labels=[],
             warnings=["No snapshots found for the active workflow."],
         )
 
-    latest_paths = apply_nsdf_version_suffix(base_paths, "")
-    latest_doc = load_surrogate_doc_for_paths(
-        latest_paths,
+    chrono = _snapshots_chronological(snaps)
+    trend_surrogate_paths = surrogate_paths or apply_nsdf_version_suffix(base_paths, "")
+    trend_doc = load_surrogate_doc_for_paths(
+        trend_surrogate_paths,
         mongo_s3_auth=mongo_s3_auth,
         remote_linked=remote_linked,
     )
     full_points, parse_warnings = parse_transformed_stddevs_avg_points(
-        (latest_doc or {}).get("transformed_stddevs_avg")
+        (trend_doc or {}).get("transformed_stddevs_avg")
     )
     warnings.extend(parse_warnings)
     if len(full_points) >= 2:
-        xs = np.asarray([point[0] for point in full_points], dtype=np.float64)
+        step_ids = [point[0] for point in full_points]
         ys = np.asarray([point[1] for point in full_points], dtype=np.float64)
-        labels = [str(i + 1) for i in range(xs.shape[0])]
-        current_index = _snapshot_index_in_series(
-            _snapshots_chronological(snaps),
-            current_snapshot,
-            len(labels),
+        current_index = _trend_current_index(
+            step_ids,
+            current_snapshot=current_snapshot,
+            chrono_snaps=chrono,
         )
         return UncertaintyTrendSeries(
-            x=xs,
+            step_ids=step_ids,
             y=ys,
-            labels=labels,
+            labels=list(step_ids),
             current_index=current_index,
             source="transformed_stddevs_avg",
             warnings=warnings,
         )
 
-    chrono = _snapshots_chronological(snaps)
-    xs_out: List[float] = []
+    step_ids_out: List[str] = []
     ys_out: List[float] = []
     labels_out: List[str] = []
     current_index: Optional[int] = None
@@ -4296,32 +4468,33 @@ def build_uncertainty_trend_series(
             mongo_s3_auth=mongo_s3_auth,
             remote_linked=remote_linked,
         )
-        x_val, y_val, source = _uncertainty_point_from_surrogate_doc(
+        step_id, y_val, _source = _uncertainty_point_from_surrogate_doc(
             surrogate_doc,
             grid_size=grid_size,
             step_index=step_idx,
+            step_id=label,
         )
         if y_val is None:
             warnings.append(f"Snapshot {label}: no transformed_stddevs_avg or uncertainty grid.")
             continue
-        if x_val is None:
-            x_val = float(step_idx)
-        xs_out.append(float(x_val))
+        if step_id is None:
+            step_id = label
+        step_ids_out.append(step_id)
         ys_out.append(float(y_val))
         labels_out.append(label)
         if suffix == current_snapshot:
-            current_index = len(xs_out) - 1
+            current_index = len(step_ids_out) - 1
 
-    if not xs_out:
+    if not step_ids_out:
         return UncertaintyTrendSeries(
-            x=np.zeros(0, dtype=np.float64),
+            step_ids=[],
             y=np.zeros(0, dtype=np.float64),
             labels=[],
             warnings=warnings or ["No uncertainty trend points could be built."],
         )
 
     return UncertaintyTrendSeries(
-        x=np.asarray(xs_out, dtype=np.float64),
+        step_ids=step_ids_out,
         y=np.asarray(ys_out, dtype=np.float64),
         labels=labels_out,
         current_index=current_index,
@@ -4888,7 +5061,7 @@ def make_uncertainty_trend_figure(
     from bokeh.models import ColumnDataSource, Div
     from bokeh.plotting import figure
 
-    if series.x.size == 0:
+    if not series.step_ids:
         return Div(
             text=(
                 f"<b>{html.escape(cfg.title_uncertainty_trend)}</b><br>"
@@ -4908,6 +5081,8 @@ def make_uncertainty_trend_figure(
             },
         )
 
+    from bokeh.models import FactorRange
+
     p = figure(
         title=cfg.title_uncertainty_trend,
         width=layout.outer_width,
@@ -4922,21 +5097,23 @@ def make_uncertainty_trend_figure(
         tools="pan,wheel_zoom,box_zoom,reset,save",
         x_axis_label=cfg.trend_x_axis_label,
         y_axis_label=cfg.trend_y_axis_label,
+        x_range=FactorRange(factors=list(series.step_ids)),
         toolbar_location="above",
     )
     _lock_strain_figure_layout(p, layout)
+    p.xaxis.major_label_orientation = math.pi / 4
     source = ColumnDataSource(
         data={
-            "x": series.x.tolist(),
+            "step_id": list(series.step_ids),
             "y": series.y.tolist(),
             "label": series.labels,
         }
     )
-    p.line("x", "y", source=source, line_width=2, color="#2c7bb6")
-    p.circle("x", "y", source=source, size=6, color="#2c7bb6", alpha=0.7, line_color="#1f4f73")
-    if series.current_index is not None and 0 <= series.current_index < series.x.size:
+    p.line("step_id", "y", source=source, line_width=2, color="#2c7bb6")
+    p.circle("step_id", "y", source=source, size=6, color="#2c7bb6", alpha=0.7, line_color="#1f4f73")
+    if series.current_index is not None and 0 <= series.current_index < len(series.step_ids):
         p.circle(
-            [float(series.x[series.current_index])],
+            [series.step_ids[series.current_index]],
             [float(series.y[series.current_index])],
             size=11,
             color="#ffffff",
@@ -4972,7 +5149,7 @@ def make_strain_triplet_row(
     trend_series = uncertainty_trend
     if trend_series is None:
         trend_series = UncertaintyTrendSeries(
-            x=np.zeros(0, dtype=np.float64),
+            step_ids=[],
             y=np.zeros(0, dtype=np.float64),
             labels=[],
         )
