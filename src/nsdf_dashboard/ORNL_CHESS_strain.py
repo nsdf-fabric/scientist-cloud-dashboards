@@ -1205,24 +1205,25 @@ else:
                 if surrogate_grid_line
                 else points_note
             )
-        def _file_label(selector_value: str, latest_label: str) -> str:
-            value = str(selector_value or "latest").strip()
-            return latest_label if value in ("", "latest") else value
+        def _file_label_from_suffix(suffix: str, latest_label: str) -> str:
+            value = str(suffix or "").strip()
+            return latest_label if not value or value.lower() == "latest" else value
 
-        data_label = _file_label(
-            grid_state.get("version_suffix"),
+        loaded_paths = bundle.paths
+        data_label = _file_label_from_suffix(
+            loaded_paths.version_suffix,
             "Latest (data.json)",
         )
-        sur_label = _file_label(
-            grid_state.get("surrogate_version_suffix"),
+        sur_label = _file_label_from_suffix(
+            loaded_paths.surrogate_version_suffix,
             "Latest (surrogate.json)",
         )
-        nx_label = _file_label(
-            grid_state.get("next_x_version_suffix"),
+        nx_label = _file_label_from_suffix(
+            loaded_paths.next_x_version_suffix,
             "Latest (next_x.json)",
         )
         version_label = f"data={data_label}; surrogate={sur_label}; next_x={nx_label}"
-        triplet_errors, triplet_warnings = collect_nsdf_triplet_load_issues(p, bundle)
+        triplet_errors, triplet_warnings = collect_nsdf_triplet_load_issues(loaded_paths, bundle)
         grid_state["last_status"] = {
             "measurement_count": measurement.observed_values.shape[0],
             "inferred_grid_size": inferred_grid_size,
@@ -1368,7 +1369,7 @@ else:
             mongo_s3_auth=_dataset_s3_auth_override(),
             remote_linked=_remote_linked,
             surrogate_paths=_resolve_paths(),
-            allow_per_snapshot_fallback=True,
+            allow_per_snapshot_fallback=False,
         )
         grid_state["uncertainty_trend_points_key"] = cache_key
         grid_state["uncertainty_trend_points"] = replace(series, current_index=None)
@@ -1425,10 +1426,9 @@ else:
                 uncertainty_trend=uncertainty_trend,
             )
             figures_column.children = [triplet_row]
-            if grid_state.get("last_status") is not None:
-                resolved = _resolve_paths()
+            if grid_state.get("last_status") is not None and loaded_bundle is not None:
                 triplet_errors, triplet_warnings = collect_nsdf_triplet_load_issues(
-                    resolved,
+                    loaded_bundle.paths,
                     loaded_bundle,
                     grid_meta=grids.meta,
                 )
