@@ -29,6 +29,21 @@ and Bokeh heatmaps.
   ``env_path,env_url,upload,converted,query_url`` for a CHESS server that only sets env vars.
 
   Valid tokens: ``upload``, ``converted``, ``query_path``, ``query_url``, ``env_path``, ``env_url``.
+
+**NSDF triplet files on S3 (CHESS live run)**
+
+- **Live defaults (primary):** ``data.json``, ``surrogate.json``, ``next_x.json``. The
+  dashboard loads these on startup, on Reload, and on event-triggered refresh; the pipeline
+  writes new datapoints to these rolling files.
+- **Backups (archive):** ``data_<timestamp>_<id>.json``, ``surrogate_<timestamp>_<id>.json``,
+  ``next_x_<timestamp>_<id>.json``. Written when a snapshot is archived; used for workflow
+  indexing, Plot 4 trend, and when the user explicitly picks a snapshot in the selectors.
+  Load failures on the live trio mean the writer has not updated S3 yet—not that backups
+  should replace them as the default source.
+
+  **Triplet matching:** archived ``data`` / ``surrogate`` / ``next_x`` files are paired by
+  shared ``workflow_id`` and the numeric **id** at the end of the filename (e.g. ``_48``).
+  Timestamps in the middle of the suffix may differ across the three files.
 """
 from __future__ import annotations
 
@@ -38,7 +53,7 @@ import logging
 import math
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -54,10 +69,80 @@ _LOG = logging.getLogger(__name__)
 DEFAULT_GRID_SIZE: Tuple[int, int] = (26, 26)
 NSDF_DATA_JSON_BASENAME = "data.json"
 NSDF_VERSION_SUFFIX_RE = re.compile(r"^\d{8}T\d{6}Z$", re.IGNORECASE)
-NSDF_DATA_FILENAME_RE = re.compile(
-    r"^data(?:_(?P<suffix>\d{8}T\d{6}Z))?\.json$",
+NSDF_SNAPSHOT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", re.IGNORECASE)
+NSDF_COMPOSITE_SNAPSHOT_SUFFIX_RE = re.compile(
+    r"^\d{8}T\d{6}Z_(?P<id>\d+)$",
     re.IGNORECASE,
 )
+NSDF_DATA_FILENAME_RE = re.compile(
+    r"^data(?:_(?P<suffix>[A-Za-z0-9][A-Za-z0-9._-]*))?\.json$",
+    re.IGNORECASE,
+)
+
+
+def is_valid_nsdf_snapshot_suffix(suffix: str) -> bool:
+    """True for a non-empty ISO timestamp or opaque snapshot id (e.g. ``50``, ``20260608T120000Z_3``)."""
+    key = (suffix or "").strip()
+    if not key:
+        return False
+    if NSDF_VERSION_SUFFIX_RE.fullmatch(key):
+        return True
+    return bool(NSDF_SNAPSHOT_ID_RE.fullmatch(key))
+
+
+def is_valid_nsdf_version_suffix(suffix: str) -> bool:
+    """True for empty/latest alias or a valid snapshot suffix (ISO timestamp or id)."""
+    key = (suffix or "").strip()
+    return not key or is_valid_nsdf_snapshot_suffix(key)
+
+
+def triplet_snapshot_id(suffix: str) -> str:
+    """
+    Shared snapshot id for matching trio members (``data`` / ``surrogate`` / ``next_x``).
+
+    ``20260608T221354Z_8`` and ``20260608T214403Z_8`` both yield ``8``. ISO-only legacy
+    suffixes without a trailing id return the full suffix string.
+    """
+    text = (suffix or "").strip()
+    if not text:
+        return ""
+    label = triplet_suffix_trend_label(text)
+    return "" if label == "Latest" else label
+
+
+def triplet_suffix_trend_label(suffix: str) -> str:
+    """
+    Short Plot 4 x-axis label from a snapshot suffix or trend step id.
+
+    ``20260608T222314Z_49`` -> ``49``; plain numeric ids pass through unchanged.
+    """
+    text = (suffix or "").strip()
+    if not text or text.lower() == "latest":
+        return "Latest"
+    composite = NSDF_COMPOSITE_SNAPSHOT_SUFFIX_RE.match(text)
+    if composite:
+        return composite.group("id")
+    if text.isdigit():
+        return text
+    if "_" in text:
+        tail = text.rsplit("_", 1)[-1]
+        if tail.isdigit():
+            return tail
+    return text
+
+
+def _trend_labels_for_step_ids(step_ids: Sequence[str]) -> List[str]:
+    return [triplet_suffix_trend_label(step_id) for step_id in step_ids]
+
+
+def _trend_step_matches_snapshot(step_id: str, current_snapshot: str) -> bool:
+    step_id = (step_id or "").strip()
+    current_snapshot = (current_snapshot or "latest").strip() or "latest"
+    if step_id == current_snapshot:
+        return True
+    if step_id.lower() == "latest" and current_snapshot.lower() == "latest":
+        return True
+    return triplet_suffix_trend_label(step_id) == triplet_suffix_trend_label(current_snapshot)
 
 
 def _strip_env_quotes(value: str) -> str:
@@ -416,12 +501,14 @@ class StrainFieldPlotConfig:
     title_estimate: str = "Prediction"
     title_variance: str = "Uncertainty"
     title_uncertainty_trend: str = "Uncertainty trend"
-    trend_x_axis_label: str = "time step"
+    trend_x_axis_label: str = "snapshot id"
     trend_y_axis_label: str = "avg uncertainty"
     flip_y_for_display: bool = False
     colormap_estimate: str = "Viridis256"
     colormap_variance: str = "Coolwarm256"
     colormap_mask: Tuple[str, str] = ("#ffffff", "#ffffff")
+    estimate_color_low: Optional[float] = None
+    estimate_color_high: Optional[float] = None
 
 
 @dataclass
@@ -525,6 +612,9 @@ class NSDFSnapshotRef:
     suffix: str  # ``""`` = latest trio (`data.json`, etc.)
     workflow_id: str
     sort_key: str  # ISO suffix or ``latest`` for ordering
+    uncertainty_trend_y: Optional[float] = None  # ``transformed_stddevs_avg`` peeked at index time
+    has_surrogate_archive: bool = False
+    has_next_x_archive: bool = False
 
 
 @dataclass
@@ -563,30 +653,40 @@ class NSDFTripletIndex:
 
     def snapshot_select_options(self, workflow_id: str) -> List[Tuple[str, str]]:
         return self._suffix_select_options(
-            workflow_id,
+            self.snapshots_for_workflow(workflow_id),
             latest_label="Latest (data.json)",
         )
 
     def surrogate_select_options(self, workflow_id: str) -> List[Tuple[str, str]]:
+        snaps = [
+            snap
+            for snap in self.snapshots_for_workflow(workflow_id)
+            if not snap.suffix or snap.has_surrogate_archive
+        ]
         return self._suffix_select_options(
-            workflow_id,
+            snaps,
             latest_label="Latest (surrogate.json)",
         )
 
     def next_x_select_options(self, workflow_id: str) -> List[Tuple[str, str]]:
+        snaps = [
+            snap
+            for snap in self.snapshots_for_workflow(workflow_id)
+            if not snap.suffix or snap.has_next_x_archive
+        ]
         return self._suffix_select_options(
-            workflow_id,
+            snaps,
             latest_label="Latest (next_x.json)",
         )
 
     def _suffix_select_options(
         self,
-        workflow_id: str,
+        snaps: Sequence[NSDFSnapshotRef],
         *,
         latest_label: str,
     ) -> List[Tuple[str, str]]:
         options: List[Tuple[str, str]] = []
-        for snap in self.snapshots_for_workflow(workflow_id):
+        for snap in snaps:
             value = "latest" if not snap.suffix else snap.suffix
             label = latest_label if value == "latest" else snap.suffix
             options.append((value, label))
@@ -736,11 +836,16 @@ def parse_s3_uri(link: str) -> Tuple[str, str]:
 
 
 def nsdf_triplet_basenames(version_suffix: str = "") -> Tuple[str, str, str]:
-    """Return ``(data, surrogate, next_x)`` basenames for a version suffix (empty = latest)."""
+    """
+    Return ``(data, surrogate, next_x)`` basenames for a version suffix.
+
+    Empty suffix = live rolling trio (``data.json``, etc.). Non-empty suffix = archived
+    backup files (``data_<timestamp>_<id>.json``, etc.).
+    """
     suffix = (version_suffix or "").strip()
     if not suffix:
         return "data.json", "surrogate.json", "next_x.json"
-    if not NSDF_VERSION_SUFFIX_RE.fullmatch(suffix):
+    if not is_valid_nsdf_snapshot_suffix(suffix):
         raise ValueError(f"Invalid NSDF version suffix: {suffix!r}")
     return (
         f"data_{suffix}.json",
@@ -754,7 +859,27 @@ def parse_nsdf_data_filename(name: str) -> Optional[str]:
     m = NSDF_DATA_FILENAME_RE.match((name or "").strip())
     if not m:
         return None
-    return (m.group("suffix") or "").strip() or None
+    suffix = (m.group("suffix") or "").strip()
+    if not suffix:
+        return None
+    if not is_valid_nsdf_snapshot_suffix(suffix):
+        return None
+    return suffix
+
+
+def _parse_nsdf_triplet_filename_suffix(name: str, prefix: str) -> Optional[str]:
+    """Parse ``<prefix>.json`` or ``<prefix>_<suffix>.json``; ``None`` means latest."""
+    base = os.path.basename((name or "").strip())
+    latest_name = f"{prefix}.json"
+    if base.lower() == latest_name.lower():
+        return None
+    token = f"{prefix}_"
+    if not (base.startswith(token) and base.endswith(".json")):
+        return None
+    middle = base[len(token) : -len(".json")]
+    if not middle or not is_valid_nsdf_snapshot_suffix(middle):
+        return None
+    return middle
 
 
 def _replace_path_basename(path: str, new_basename: str) -> str:
@@ -843,8 +968,9 @@ def resolve_auxiliary_suffix_for_data_snapshot(
     """
     Return a surrogate/next_x selector value aligned with a data snapshot.
 
-    Uses an exact timestamp match when present, otherwise the nearest available
-    timestamp, then ``latest`` when no candidates exist.
+    Matches exact suffix first, then any available suffix with the same snapshot id
+    (trailing ``_<id>`` token). Falls back to ``latest`` when no id match exists.
+    Timestamps in the suffix are not compared.
     """
     data_suffix = _nsdf_selector_value_to_suffix(data_selector_value)
     if not data_suffix:
@@ -856,9 +982,13 @@ def resolve_auxiliary_suffix_for_data_snapshot(
     if data_suffix in available:
         return data_suffix
 
-    nearest = _nearest_nsdf_version_suffix(data_suffix, available)
-    if nearest:
-        return nearest
+    data_id = triplet_snapshot_id(data_suffix)
+    if data_id:
+        id_matches = [
+            suffix for suffix in available if triplet_snapshot_id(suffix) == data_id
+        ]
+        if id_matches:
+            return sorted(id_matches, key=_snapshot_sort_key, reverse=True)[0]
     return "latest"
 
 
@@ -872,6 +1002,9 @@ def apply_nsdf_file_suffixes(
 ) -> StrainDashboardPaths:
     """
     Point resolved paths at independent ``data`` / ``surrogate`` / ``next_x`` files.
+
+    Empty / ``latest`` suffix selects the rolling live trio (``data.json``,
+    ``surrogate.json``, ``next_x.json``). Non-empty suffix selects archived backups.
 
     When ``surrogate_suffix`` or ``next_x_suffix`` is omitted, they follow ``data_suffix``.
     """
@@ -925,22 +1058,26 @@ def apply_nsdf_file_suffixes(
         out.s3_data_key = _replace_s3_key_basename(out.s3_data_key, data_fn)
         explicit_sur = (paths.s3_surrogate_key or "").strip()
         explicit_nx = (paths.s3_next_x_key or "").strip()
-        if explicit_sur and sur_s == data_s:
+        _, expected_sur_fn, _ = nsdf_triplet_basenames(sur_s)
+        _, _, expected_nx_fn = nsdf_triplet_basenames(nx_s)
+        data_prefix = _nsdf_key_prefix(out.s3_data_key)
+        if explicit_sur and _location_basename(explicit_sur) == expected_sur_fn:
             out.s3_surrogate_key = explicit_sur
         else:
-            out.s3_surrogate_key = _replace_s3_key_basename(out.s3_data_key, sur_fn)
-        if explicit_nx and nx_s == data_s:
+            out.s3_surrogate_key = data_prefix + expected_sur_fn
+        if explicit_nx and _location_basename(explicit_nx) == expected_nx_fn:
             out.s3_next_x_key = explicit_nx
         elif (
             explicit_sur
-            and sur_s == data_s
-            and not explicit_nx
             and "/" in explicit_sur
+            and not explicit_nx
+            and sur_s == data_s
+            and _location_basename(explicit_sur) == expected_sur_fn
         ):
-            sur_prefix = explicit_sur.rsplit("/", 1)[0]
-            out.s3_next_x_key = f"{sur_prefix}/{nx_fn}"
+            sur_prefix = explicit_sur.rsplit("/", 1)[0] + "/"
+            out.s3_next_x_key = sur_prefix + expected_nx_fn
         else:
-            out.s3_next_x_key = _replace_s3_key_basename(out.s3_data_key, nx_fn)
+            out.s3_next_x_key = data_prefix + expected_nx_fn
 
     return out
 
@@ -1055,7 +1192,7 @@ def list_nsdf_version_suffixes_from_directory(directory: str) -> List[str]:
         parsed = parse_nsdf_data_filename(name)
         if parsed:
             suffixes.append(parsed)
-    return sorted(set(suffixes), reverse=True)
+    return sorted(set(suffixes), key=_snapshot_sort_key, reverse=True)
 
 
 def list_nsdf_surrogate_suffixes_from_directory(directory: str) -> List[str]:
@@ -1074,7 +1211,7 @@ def list_nsdf_surrogate_suffixes_from_directory(directory: str) -> List[str]:
         parsed = parse_nsdf_surrogate_filename(name)
         if parsed:
             suffixes.append(parsed)
-    return sorted(set(suffixes), reverse=True)
+    return sorted(set(suffixes), key=_snapshot_sort_key, reverse=True)
 
 
 def list_nsdf_next_x_suffixes_from_directory(directory: str) -> List[str]:
@@ -1091,7 +1228,7 @@ def list_nsdf_next_x_suffixes_from_directory(directory: str) -> List[str]:
         parsed = parse_nsdf_next_x_filename(name)
         if parsed:
             suffixes.append(parsed)
-    return sorted(set(suffixes), reverse=True)
+    return sorted(set(suffixes), key=_snapshot_sort_key, reverse=True)
 
 
 def list_nsdf_version_suffixes_from_s3(
@@ -1150,29 +1287,17 @@ def list_nsdf_version_suffixes_from_s3(
                 break
     except Exception:
         return []
-    return sorted(set(suffixes), reverse=True)
+    return sorted(set(suffixes), key=_snapshot_sort_key, reverse=True)
 
 
 def parse_nsdf_surrogate_filename(name: str) -> Optional[str]:
     """Parse ``surrogate_<suffix>.json``; return suffix or ``None`` for ``surrogate.json``."""
-    base = os.path.basename((name or "").strip())
-    if base == "surrogate.json":
-        return None
-    if not (base.startswith("surrogate_") and base.endswith(".json")):
-        return None
-    middle = base[len("surrogate_") : -len(".json")]
-    return middle or None
+    return _parse_nsdf_triplet_filename_suffix(name, "surrogate")
 
 
 def parse_nsdf_next_x_filename(name: str) -> Optional[str]:
     """Parse ``next_x_<suffix>.json``; return suffix or ``None`` for ``next_x.json``."""
-    base = os.path.basename((name or "").strip())
-    if base == "next_x.json":
-        return None
-    if not (base.startswith("next_x_") and base.endswith(".json")):
-        return None
-    middle = base[len("next_x_") : -len(".json")]
-    return middle or None
+    return _parse_nsdf_triplet_filename_suffix(name, "next_x")
 
 
 def _nsdf_reference_data_suffix(
@@ -1190,7 +1315,7 @@ def _nsdf_reference_data_suffix(
     if parsed:
         return parsed
     if data_suffixes:
-        ordered = sorted(set(data_suffixes), reverse=True)
+        ordered = sorted(set(data_suffixes), key=_snapshot_sort_key, reverse=True)
         if ordered:
             return ordered[0]
     return None
@@ -1201,11 +1326,11 @@ def _nsdf_suffixes_after_reference(
     reference_suffix: Optional[str],
 ) -> List[str]:
     """Newest-first auxiliary suffixes strictly after ``reference_suffix``."""
-    ordered = sorted(set(suffixes), reverse=True)
+    ordered = sorted(set(suffixes), key=_snapshot_sort_key, reverse=True)
     if not reference_suffix:
         return ordered
-    ref = reference_suffix.strip().upper()
-    return [suffix for suffix in ordered if suffix.strip().upper() > ref]
+    ref_key = _snapshot_sort_key(reference_suffix.strip())
+    return [suffix for suffix in ordered if _snapshot_sort_key(suffix) > ref_key]
 
 
 def list_nsdf_surrogate_suffixes_from_s3(
@@ -1264,7 +1389,7 @@ def list_nsdf_surrogate_suffixes_from_s3(
                 break
     except Exception:
         return []
-    return sorted(set(suffixes), reverse=True)
+    return sorted(set(suffixes), key=_snapshot_sort_key, reverse=True)
 
 
 def list_nsdf_next_x_suffixes_from_s3(
@@ -1323,7 +1448,7 @@ def list_nsdf_next_x_suffixes_from_s3(
                 break
     except Exception:
         return []
-    return sorted(set(suffixes), reverse=True)
+    return sorted(set(suffixes), key=_snapshot_sort_key, reverse=True)
 
 
 def _merged_snapshot_suffixes_from_directory(directory: str) -> List[str]:
@@ -1463,8 +1588,15 @@ def _suffix_from_next_x_basename(name: str) -> Optional[str]:
 
 
 def _snapshot_sort_key(suffix: str) -> str:
-    """Sort newest-first: ISO timestamps lexicographic; latest trio sorts above all."""
-    return suffix if suffix else "z_latest"
+    """Sort newest-first: ISO timestamps, then numeric ids, then other ids; latest trio on top."""
+    s = (suffix or "").strip()
+    if not s:
+        return "z_latest"
+    if NSDF_VERSION_SUFFIX_RE.fullmatch(s):
+        return f"a_ts_{s.upper()}"
+    if s.isdigit():
+        return f"b_num_{int(s):020d}"
+    return f"c_id_{s.upper()}"
 
 
 def _peek_workflow_id_from_json_doc(doc: Any) -> Optional[str]:
@@ -1579,43 +1711,30 @@ def _collect_auxiliary_workflow_maps(
     return surrogate_wf, next_x_wf
 
 
-def _nearest_auxiliary_workflow_id(
+def _workflow_id_from_auxiliary_maps(
     data_suffix: str,
     surrogate_wf: Mapping[str, str],
     next_x_wf: Mapping[str, str],
 ) -> Optional[str]:
-    """
-    Infer workflow_id for a data snapshot from nearby surrogate/next_x timestamps.
-
-    Prefers surrogate workflow_id when surrogate and next_x are equally close.
-    """
+    """Resolve workflow_id from surrogate/next_x maps by exact suffix or shared snapshot id."""
     key = (data_suffix or "").strip()
     if not key:
         return surrogate_wf.get("") or next_x_wf.get("")
 
-    target_dt = _parse_nsdf_iso_suffix_timestamp(key)
-    if target_dt is None:
+    if key in surrogate_wf:
+        return surrogate_wf[key]
+    if key in next_x_wf:
+        return next_x_wf[key]
+
+    data_id = triplet_snapshot_id(key)
+    if not data_id:
         return None
 
-    best_wf: Optional[str] = None
-    best_delta: Optional[float] = None
-    best_is_surrogate = False
-
-    for wf_map, is_surrogate in ((surrogate_wf, True), (next_x_wf, False)):
+    for wf_map in (surrogate_wf, next_x_wf):
         for suffix, workflow_id in wf_map.items():
-            if not (suffix or "").strip():
-                continue
-            candidate_dt = _parse_nsdf_iso_suffix_timestamp(suffix)
-            if candidate_dt is None:
-                continue
-            delta = abs((candidate_dt - target_dt).total_seconds())
-            if best_wf is None or delta < best_delta or (
-                delta == best_delta and is_surrogate and not best_is_surrogate
-            ):
-                best_wf = workflow_id
-                best_delta = delta
-                best_is_surrogate = is_surrogate
-    return best_wf
+            if triplet_snapshot_id(suffix) == data_id:
+                return workflow_id
+    return None
 
 
 def _attribute_workflow_for_data_snapshot(
@@ -1630,8 +1749,8 @@ def _attribute_workflow_for_data_snapshot(
     """
     Resolve workflow_id for a ``data.json`` snapshot.
 
-    Order: explicit ``data.json`` id (new files), same-suffix surrogate/next_x,
-    then nearest-timestamp surrogate/next_x for backward compatibility.
+    Order: explicit ``data.json`` id (new files), linked surrogate/next_x on the same
+    snapshot id, then exact suffix in auxiliary maps.
     """
     workflow_id = _peek_workflow_id_from_json_doc(data_doc)
     if workflow_id:
@@ -1645,9 +1764,9 @@ def _attribute_workflow_for_data_snapshot(
 
     surrogate_wf = surrogate_wf_by_suffix or {}
     next_x_wf = next_x_wf_by_suffix or {}
-    nearest = _nearest_auxiliary_workflow_id(data_suffix, surrogate_wf, next_x_wf)
-    if nearest:
-        return nearest
+    matched = _workflow_id_from_auxiliary_maps(data_suffix, surrogate_wf, next_x_wf)
+    if matched:
+        return matched
     return NSDF_UNKNOWN_WORKFLOW_ID
 
 
@@ -1677,6 +1796,8 @@ def _build_triplet_index_from_groups(
     snapshots: List[NSDFSnapshotRef] = []
     by_workflow: Dict[str, List[NSDFSnapshotRef]] = {}
     for suffix in sorted(groups.keys(), key=_snapshot_sort_key, reverse=True):
+        if suffix and not is_valid_nsdf_snapshot_suffix(suffix):
+            continue
         files = groups[suffix]
         data_loc = (files.get("data") or "").strip()
         if not data_loc:
@@ -1696,6 +1817,9 @@ def _build_triplet_index_from_groups(
             suffix=suffix,
             workflow_id=workflow_id,
             sort_key=_snapshot_sort_key(suffix),
+            uncertainty_trend_y=_peek_transformed_stddevs_avg_scalar(surrogate_doc),
+            has_surrogate_archive=bool((files.get("surrogate") or "").strip()),
+            has_next_x_archive=bool((files.get("next_x") or "").strip()),
         )
         snapshots.append(ref)
         by_workflow.setdefault(workflow_id, []).append(ref)
@@ -1706,21 +1830,44 @@ def _build_triplet_index_from_groups(
 
 def _triplet_groups_from_object_keys(keys: Sequence[str]) -> Dict[str, Dict[str, str]]:
     groups: Dict[str, Dict[str, str]] = {}
+    id_to_data_suffix: Dict[str, str] = {}
+
     for key in keys:
         name = os.path.basename((key or "").strip())
         if not name:
             continue
         data_suffix = _suffix_from_data_basename(name)
-        if data_suffix is not None:
-            groups.setdefault(data_suffix, {})["data"] = key
+        if data_suffix is None:
+            continue
+        groups.setdefault(data_suffix, {})["data"] = key
+        snapshot_id = triplet_snapshot_id(data_suffix)
+        if not snapshot_id:
+            continue
+        previous = id_to_data_suffix.get(snapshot_id)
+        if not previous or _snapshot_sort_key(data_suffix) > _snapshot_sort_key(previous):
+            id_to_data_suffix[snapshot_id] = data_suffix
+
+    def _attach_auxiliary(role: str, suffix: Optional[str], key: str) -> None:
+        if suffix is None:
+            return
+        snapshot_id = triplet_snapshot_id(suffix)
+        target_suffix = id_to_data_suffix.get(snapshot_id) if snapshot_id else None
+        group_key = target_suffix if target_suffix is not None else suffix
+        groups.setdefault(group_key, {})[role] = key
+
+    for key in keys:
+        name = os.path.basename((key or "").strip())
+        if not name:
+            continue
+        if _suffix_from_data_basename(name) is not None:
             continue
         surrogate_suffix = _suffix_from_surrogate_basename(name)
         if surrogate_suffix is not None:
-            groups.setdefault(surrogate_suffix, {})["surrogate"] = key
+            _attach_auxiliary("surrogate", surrogate_suffix, key)
             continue
         next_x_suffix = _suffix_from_next_x_basename(name)
         if next_x_suffix is not None:
-            groups.setdefault(next_x_suffix, {})["next_x"] = key
+            _attach_auxiliary("next_x", next_x_suffix, key)
     return groups
 
 
@@ -2066,18 +2213,13 @@ def _prepare_nsdf_load_paths(
             strict_triplet_paths=load_paths.strict_triplet_paths,
         )
     if paths.strict_triplet_paths and load_paths.has_s3_source():
-        needs_suffix_keys = not (
-            (load_paths.s3_surrogate_key or "").strip()
-            and (load_paths.s3_next_x_key or "").strip()
+        load_paths = apply_nsdf_file_suffixes(
+            load_paths,
+            data_suffix=paths.version_suffix or "",
+            surrogate_suffix=paths.surrogate_version_suffix,
+            next_x_suffix=paths.next_x_version_suffix,
+            strict=True,
         )
-        if needs_suffix_keys:
-            load_paths = apply_nsdf_file_suffixes(
-                load_paths,
-                data_suffix=paths.version_suffix or "",
-                surrogate_suffix=paths.surrogate_version_suffix,
-                next_x_suffix=paths.next_x_version_suffix,
-                strict=True,
-            )
     return load_paths
 
 
@@ -2598,7 +2740,12 @@ def load_optional_surrogate_json(
             reference = _nsdf_reference_data_suffix(data_name, data_suffixes=data_suffixes)
             sur_suffixes = list_nsdf_surrogate_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth)
             for suffix in _nsdf_suffixes_after_reference(sur_suffixes, reference):
-                _, sur_fn, _ = nsdf_triplet_basenames(suffix)
+                if not is_valid_nsdf_version_suffix(suffix):
+                    continue
+                try:
+                    _, sur_fn, _ = nsdf_triplet_basenames(suffix)
+                except ValueError:
+                    continue
                 sur_url = _replace_url_basename(paths.json_url, sur_fn)
                 if sur_url not in tried:
                     candidates.append(("url", sur_url, False))
@@ -2775,7 +2922,12 @@ def load_optional_next_x_json(
             reference = _nsdf_reference_data_suffix(data_name, data_suffixes=data_suffixes)
             nx_suffixes = list_nsdf_next_x_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth)
             for suffix in _nsdf_suffixes_after_reference(nx_suffixes, reference):
-                _, _, nx_fn = nsdf_triplet_basenames(suffix)
+                if not is_valid_nsdf_version_suffix(suffix):
+                    continue
+                try:
+                    _, _, nx_fn = nsdf_triplet_basenames(suffix)
+                except ValueError:
+                    continue
                 nx_url = _replace_url_basename(paths.json_url, nx_fn)
                 if nx_url not in tried:
                     candidates.append(("url", nx_url, False))
@@ -2964,7 +3116,12 @@ def _iter_surrogate_path_candidates(
     reference = _nsdf_reference_data_suffix(data_basename, data_suffixes=data_suffixes)
     sur_suffixes = list_nsdf_surrogate_suffixes_from_directory(directory)
     for listed_suffix in _nsdf_suffixes_after_reference(sur_suffixes, reference):
-        _, sur_fn, _ = nsdf_triplet_basenames(listed_suffix)
+        if not is_valid_nsdf_version_suffix(listed_suffix):
+            continue
+        try:
+            _, sur_fn, _ = nsdf_triplet_basenames(listed_suffix)
+        except ValueError:
+            continue
         if directory:
             add(os.path.join(directory, sur_fn))
     return candidates
@@ -3002,14 +3159,32 @@ def _iter_next_x_path_candidates(
     reference = _nsdf_reference_data_suffix(data_basename, data_suffixes=data_suffixes)
     nx_suffixes = list_nsdf_next_x_suffixes_from_directory(directory)
     for listed_suffix in _nsdf_suffixes_after_reference(nx_suffixes, reference):
-        _, _, nx_fn = nsdf_triplet_basenames(listed_suffix)
+        if not is_valid_nsdf_version_suffix(listed_suffix):
+            continue
+        try:
+            _, _, nx_fn = nsdf_triplet_basenames(listed_suffix)
+        except ValueError:
+            continue
         if directory:
             add(os.path.join(directory, nx_fn))
     return candidates
 
 
-def _data_s3_key_candidates(paths: StrainDashboardPaths) -> List[str]:
+def _data_s3_key_candidates(
+    paths: StrainDashboardPaths,
+    *,
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+) -> List[str]:
     """Ordered data.json keys to try when env prefixes disagree (e.g. chess-data vs test-chess)."""
+    return _iter_data_s3_key_candidates(paths, mongo_s3_auth=mongo_s3_auth)
+
+
+def _iter_data_s3_key_candidates(
+    paths: StrainDashboardPaths,
+    *,
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """Ordered live ``data.json`` keys to try (no timestamped backup fallback for latest)."""
     data_fn, _, _ = nsdf_triplet_basenames(paths.version_suffix or "")
     candidates: List[str] = []
     seen: set[str] = set()
@@ -3027,7 +3202,30 @@ def _data_s3_key_candidates(paths: StrainDashboardPaths) -> List[str]:
     ):
         if aux_key and "/" in aux_key:
             add(_replace_s3_key_basename(aux_key, data_fn))
+
     return candidates
+
+
+def _add_s3_keys_for_matching_snapshot_id(
+    add: Any,
+    *,
+    prefix: str,
+    snapshot_id: str,
+    listed_suffixes: Sequence[str],
+    role: str,
+) -> None:
+    if not snapshot_id:
+        return
+    for listed_suffix in listed_suffixes:
+        if triplet_snapshot_id(listed_suffix) != snapshot_id:
+            continue
+        try:
+            data_fn, sur_fn, nx_fn = nsdf_triplet_basenames(listed_suffix)
+        except ValueError:
+            continue
+        basename = {"data": data_fn, "surrogate": sur_fn, "next_x": nx_fn}.get(role, "")
+        if basename:
+            add(prefix + basename)
 
 
 def _iter_surrogate_s3_key_candidates(
@@ -3047,7 +3245,32 @@ def _iter_surrogate_s3_key_candidates(
             candidates.append(k)
 
     if paths.strict_triplet_paths:
-        add((paths.s3_surrogate_key or "").strip())
+        data_basename = data_key.rsplit("/", 1)[-1] if data_key else ""
+        versioned_data = bool(parse_nsdf_data_filename(data_basename))
+        sur_suffix = (paths.surrogate_version_suffix or "").strip()
+        prefix = _nsdf_key_prefix(data_key)
+        _, live_sur_fn, _ = nsdf_triplet_basenames("")
+        if versioned_data:
+            if not sur_suffix:
+                add(prefix + live_sur_fn)
+            else:
+                add(_sibling_surrogate_s3_key(data_key))
+                add((paths.s3_surrogate_key or "").strip())
+                snapshot_id = triplet_snapshot_id(parse_nsdf_data_filename(data_basename) or "")
+                _add_s3_keys_for_matching_snapshot_id(
+                    add,
+                    prefix=prefix,
+                    snapshot_id=snapshot_id,
+                    listed_suffixes=list_nsdf_surrogate_suffixes_from_s3(
+                        paths,
+                        mongo_s3_auth=mongo_s3_auth,
+                    ),
+                    role="surrogate",
+                )
+                add(prefix + live_sur_fn)
+        else:
+            add((paths.s3_surrogate_key or "").strip())
+            add(_sibling_surrogate_s3_key(data_key))
         return candidates
 
     data_key = (data_key or "").strip()
@@ -3061,7 +3284,12 @@ def _iter_surrogate_s3_key_candidates(
     reference = _nsdf_reference_data_suffix(data_basename, data_suffixes=data_suffixes)
     sur_suffixes = list_nsdf_surrogate_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth)
     for listed_suffix in _nsdf_suffixes_after_reference(sur_suffixes, reference):
-        _, sur_fn, _ = nsdf_triplet_basenames(listed_suffix)
+        if not is_valid_nsdf_version_suffix(listed_suffix):
+            continue
+        try:
+            _, sur_fn, _ = nsdf_triplet_basenames(listed_suffix)
+        except ValueError:
+            continue
         add(prefix + sur_fn)
     return candidates
 
@@ -3083,7 +3311,32 @@ def _iter_next_x_s3_key_candidates(
             candidates.append(k)
 
     if paths.strict_triplet_paths:
-        add((paths.s3_next_x_key or "").strip())
+        data_basename = data_key.rsplit("/", 1)[-1] if data_key else ""
+        versioned_data = bool(parse_nsdf_data_filename(data_basename))
+        nx_suffix = (paths.next_x_version_suffix or "").strip()
+        prefix = _nsdf_key_prefix(data_key)
+        _, _, live_nx_fn = nsdf_triplet_basenames("")
+        if versioned_data:
+            if not nx_suffix:
+                add(prefix + live_nx_fn)
+            else:
+                add(_sibling_next_x_s3_key(data_key))
+                add((paths.s3_next_x_key or "").strip())
+                snapshot_id = triplet_snapshot_id(parse_nsdf_data_filename(data_basename) or "")
+                _add_s3_keys_for_matching_snapshot_id(
+                    add,
+                    prefix=prefix,
+                    snapshot_id=snapshot_id,
+                    listed_suffixes=list_nsdf_next_x_suffixes_from_s3(
+                        paths,
+                        mongo_s3_auth=mongo_s3_auth,
+                    ),
+                    role="next_x",
+                )
+                add(prefix + live_nx_fn)
+        else:
+            add((paths.s3_next_x_key or "").strip())
+            add(_sibling_next_x_s3_key(data_key))
         return candidates
 
     data_key = (data_key or "").strip()
@@ -3097,7 +3350,12 @@ def _iter_next_x_s3_key_candidates(
     reference = _nsdf_reference_data_suffix(data_basename, data_suffixes=data_suffixes)
     nx_suffixes = list_nsdf_next_x_suffixes_from_s3(paths, mongo_s3_auth=mongo_s3_auth)
     for listed_suffix in _nsdf_suffixes_after_reference(nx_suffixes, reference):
-        _, _, nx_fn = nsdf_triplet_basenames(listed_suffix)
+        if not is_valid_nsdf_version_suffix(listed_suffix):
+            continue
+        try:
+            _, _, nx_fn = nsdf_triplet_basenames(listed_suffix)
+        except ValueError:
+            continue
         add(prefix + nx_fn)
     return candidates
 
@@ -3326,7 +3584,8 @@ def load_nsdf_json_bundle_from_s3(
     data = None
     data_key = ""
     data_errors: List[str] = []
-    for candidate_key in _data_s3_key_candidates(paths):
+    data_candidates = _iter_data_s3_key_candidates(paths, mongo_s3_auth=mongo_s3_auth)
+    for candidate_key in data_candidates:
         try:
             data = _load_json_from_s3_key(client, bucket, candidate_key)
             data_key = candidate_key
@@ -3339,18 +3598,36 @@ def load_nsdf_json_bundle_from_s3(
                 continue
             raise
     if data is None or not data_key:
-        tried = ", ".join(_data_s3_key_candidates(paths)) or "(none)"
+        tried = ", ".join(data_candidates) or "(none)"
         detail = data_errors[-1] if data_errors else "object not found"
+        if not (paths.version_suffix or "").strip():
+            live_key = (paths.s3_data_key or "").strip() or "data.json"
+            detail = (
+                f"Live {live_key} not found on s3://{bucket}/. "
+                f"The dashboard watches the rolling live triplet (data.json, surrogate.json, "
+                f"next_x.json); timestamped backups are loaded only when selected explicitly. "
+                f"{detail}"
+            )
         raise FileNotFoundError(
             f"Could not load NSDF data.json from s3://{bucket}/. Tried: {tried}. {detail}"
         )
+    loaded_suffix = parse_nsdf_data_filename(data_key.rsplit("/", 1)[-1]) or ""
     messages = [f"Loaded NSDF data JSON from s3://{bucket}/{data_key}"]
+    aux_paths = paths
+    if loaded_suffix:
+        aux_paths = apply_nsdf_file_suffixes(
+            paths,
+            data_suffix=loaded_suffix,
+            surrogate_suffix=(paths.surrogate_version_suffix or "").strip(),
+            next_x_suffix=(paths.next_x_version_suffix or "").strip(),
+            strict=paths.strict_triplet_paths,
+        )
     display_size, _ = resolve_nsdf_grid_size(data)
 
     surrogate = None
     surrogate_key = ""
     surrogate_candidates = _iter_surrogate_s3_key_candidates(
-        paths,
+        aux_paths,
         data_key,
         mongo_s3_auth=mongo_s3_auth,
     )
@@ -3377,6 +3654,10 @@ def load_nsdf_json_bundle_from_s3(
             continue
         except Exception as exc:
             if _s3_missing_error(exc):
+                messages.append(
+                    f"S3 surrogate JSON skipped ({candidate_key}): "
+                    f"{_format_s3_get_object_error(exc, bucket=bucket, key=candidate_key)}"
+                )
                 continue
             messages.append(f"S3 surrogate JSON skipped ({candidate_key}): {exc}")
             break
@@ -3384,7 +3665,7 @@ def load_nsdf_json_bundle_from_s3(
     next_x = None
     next_x_key = ""
     for candidate_key in _iter_next_x_s3_key_candidates(
-        paths,
+        aux_paths,
         data_key,
         mongo_s3_auth=mongo_s3_auth,
     ):
@@ -3393,7 +3674,13 @@ def load_nsdf_json_bundle_from_s3(
             if _next_x_doc_is_recognized_format(next_x_doc):
                 next_x = next_x_doc
                 next_x_key = candidate_key
-                messages.append(f"Loaded next_x JSON from s3://{bucket}/{candidate_key}")
+                if loaded_suffix and _location_basename(candidate_key) == nsdf_triplet_basenames("")[2]:
+                    messages.append(
+                        f"Loaded live next_x JSON from s3://{bucket}/{candidate_key} "
+                        f"(overlay for data snapshot {loaded_suffix})"
+                    )
+                else:
+                    messages.append(f"Loaded next_x JSON from s3://{bucket}/{candidate_key}")
                 break
             messages.append(
                 f"S3 next_x JSON skipped ({candidate_key}): expected a JSON object or array."
@@ -3403,9 +3690,23 @@ def load_nsdf_json_bundle_from_s3(
             continue
         except Exception as exc:
             if _s3_missing_error(exc):
+                messages.append(
+                    f"S3 next_x JSON skipped ({candidate_key}): "
+                    f"{_format_s3_get_object_error(exc, bucket=bucket, key=candidate_key)}"
+                )
                 continue
             messages.append(f"S3 next_x JSON skipped ({candidate_key}): {exc}")
             break
+
+    effective_version = (paths.version_suffix or "").strip() or loaded_suffix
+    surrogate_version = (aux_paths.surrogate_version_suffix or "").strip()
+    next_x_version = (aux_paths.next_x_version_suffix or "").strip()
+    live_sur_basename = nsdf_triplet_basenames("")[1]
+    live_nx_basename = nsdf_triplet_basenames("")[2]
+    if surrogate_key and _location_basename(surrogate_key) == live_sur_basename and loaded_suffix:
+        surrogate_version = ""
+    if next_x_key and _location_basename(next_x_key) == live_nx_basename and loaded_suffix:
+        next_x_version = ""
 
     effective = StrainDashboardPaths(
         s3_env_file=paths.s3_env_file,
@@ -3416,12 +3717,21 @@ def load_nsdf_json_bundle_from_s3(
         s3_next_x_key=next_x_key,
         s3_endpoint_url=paths.s3_endpoint_url,
         s3_region=paths.s3_region,
-        version_suffix=paths.version_suffix,
+        version_suffix=effective_version,
+        surrogate_version_suffix=surrogate_version,
+        next_x_version_suffix=next_x_version,
+        strict_triplet_paths=paths.strict_triplet_paths,
     )
     if not surrogate and surrogate_candidates:
-        messages.append(
-            "S3 surrogate JSON not found for latest triplet or timestamped fallbacks."
-        )
+        if (effective_version or "").strip():
+            messages.append(
+                "S3 surrogate archive not found for this data snapshot "
+                "(data-only backup); plots 2–3 use measurement interpolation."
+            )
+        else:
+            messages.append(
+                "S3 surrogate JSON not found for the live triplet (surrogate.json)."
+            )
 
     return NSDFLoadedBundle(data=data, surrogate=surrogate, next_x=next_x, messages=messages, paths=effective)
 
@@ -3496,6 +3806,11 @@ def _message_targets_location(message: str, location: str) -> bool:
     return bool(base and base in msg)
 
 
+def _viewing_live_triplet(paths: StrainDashboardPaths) -> bool:
+    """True when selectors point at the rolling live trio (``data.json``, etc.)."""
+    return not (paths.version_suffix or "").strip()
+
+
 def collect_nsdf_triplet_load_issues(
     paths: StrainDashboardPaths,
     bundle: NSDFLoadedBundle,
@@ -3505,11 +3820,14 @@ def collect_nsdf_triplet_load_issues(
     """
     Summarize problems with the primary ``data.json`` / ``surrogate.json`` / ``next_x.json`` triplet.
 
-    Returns ``(errors, warnings)``. Errors indicate the primary snapshot file is missing or unusable
-    (including when a fallback surrogate was used). Warnings cover optional ``next_x.json`` gaps.
+    Returns ``(errors, warnings)``. Errors indicate the live triplet or selected archive
+    surrogate is missing when required for the primary view. Warnings cover optional
+    ``next_x.json`` gaps and data-only archived snapshots (measurements without a
+    matching surrogate backup on S3).
     """
     errors: List[str] = []
     warnings: List[str] = []
+    live_triplet = _viewing_live_triplet(paths)
     primary = primary_nsdf_triplet_locations(paths)
     data_fn, _, _ = nsdf_triplet_basenames(paths.version_suffix or "")
     sur_suffix = (
@@ -3544,7 +3862,13 @@ def collect_nsdf_triplet_load_issues(
             token in msg.lower() for token in ("skipped", "not found", "not loaded", "missing")
         ):
             detail = msg.split(":", 1)[-1].strip() if ":" in msg else msg
-            errors.append(f"{sur_fn}: {detail}")
+            if live_triplet:
+                errors.append(f"{sur_fn}: {detail}")
+            else:
+                warnings.append(
+                    f"{sur_fn}: surrogate archive not on S3 for this data snapshot "
+                    f"({detail}); plots 2–3 use measurement interpolation."
+                )
         elif _message_targets_location(msg, primary_nx) and any(
             token in msg.lower() for token in ("skipped", "not found", "not loaded", "missing")
         ):
@@ -3555,8 +3879,14 @@ def collect_nsdf_triplet_load_issues(
                 warnings.append(f"{nx_fn}: {detail}")
 
     if bundle.surrogate is None:
-        if not any(sur_fn in item for item in errors):
-            errors.append(f"{sur_fn}: not loaded (missing or every fallback failed).")
+        if not any(sur_fn in item for item in errors + warnings):
+            if live_triplet:
+                errors.append(f"{sur_fn}: not loaded (missing or every fallback failed).")
+            else:
+                warnings.append(
+                    f"{sur_fn}: data-only archive (surrogate backup not on S3); "
+                    "plots 2–3 use measurement interpolation."
+                )
     elif primary_sur:
         primary_base = _location_basename(primary_sur)
         loaded_base = _location_basename(loaded_sur)
@@ -4481,6 +4811,26 @@ def _shared_field_limits(
     return lo, hi
 
 
+def resolve_estimate_color_limits(
+    *arrays: np.ndarray,
+    manual_low: Optional[float] = None,
+    manual_high: Optional[float] = None,
+    fallback: Tuple[float, float] = (0.0, 1.0),
+) -> Tuple[float, float]:
+    """
+    Color scale for measurement + prediction panels.
+
+    Uses ``manual_low`` / ``manual_high`` when both are finite and ``low < high``;
+    otherwise falls back to data-driven min/max via ``_shared_field_limits``.
+    """
+    if manual_low is not None and manual_high is not None:
+        lo = float(manual_low)
+        hi = float(manual_high)
+        if math.isfinite(lo) and math.isfinite(hi) and lo < hi:
+            return lo, hi
+    return _shared_field_limits(*arrays, fallback=fallback)
+
+
 _STRAIN_COLORBAR_MARGIN = 75
 _STRAIN_FRAME_BASE = 360
 _STRAIN_MIN_BORDER_LEFT = 58
@@ -4719,6 +5069,30 @@ def _parse_trend_y_value(value: Any) -> Optional[float]:
     return numeric if math.isfinite(numeric) else None
 
 
+def _peek_transformed_stddevs_avg_scalar(
+    surrogate_doc: Any,
+) -> Optional[float]:
+    """
+    Return one average-uncertainty value from a surrogate snapshot.
+
+    Accepts the current pipeline format ``transformed_stddevs_avg: <float>`` as
+    well as a single ``[[id, avg]]`` pair. Returns ``None`` when the field holds
+    a multi-step history (handled via the selected ``surrogate.json`` instead).
+    """
+    if not isinstance(surrogate_doc, Mapping):
+        return None
+    raw = surrogate_doc.get("transformed_stddevs_avg")
+    if raw is None:
+        return None
+    scalar = _parse_trend_y_value(raw)
+    if scalar is not None:
+        return scalar
+    points, _ = parse_transformed_stddevs_avg_points(raw)
+    if len(points) == 1:
+        return float(points[0][1])
+    return None
+
+
 def _append_transformed_stddevs_avg_point(
     points: List[Tuple[str, float]],
     *,
@@ -4754,6 +5128,9 @@ def parse_transformed_stddevs_avg_points(
     """
     warnings: List[str] = []
     if value is None:
+        return [], warnings
+    scalar = _parse_trend_y_value(value)
+    if scalar is not None:
         return [], warnings
     if isinstance(value, Mapping):
         ids = value.get("id")
@@ -4873,6 +5250,10 @@ def _uncertainty_point_from_surrogate_doc(
     """Return (step_id, y, source) for one snapshot's contribution to the trend line."""
     if not isinstance(surrogate_doc, Mapping):
         return None, None, "none"
+    scalar = _peek_transformed_stddevs_avg_scalar(surrogate_doc)
+    if scalar is not None:
+        label = (step_id or "").strip() or str(step_index)
+        return label, scalar, "transformed_stddevs_avg"
     points, _ = parse_transformed_stddevs_avg_points(
         surrogate_doc.get("transformed_stddevs_avg")
     )
@@ -4934,7 +5315,7 @@ def _trend_current_index(
         return None
     if current_snapshot != "latest":
         for idx, step_id in enumerate(step_ids):
-            if step_id == current_snapshot:
+            if _trend_step_matches_snapshot(step_id, current_snapshot):
                 return idx
     fallback = _snapshot_index_in_series(chrono_snaps, current_snapshot, len(step_ids))
     return fallback
@@ -4954,6 +5335,18 @@ def uncertainty_trend_from_surrogate_doc(
     """
     if not isinstance(surrogate_doc, Mapping):
         return None
+    scalar = _peek_transformed_stddevs_avg_scalar(surrogate_doc)
+    current_snapshot = (current_snapshot or "latest").strip() or "latest"
+    if scalar is not None:
+        step_id = current_snapshot if current_snapshot != "latest" else "latest"
+        return UncertaintyTrendSeries(
+            step_ids=[step_id],
+            y=np.asarray([scalar], dtype=np.float64),
+            labels=[triplet_suffix_trend_label(step_id)],
+            current_index=0,
+            source="transformed_stddevs_avg",
+            warnings=[],
+        )
     full_points, parse_warnings = parse_transformed_stddevs_avg_points(
         surrogate_doc.get("transformed_stddevs_avg")
     )
@@ -4964,7 +5357,7 @@ def uncertainty_trend_from_surrogate_doc(
         current_index: Optional[int] = None
         if current_snapshot != "latest":
             for idx, step_id in enumerate(step_ids):
-                if step_id == current_snapshot:
+                if _trend_step_matches_snapshot(step_id, current_snapshot):
                     current_index = idx
                     break
         elif step_ids:
@@ -4972,7 +5365,7 @@ def uncertainty_trend_from_surrogate_doc(
         return UncertaintyTrendSeries(
             step_ids=step_ids,
             y=ys,
-            labels=list(step_ids),
+            labels=_trend_labels_for_step_ids(step_ids),
             current_index=current_index,
             source="transformed_stddevs_avg",
             warnings=parse_warnings,
@@ -4989,9 +5382,79 @@ def uncertainty_trend_from_surrogate_doc(
     return UncertaintyTrendSeries(
         step_ids=[step_id],
         y=np.asarray([mean_val], dtype=np.float64),
-        labels=[step_id],
+        labels=[triplet_suffix_trend_label(step_id)],
         current_index=0,
         source="uncertainty_grid_mean",
+        warnings=warnings,
+    )
+
+
+def _build_per_snapshot_uncertainty_trend(
+    chrono: Sequence[NSDFSnapshotRef],
+    base_paths: StrainDashboardPaths,
+    *,
+    grid_size: Tuple[int, int],
+    current_snapshot: str,
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+    remote_linked: bool = False,
+    allow_file_load: bool = True,
+) -> UncertaintyTrendSeries:
+    """One trend point per ``surrogate_<suffix>.json`` (x = file id, y = scalar avg)."""
+    warnings: List[str] = []
+    step_ids_out: List[str] = []
+    ys_out: List[float] = []
+    labels_out: List[str] = []
+    current_index: Optional[int] = None
+    current_snapshot = (current_snapshot or "latest").strip() or "latest"
+
+    for step_idx, snap in enumerate(chrono, start=1):
+        suffix = snap.suffix or "latest"
+        step_key = suffix
+        display_label = triplet_suffix_trend_label(step_key)
+        if suffix != "latest" and not is_valid_nsdf_version_suffix(suffix):
+            warnings.append(f"Snapshot {display_label}: invalid version suffix; skipped.")
+            continue
+        y_val = snap.uncertainty_trend_y
+        if y_val is None and allow_file_load:
+            try:
+                snap_paths = apply_nsdf_version_suffix(
+                    base_paths,
+                    "" if suffix == "latest" else suffix,
+                )
+            except ValueError as exc:
+                warnings.append(f"Snapshot {display_label}: {exc}")
+                continue
+            surrogate_doc = load_surrogate_doc_for_paths(
+                snap_paths,
+                mongo_s3_auth=mongo_s3_auth,
+                remote_linked=remote_linked,
+            )
+            _step_id, loaded_y, _point_source = _uncertainty_point_from_surrogate_doc(
+                surrogate_doc,
+                grid_size=grid_size,
+                step_index=step_idx,
+                step_id=step_key,
+            )
+            if loaded_y is not None:
+                y_val = loaded_y
+        if y_val is None:
+            if allow_file_load:
+                warnings.append(
+                    f"Snapshot {display_label}: no transformed_stddevs_avg or uncertainty grid."
+                )
+            continue
+        step_ids_out.append(step_key)
+        ys_out.append(float(y_val))
+        labels_out.append(display_label)
+        if suffix == current_snapshot:
+            current_index = len(step_ids_out) - 1
+
+    return UncertaintyTrendSeries(
+        step_ids=step_ids_out,
+        y=np.asarray(ys_out, dtype=np.float64),
+        labels=labels_out,
+        current_index=current_index,
+        source="per_snapshot_transformed_stddevs_avg" if step_ids_out else "per_snapshot",
         warnings=warnings,
     )
 
@@ -5036,8 +5499,9 @@ def build_uncertainty_trend_series(
     """
     Build avg-uncertainty vs time-step series for the active workflow.
 
-    Prefers ``transformed_stddevs_avg`` ``[[id, avg], ...]`` from the selected
-    ``surrogate.json``; falls back to per-snapshot means from uncertainty grids.
+    Prefers one ``transformed_stddevs_avg`` scalar per ``surrogate_<suffix>.json``
+    (x = snapshot id). Falls back to a multi-step history array in the selected
+    ``surrogate.json``, then per-snapshot uncertainty-grid means.
     """
     warnings: List[str] = []
     snaps = triplet_index.snapshots_for_workflow(workflow_id)
@@ -5050,6 +5514,24 @@ def build_uncertainty_trend_series(
         )
 
     chrono = _snapshots_chronological(snaps)
+    per_snapshot = _build_per_snapshot_uncertainty_trend(
+        chrono,
+        base_paths,
+        grid_size=grid_size,
+        current_snapshot=current_snapshot,
+        mongo_s3_auth=mongo_s3_auth,
+        remote_linked=remote_linked,
+        allow_file_load=allow_per_snapshot_fallback,
+    )
+    warnings.extend(per_snapshot.warnings)
+    if per_snapshot.step_ids:
+        if per_snapshot.current_index is None and current_snapshot == "latest" and chrono:
+            per_snapshot = replace(per_snapshot, current_index=len(per_snapshot.step_ids) - 1)
+        return replace(
+            per_snapshot,
+            warnings=warnings,
+        )
+
     trend_surrogate_paths = surrogate_paths or apply_nsdf_version_suffix(base_paths, "")
     trend_doc = load_surrogate_doc_for_paths(
         trend_surrogate_paths,
@@ -5073,7 +5555,7 @@ def build_uncertainty_trend_series(
         return UncertaintyTrendSeries(
             step_ids=step_ids,
             y=ys,
-            labels=list(step_ids),
+            labels=_trend_labels_for_step_ids(step_ids),
             current_index=current_index,
             source="transformed_stddevs_avg",
             warnings=warnings,
@@ -5085,7 +5567,7 @@ def build_uncertainty_trend_series(
         grid_size=grid_size,
     )
     if quick is not None:
-        return quick
+        return replace(quick, warnings=[*warnings, *quick.warnings])
 
     if not allow_per_snapshot_fallback:
         return UncertaintyTrendSeries(
@@ -5096,6 +5578,7 @@ def build_uncertainty_trend_series(
             or ["Uncertainty trend will update after the snapshot catalog finishes loading."],
         )
 
+    # Last resort: mean uncertainty grid per snapshot (loads full surrogate each time).
     step_ids_out: List[str] = []
     ys_out: List[float] = []
     labels_out: List[str] = []
@@ -5104,30 +5587,33 @@ def build_uncertainty_trend_series(
 
     for step_idx, snap in enumerate(chrono, start=1):
         suffix = snap.suffix or "latest"
-        label = "Latest" if not snap.suffix else snap.suffix
-        snap_paths = apply_nsdf_version_suffix(
-            base_paths,
-            "" if suffix == "latest" else suffix,
-        )
+        step_key = suffix
+        display_label = triplet_suffix_trend_label(step_key)
+        if suffix != "latest" and not is_valid_nsdf_version_suffix(suffix):
+            warnings.append(f"Snapshot {display_label}: invalid version suffix; skipped.")
+            continue
+        try:
+            snap_paths = apply_nsdf_version_suffix(
+                base_paths,
+                "" if suffix == "latest" else suffix,
+            )
+        except ValueError as exc:
+            warnings.append(f"Snapshot {display_label}: {exc}")
+            continue
         surrogate_doc = load_surrogate_doc_for_paths(
             snap_paths,
             mongo_s3_auth=mongo_s3_auth,
             remote_linked=remote_linked,
         )
-        step_id, y_val, _source = _uncertainty_point_from_surrogate_doc(
-            surrogate_doc,
-            grid_size=grid_size,
-            step_index=step_idx,
-            step_id=label,
-        )
-        if y_val is None:
-            warnings.append(f"Snapshot {label}: no transformed_stddevs_avg or uncertainty grid.")
+        mean_val = _mean_uncertainty_from_surrogate_doc(surrogate_doc, grid_size=grid_size)
+        if mean_val is None:
+            warnings.append(
+                f"Snapshot {display_label}: no transformed_stddevs_avg or uncertainty grid."
+            )
             continue
-        if step_id is None:
-            step_id = label
-        step_ids_out.append(step_id)
-        ys_out.append(float(y_val))
-        labels_out.append(label)
+        step_ids_out.append(step_key)
+        ys_out.append(float(mean_val))
+        labels_out.append(display_label)
         if suffix == current_snapshot:
             current_index = len(step_ids_out) - 1
 
@@ -5625,7 +6111,12 @@ def _build_strain_triplet_figures(
         measured_vals = np.array([], dtype=np.float64)
 
     est_palette = _resolve_bokeh_palette(cfg.colormap_estimate)
-    est_lo, est_hi = _shared_field_limits(est, measured_vals)
+    est_lo, est_hi = resolve_estimate_color_limits(
+        est,
+        measured_vals,
+        manual_low=cfg.estimate_color_low,
+        manual_high=cfg.estimate_color_high,
+    )
     est_mapper = LinearColorMapper(palette=est_palette, low=est_lo, high=est_hi)
     panel_layout = _strain_figure_layout(nx, ny)
 
@@ -5781,10 +6272,17 @@ def make_uncertainty_trend_figure(
     from bokeh.plotting import figure
 
     if not series.step_ids:
+        if series.warnings:
+            hint = "<br>".join(
+                f"<span style='color:#666;'>{html.escape(msg)}</span>"
+                for msg in series.warnings[:2]
+            )
+        else:
+            hint = "<i>No uncertainty trend data for this workflow yet.</i>"
         return Div(
             text=(
                 f"<b>{html.escape(cfg.title_uncertainty_trend)}</b><br>"
-                "<i>No uncertainty trend data for this workflow yet.</i>"
+                f"{hint}"
             ),
             width=layout.outer_width,
             height=layout.outer_height,
@@ -5829,9 +6327,17 @@ def make_uncertainty_trend_figure(
         highlight_id=highlight_id,
     )
     sparse_set = set(sparse_ticks)
+    tick_text = {
+        step_id: (
+            series.labels[idx]
+            if idx < len(series.labels) and series.labels[idx]
+            else triplet_suffix_trend_label(step_id)
+        )
+        for idx, step_id in enumerate(series.step_ids)
+    }
     # FactorRange is categorical: blank overrides hide labels without changing point positions.
     p.xaxis.major_label_overrides = {
-        step_id: step_id if step_id in sparse_set else ""
+        step_id: tick_text[step_id] if step_id in sparse_set else ""
         for step_id in series.step_ids
     }
     p.xaxis.major_label_orientation = math.pi / 4 if len(sparse_ticks) > 4 else 0.0
@@ -5839,7 +6345,7 @@ def make_uncertainty_trend_figure(
         data={
             "step_id": list(series.step_ids),
             "y": series.y.tolist(),
-            "label": series.labels,
+            "label": series.labels or _trend_labels_for_step_ids(series.step_ids),
         }
     )
     p.line("step_id", "y", source=source, line_width=2, color="#2c7bb6")

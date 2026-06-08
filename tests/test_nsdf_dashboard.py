@@ -559,6 +559,91 @@ def test_parse_transformed_stddevs_avg_points() -> None:
     points, _ = parse_transformed_stddevs_avg_points([[1.0, 0.5], [2.0, 0.3]])
     assert points == [("1", 0.5), ("2", 0.3)]
 
+    points, _ = parse_transformed_stddevs_avg_points(0.42)
+    assert points == []
+
+
+def test_peek_transformed_stddevs_avg_scalar() -> None:
+    from nsdf_dashboard.ornl_chess_strain_lib import _peek_transformed_stddevs_avg_scalar
+
+    assert _peek_transformed_stddevs_avg_scalar({"transformed_stddevs_avg": 0.15}) == 0.15
+    assert _peek_transformed_stddevs_avg_scalar(
+        {"transformed_stddevs_avg": [["20260608T120000Z", 0.2]]}
+    ) == 0.2
+    assert _peek_transformed_stddevs_avg_scalar(
+        {"transformed_stddevs_avg": [["a", 0.9], ["b", 0.4]]}
+    ) is None
+
+
+def test_build_uncertainty_trend_series_from_scalar_per_snapshot_surrogates() -> None:
+    from nsdf_dashboard.ornl_chess_strain_lib import _build_triplet_index_from_directory
+
+    with tempfile.TemporaryDirectory() as tmp:
+        for suffix, y in (
+            ("20260601T100000Z", 0.9),
+            ("20260602T100000Z", 0.6),
+            ("20260603T100000Z", 0.4),
+        ):
+            with open(os.path.join(tmp, f"data_{suffix}.json"), "w", encoding="utf-8") as fh:
+                json.dump({**_base_data(), "workflow_id": "wf-scalar"}, fh)
+            with open(os.path.join(tmp, f"surrogate_{suffix}.json"), "w", encoding="utf-8") as fh:
+                json.dump(
+                    {"workflow_id": "wf-scalar", "transformed_stddevs_avg": y},
+                    fh,
+                )
+        index = _build_triplet_index_from_directory(tmp)
+        paths = StrainDashboardPaths(local_json_path=os.path.join(tmp, "data.json"))
+        series = build_uncertainty_trend_series(
+            index,
+            paths,
+            workflow_id="wf-scalar",
+            current_snapshot="20260602T100000Z",
+            grid_size=(11, 11),
+        )
+        assert series.step_ids == [
+            "20260601T100000Z",
+            "20260602T100000Z",
+            "20260603T100000Z",
+        ]
+        assert series.y.tolist() == [0.9, 0.6, 0.4]
+        assert series.current_index == 1
+        assert series.source == "per_snapshot_transformed_stddevs_avg"
+
+
+def test_build_uncertainty_trend_series_from_composite_snapshot_ids() -> None:
+    from nsdf_dashboard.ornl_chess_strain_lib import _build_triplet_index_from_directory
+
+    with tempfile.TemporaryDirectory() as tmp:
+        for snap_id, y in (
+            ("20260608T222314Z_48", 0.9),
+            ("20260608T222314Z_49", 0.6),
+            ("20260608T222314Z_50", 0.4),
+        ):
+            with open(os.path.join(tmp, f"data_{snap_id}.json"), "w", encoding="utf-8") as fh:
+                json.dump({**_base_data(), "workflow_id": "wf-composite"}, fh)
+            with open(os.path.join(tmp, f"surrogate_{snap_id}.json"), "w", encoding="utf-8") as fh:
+                json.dump(
+                    {"workflow_id": "wf-composite", "transformed_stddevs_avg": y},
+                    fh,
+                )
+        index = _build_triplet_index_from_directory(tmp)
+        paths = StrainDashboardPaths(local_json_path=os.path.join(tmp, "data.json"))
+        series = build_uncertainty_trend_series(
+            index,
+            paths,
+            workflow_id="wf-composite",
+            current_snapshot="20260608T222314Z_49",
+            grid_size=(11, 11),
+        )
+        assert series.step_ids == [
+            "20260608T222314Z_48",
+            "20260608T222314Z_49",
+            "20260608T222314Z_50",
+        ]
+        assert series.labels == ["48", "49", "50"]
+        assert series.current_index == 1
+        assert series.y.tolist() == [0.9, 0.6, 0.4]
+
 
 def test_build_uncertainty_trend_skips_per_snapshot_when_disabled() -> None:
     index = NSDFTripletIndex(
@@ -689,6 +774,22 @@ def test_next_x_accepts_lab_pair_when_dataset_x_size_is_gp_dim() -> None:
     assert float(info.entries[0].coordinates[0, 1]) == 33.247209043840385
 
 
+def test_resolve_estimate_color_limits_manual_and_dynamic() -> None:
+    from nsdf_dashboard.ornl_chess_strain_lib import resolve_estimate_color_limits
+
+    est = np.array([[0.1, 0.5], [0.2, 0.8]], dtype=np.float64)
+    measured = np.array([0.05, 0.9], dtype=np.float64)
+    assert resolve_estimate_color_limits(est, measured) == (0.05, 0.9)
+    assert resolve_estimate_color_limits(est, measured, manual_low=-1.0, manual_high=1.0) == (
+        -1.0,
+        1.0,
+    )
+    assert resolve_estimate_color_limits(est, measured, manual_low=1.0, manual_high=-1.0) == (
+        0.05,
+        0.9,
+    )
+
+
 def test_next_x_object_schema_loads_from_local_bundle() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         data_path = os.path.join(tmp, "data.json")
@@ -738,6 +839,39 @@ def test_nsdf_version_suffix_triplet_and_apply() -> None:
     assert parse_nsdf_data_filename("data.json") is None
     assert parse_nsdf_data_filename("data_20260606T223505Z.json") == "20260606T223505Z"
 
+    from nsdf_dashboard.ornl_chess_strain_lib import parse_nsdf_next_x_filename, parse_nsdf_surrogate_filename
+
+    assert parse_nsdf_surrogate_filename("surrogate_20260606T223505Z.json") == "20260606T223505Z"
+    assert parse_nsdf_surrogate_filename("surrogate_20260608T222409Z_50.json") == "20260608T222409Z_50"
+    assert parse_nsdf_surrogate_filename("surrogate_50.json") == "50"
+    assert parse_nsdf_next_x_filename("next_x_20260606T223505Z.json") == "20260606T223505Z"
+    assert parse_nsdf_next_x_filename("next_x_50.json") == "50"
+    assert parse_nsdf_data_filename("data_50.json") == "50"
+    assert nsdf_triplet_basenames("50") == (
+        "data_50.json",
+        "surrogate_50.json",
+        "next_x_50.json",
+    )
+    assert nsdf_triplet_basenames("20260608T222409Z_50") == (
+        "data_20260608T222409Z_50.json",
+        "surrogate_20260608T222409Z_50.json",
+        "next_x_20260608T222409Z_50.json",
+    )
+    assert parse_nsdf_data_filename("data_20260608T222314Z_49.json") == "20260608T222314Z_49"
+    assert parse_nsdf_surrogate_filename("surrogate_20260608T222314Z_49.json") == "20260608T222314Z_49"
+
+    from nsdf_dashboard.ornl_chess_strain_lib import triplet_snapshot_id, triplet_suffix_trend_label
+
+    assert triplet_snapshot_id("20260608T221354Z_8") == "8"
+    assert triplet_snapshot_id("20260608T214403Z_8") == "8"
+    assert triplet_suffix_trend_label("20260608T222314Z_49") == "49"
+    assert triplet_suffix_trend_label("20260608T222409Z_50") == "50"
+    assert triplet_suffix_trend_label("49") == "49"
+    assert triplet_suffix_trend_label("20260606T223505Z") == "20260606T223505Z"
+    assert triplet_suffix_trend_label("latest") == "Latest"
+    assert parse_nsdf_surrogate_filename("surrogate_.json") is None
+    assert parse_nsdf_surrogate_filename("surrogate_bad id.json") is None
+
     base = StrainDashboardPaths(
         local_data_dir="/tmp/chess-data",
     )
@@ -773,6 +907,36 @@ def test_apply_nsdf_file_suffixes_accepts_latest_selector() -> None:
     assert versioned.next_x_json_path.endswith("next_x.json")
 
 
+def test_triplet_index_groups_files_by_snapshot_id_suffix() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        workflow = "wf-id-triplet"
+        for snap_id in ("48", "49", "50"):
+            with open(os.path.join(tmp, f"data_{snap_id}.json"), "w", encoding="utf-8") as fh:
+                json.dump({**_base_data(), "workflow_id": workflow}, fh)
+            with open(os.path.join(tmp, f"surrogate_{snap_id}.json"), "w", encoding="utf-8") as fh:
+                json.dump({"workflow_id": workflow, "transformed_stddevs_avg": float(snap_id)}, fh)
+            with open(os.path.join(tmp, f"next_x_{snap_id}.json"), "w", encoding="utf-8") as fh:
+                json.dump({"workflow_id": workflow, "data": [[1.0, 2.0]]}, fh)
+        index = _build_triplet_index_from_directory(tmp)
+        snaps = index.snapshots_for_workflow(workflow)
+        assert [snap.suffix for snap in snaps] == ["50", "49", "48"]
+        assert snaps[0].uncertainty_trend_y == 50.0
+
+        paths = StrainDashboardPaths(local_json_path=os.path.join(tmp, "data.json"))
+        versioned = apply_nsdf_file_suffixes(
+            paths,
+            data_suffix="49",
+            surrogate_suffix="49",
+            next_x_suffix="49",
+            strict=True,
+        )
+        assert versioned.local_json_path.endswith("data_49.json")
+        assert versioned.surrogate_json_path.endswith("surrogate_49.json")
+        assert versioned.next_x_json_path.endswith("next_x_49.json")
+        assert resolve_auxiliary_suffix_for_data_snapshot("49", ["48", "49", "50"]) == "49"
+        assert resolve_auxiliary_suffix_for_data_snapshot("49", ["48", "50"]) == "latest"
+
+
 def test_promote_gateway_preserves_strict_triplet_paths() -> None:
     gateway = "https://gateway.example/bucket/prefix/data.json?access_key=a&secret_key=b"
     paths = StrainDashboardPaths(
@@ -798,6 +962,30 @@ def test_prepare_nsdf_load_paths_sets_strict_s3_triplet_keys() -> None:
     assert prepared.strict_triplet_paths is True
     assert prepared.s3_surrogate_key == "prefix/surrogate.json"
     assert prepared.s3_next_x_key == "prefix/next_x.json"
+
+
+def test_prepare_nsdf_load_paths_reapplies_versioned_s3_triplet_keys() -> None:
+    suffix = "20260608T222204Z_48"
+    paths = apply_nsdf_file_suffixes(
+        StrainDashboardPaths(
+            s3_bucket="scientistcloud",
+            s3_data_key="chess-data/data.json",
+            s3_surrogate_key="chess-data/surrogate.json",
+            s3_next_x_key="chess-data/next_x.json",
+            version_suffix=suffix,
+            surrogate_version_suffix=suffix,
+            next_x_version_suffix=suffix,
+            strict_triplet_paths=True,
+        ),
+        data_suffix=suffix,
+        surrogate_suffix=suffix,
+        next_x_suffix=suffix,
+        strict=True,
+    )
+    prepared = lib._prepare_nsdf_load_paths(paths)
+    assert prepared.s3_data_key == f"chess-data/data_{suffix}.json"
+    assert prepared.s3_surrogate_key == f"chess-data/surrogate_{suffix}.json"
+    assert prepared.s3_next_x_key == f"chess-data/next_x_{suffix}.json"
 
 
 def test_iter_surrogate_s3_key_candidates_strict_skips_listing(monkeypatch) -> None:
@@ -826,6 +1014,26 @@ def test_apply_nsdf_file_suffixes_keeps_explicit_s3_keys_for_latest() -> None:
     versioned = apply_nsdf_file_suffixes(paths, strict=True)
     assert versioned.s3_surrogate_key == "test-chess/surrogate.json"
     assert versioned.s3_next_x_key == "test-chess/next_x.json"
+
+
+def test_apply_nsdf_file_suffixes_replaces_latest_explicit_keys_for_versioned_suffix() -> None:
+    paths = StrainDashboardPaths(
+        s3_bucket="b",
+        s3_data_key="chess-data/data.json",
+        s3_surrogate_key="chess-data/surrogate.json",
+        s3_next_x_key="chess-data/next_x.json",
+    )
+    suffix = "20260608T222204Z_48"
+    versioned = apply_nsdf_file_suffixes(
+        paths,
+        data_suffix=suffix,
+        surrogate_suffix=suffix,
+        next_x_suffix=suffix,
+        strict=True,
+    )
+    assert versioned.s3_data_key == f"chess-data/data_{suffix}.json"
+    assert versioned.s3_surrogate_key == f"chess-data/surrogate_{suffix}.json"
+    assert versioned.s3_next_x_key == f"chess-data/next_x_{suffix}.json"
 
 
 def test_apply_nsdf_file_suffixes_aligns_next_x_with_surrogate_prefix() -> None:
@@ -869,6 +1077,20 @@ def test_apply_nsdf_file_suffixes_independent() -> None:
     assert versioned.strict_triplet_paths is True
 
 
+def test_triplet_groups_link_auxiliary_files_by_snapshot_id() -> None:
+    groups = lib._triplet_groups_from_object_keys(
+        [
+            "chess-data/data_20260608T221354Z_8.json",
+            "chess-data/surrogate_20260608T214403Z_8.json",
+            "chess-data/next_x_20260608T220000Z_8.json",
+        ]
+    )
+    data_group = groups["20260608T221354Z_8"]
+    assert data_group["data"].endswith("data_20260608T221354Z_8.json")
+    assert data_group["surrogate"].endswith("surrogate_20260608T214403Z_8.json")
+    assert data_group["next_x"].endswith("next_x_20260608T220000Z_8.json")
+
+
 def test_resolve_auxiliary_suffix_for_data_snapshot() -> None:
     available = ["20260601T100000Z", "20260603T100000Z"]
     assert resolve_auxiliary_suffix_for_data_snapshot("latest", available) == "latest"
@@ -878,14 +1100,21 @@ def test_resolve_auxiliary_suffix_for_data_snapshot() -> None:
     )
     assert (
         resolve_auxiliary_suffix_for_data_snapshot("20260602T100000Z", available)
-        == "20260603T100000Z"
+        == "latest"
     )
     assert (
         resolve_auxiliary_suffix_for_data_snapshot(
             "20260607T201904Z",
             ["20260607T201907Z", "20260607T201906Z"],
         )
-        == "20260607T201906Z"
+        == "latest"
+    )
+    assert (
+        resolve_auxiliary_suffix_for_data_snapshot(
+            "20260608T221354Z_8",
+            ["20260608T214403Z_8", "20260608T222408Z_50"],
+        )
+        == "20260608T214403Z_8"
     )
 
 
@@ -984,6 +1213,156 @@ def test_collect_triplet_warning_when_next_x_missing() -> None:
     errors, warnings = collect_nsdf_triplet_load_issues(paths, bundle)
     assert not errors
     assert any("next_x.json" in warn for warn in warnings)
+
+
+def test_triplet_index_auxiliary_selectors_skip_data_only_archives() -> None:
+    suffix_data_only = "20260608T214403Z_8"
+    suffix_full = "20260608T222408Z_50"
+    index = NSDFTripletIndex(
+        snapshots=[
+            NSDFSnapshotRef(
+                suffix=suffix_full,
+                workflow_id="wf",
+                sort_key=suffix_full,
+                has_surrogate_archive=True,
+                has_next_x_archive=True,
+            ),
+            NSDFSnapshotRef(
+                suffix=suffix_data_only,
+                workflow_id="wf",
+                sort_key=suffix_data_only,
+                has_surrogate_archive=False,
+                has_next_x_archive=False,
+            ),
+        ],
+        by_workflow={
+            "wf": [
+                NSDFSnapshotRef(
+                    suffix=suffix_full,
+                    workflow_id="wf",
+                    sort_key=suffix_full,
+                    has_surrogate_archive=True,
+                    has_next_x_archive=True,
+                ),
+                NSDFSnapshotRef(
+                    suffix=suffix_data_only,
+                    workflow_id="wf",
+                    sort_key=suffix_data_only,
+                    has_surrogate_archive=False,
+                    has_next_x_archive=False,
+                ),
+            ],
+        },
+    )
+    data_opts = {value for value, _label in index.snapshot_select_options("wf")}
+    sur_opts = {value for value, _label in index.surrogate_select_options("wf")}
+    nx_opts = {value for value, _label in index.next_x_select_options("wf")}
+    assert suffix_data_only in data_opts
+    assert suffix_data_only not in sur_opts
+    assert suffix_data_only not in nx_opts
+    assert suffix_full in sur_opts
+    assert suffix_full in nx_opts
+    assert (
+        resolve_auxiliary_suffix_for_data_snapshot(
+            suffix_data_only,
+            [value for value in nx_opts if value != "latest"],
+        )
+        == "latest"
+    )
+
+
+def test_s3_archived_data_loads_live_next_x_overlay() -> None:
+    suffix = "20260608T214403Z_8"
+
+    class _LiveNextXS3Client(_FakeS3Client):
+        def get_object(self, Bucket: str, Key: str) -> dict:  # noqa: N803
+            self.keys_requested.append(Key)
+            if Bucket != "my-bucket":
+                raise AssertionError(f"unexpected bucket {Bucket}")
+            if Key == f"chess-data/data_{suffix}.json":
+                return {"Body": _FakeBody(_base_data())}
+            if Key == f"chess-data/surrogate_{suffix}.json":
+                from botocore.exceptions import ClientError
+
+                raise ClientError({"Error": {"Code": "NoSuchKey", "Message": "missing"}}, "GetObject")
+            if Key == "chess-data/surrogate.json":
+                return {
+                    "Body": _FakeBody(
+                        {
+                            "surrogate": [1.0, 2.0, 3.0, 4.0],
+                            "uncertainty": [0.1, 0.2, 0.3, 0.4],
+                            "bounds": [[0.0, 2.0], [0.0, 2.0]],
+                        }
+                    )
+                }
+            if Key == f"chess-data/next_x_{suffix}.json":
+                from botocore.exceptions import ClientError
+
+                raise ClientError({"Error": {"Code": "NoSuchKey", "Message": "missing"}}, "GetObject")
+            if Key == "chess-data/next_x.json":
+                return {
+                    "Body": _FakeBody(
+                        [
+                            {
+                                "workflow_id": "wf",
+                                "next_x": [[5.0, 5.0]],
+                            }
+                        ]
+                    )
+                }
+            raise AssertionError(f"unexpected key {Key}")
+
+    fake_client = _LiveNextXS3Client()
+    old_make_client = lib._make_nsdf_s3_client
+    try:
+        lib._make_nsdf_s3_client = lambda paths, mongo_s3_auth=None: fake_client
+        paths = apply_nsdf_file_suffixes(
+            StrainDashboardPaths(
+                s3_bucket="my-bucket",
+                s3_data_key="chess-data/data.json",
+            ),
+            data_suffix=suffix,
+            surrogate_suffix="latest",
+            next_x_suffix="latest",
+            strict=True,
+        )
+        bundle = load_nsdf_json_bundle(paths)
+        assert bundle.next_x is not None
+        assert bundle.paths.s3_data_key == f"chess-data/data_{suffix}.json"
+        assert bundle.paths.s3_next_x_key == "chess-data/next_x.json"
+        assert bundle.paths.next_x_version_suffix == ""
+        assert "chess-data/next_x.json" in fake_client.keys_requested
+        assert f"chess-data/next_x_{suffix}.json" not in fake_client.keys_requested
+    finally:
+        lib._make_nsdf_s3_client = old_make_client
+
+
+def test_collect_triplet_warning_when_archived_surrogate_missing() -> None:
+    suffix = "20260608T221354Z_40"
+    paths = apply_nsdf_file_suffixes(
+        StrainDashboardPaths(
+            s3_bucket="scientistcloud",
+            s3_data_key="chess-data/data.json",
+        ),
+        data_suffix=suffix,
+        surrogate_suffix=suffix,
+        next_x_suffix=suffix,
+        strict=True,
+    )
+    bundle = NSDFLoadedBundle(
+        data=_base_data(),
+        surrogate=None,
+        messages=[
+            f"Loaded NSDF data JSON from s3://scientistcloud/chess-data/data_{suffix}.json",
+            f"S3 surrogate JSON skipped (chess-data/surrogate_{suffix}.json): missing",
+        ],
+        paths=paths,
+    )
+    errors, warnings = collect_nsdf_triplet_load_issues(paths, bundle)
+    assert not errors
+    assert any(
+        "surrogate archive" in warn or "data-only archive" in warn for warn in warnings
+    )
 
 
 def test_stub_surrogate_rejected_and_idw_estimate_used() -> None:
@@ -1266,13 +1645,13 @@ def test_s3_bundle_loads_and_infers_surrogate_key() -> None:
         lib._make_nsdf_s3_client = old_make_client
 
 
-def test_dated_snapshot_falls_back_to_nearest_surrogate() -> None:
+def test_dated_snapshot_links_surrogate_by_snapshot_id_not_timestamp() -> None:
     with _local_files_first_for_testing():
         with tempfile.TemporaryDirectory() as tmp:
-            data_path = os.path.join(tmp, "data_20260606T223505Z.json")
+            data_path = os.path.join(tmp, "data_20260606T223505Z_1.json")
             with open(data_path, "w", encoding="utf-8") as fh:
                 json.dump(_base_data(), fh)
-            with open(os.path.join(tmp, "surrogate_20260606T223507Z.json"), "w", encoding="utf-8") as fh:
+            with open(os.path.join(tmp, "surrogate_20260606T223507Z_1.json"), "w", encoding="utf-8") as fh:
                 json.dump(
                     {
                         "surrogate": [1.0, 2.0, 3.0, 4.0],
@@ -1281,17 +1660,16 @@ def test_dated_snapshot_falls_back_to_nearest_surrogate() -> None:
                     },
                     fh,
                 )
-            paths = apply_nsdf_version_suffix(
+            paths = apply_nsdf_file_suffixes(
                 StrainDashboardPaths(local_data_dir=tmp),
-                "20260606T223505Z",
+                data_suffix="20260606T223505Z_1",
+                surrogate_suffix="20260606T223507Z_1",
+                next_x_suffix="latest",
+                strict=True,
             )
             bundle = load_nsdf_json_bundle(paths)
             assert bundle.surrogate is not None
             assert bundle.surrogate["surrogate"] == [1.0, 2.0, 3.0, 4.0]
-            cfg = StrainFieldPlotConfig()
-            cfg.grid_size = resolve_nsdf_grid_size(bundle.data, surrogate_doc=bundle.surrogate)[0]
-            grids = build_strain_field_grids(bundle.data, cfg, bundle.surrogate)
-            assert grids.meta["estimate_source"] == "surrogate_grid"
 
 
 def test_latest_without_surrogate_json_uses_timestamped_fallback() -> None:
@@ -1546,6 +1924,117 @@ def test_discover_triplet_index_falls_back_to_local_when_s3_empty(monkeypatch) -
         index = discover_nsdf_triplet_index(paths, base_dir=upload_dir, save_dir="")
         assert local_calls == [upload_dir]
         assert index.has_workflow(NSDF_UNKNOWN_WORKFLOW_ID)
+
+
+def test_prepare_nsdf_load_paths_keeps_live_triplet_for_latest() -> None:
+    paths = apply_nsdf_file_suffixes(
+        StrainDashboardPaths(
+            s3_bucket="scientistcloud",
+            s3_data_key="chess-data/data.json",
+        ),
+        data_suffix="latest",
+        surrogate_suffix="latest",
+        next_x_suffix="latest",
+        strict=True,
+    )
+    prepared = lib._prepare_nsdf_load_paths(paths)
+    assert prepared.s3_data_key == "chess-data/data.json"
+    assert prepared.s3_surrogate_key == "chess-data/surrogate.json"
+    assert prepared.s3_next_x_key == "chess-data/next_x.json"
+    assert prepared.version_suffix == ""
+    assert prepared.strict_triplet_paths is True
+
+
+def test_s3_default_loads_live_triplet_files() -> None:
+    backup_suffix = "20260608T222408Z_50"
+
+    class _LiveTripletClient(_FakeS3Client):
+        def get_object(self, Bucket: str, Key: str) -> dict:  # noqa: N803
+            self.keys_requested.append(Key)
+            if Bucket != "my-bucket":
+                raise AssertionError(f"unexpected bucket {Bucket}")
+            if backup_suffix in Key:
+                raise AssertionError(f"default load must not request backup key {Key}")
+            if Key == "chess-data/data.json":
+                return {"Body": _FakeBody(_base_data())}
+            if Key == "chess-data/surrogate.json":
+                return {
+                    "Body": _FakeBody(
+                        {
+                            "surrogate": [1.0, 2.0, 3.0, 4.0],
+                            "uncertainty": [0.1, 0.2, 0.3, 0.4],
+                            "bounds": [[0.0, 2.0], [0.0, 2.0]],
+                        }
+                    )
+                }
+            if Key == "chess-data/next_x.json":
+                return {"Body": _FakeBody([])}
+            raise AssertionError(f"unexpected key {Key}")
+
+    fake_client = _LiveTripletClient()
+    fake_client.listed_suffixes = [backup_suffix]
+    old_make_client = lib._make_nsdf_s3_client
+    try:
+        lib._make_nsdf_s3_client = lambda paths, mongo_s3_auth=None: fake_client
+        paths = apply_nsdf_file_suffixes(
+            StrainDashboardPaths(
+                s3_bucket="my-bucket",
+                s3_data_key="chess-data/data.json",
+            ),
+            data_suffix="latest",
+            surrogate_suffix="latest",
+            next_x_suffix="latest",
+            strict=True,
+        )
+        bundle = load_nsdf_json_bundle(paths)
+        assert bundle.paths.s3_data_key == "chess-data/data.json"
+        assert bundle.paths.s3_surrogate_key == "chess-data/surrogate.json"
+        assert bundle.paths.s3_next_x_key == "chess-data/next_x.json"
+        assert bundle.surrogate is not None
+        assert fake_client.keys_requested == [
+            "chess-data/data.json",
+            "chess-data/surrogate.json",
+            "chess-data/next_x.json",
+        ]
+    finally:
+        lib._make_nsdf_s3_client = old_make_client
+
+
+def test_s3_latest_load_does_not_fallback_to_versioned_data_backup() -> None:
+    suffix = "20260608T222204Z_48"
+
+    class _FallbackS3Client(_FakeS3Client):
+        def get_object(self, Bucket: str, Key: str) -> dict:  # noqa: N803
+            self.keys_requested.append(Key)
+            if Bucket != "my-bucket":
+                raise AssertionError(f"unexpected bucket {Bucket}")
+            if Key == "prefix/data.json":
+                from botocore.exceptions import ClientError
+
+                raise ClientError({"Error": {"Code": "NoSuchKey", "Message": "missing"}}, "GetObject")
+            if Key == f"prefix/data_{suffix}.json":
+                return {"Body": _FakeBody(_base_data())}
+            raise AssertionError(f"unexpected key {Key}")
+
+    fake_client = _FallbackS3Client()
+    fake_client.listed_suffixes = [suffix]
+    old_make_client = lib._make_nsdf_s3_client
+    try:
+        lib._make_nsdf_s3_client = lambda paths, mongo_s3_auth=None: fake_client
+        paths = StrainDashboardPaths(
+            s3_bucket="my-bucket",
+            s3_data_key="prefix/data.json",
+            strict_triplet_paths=True,
+        )
+        try:
+            load_nsdf_json_bundle(paths)
+            raise AssertionError("expected FileNotFoundError when live data.json is missing")
+        except FileNotFoundError as exc:
+            assert "rolling live triplet" in str(exc)
+            assert "prefix/data.json" in str(exc)
+        assert f"prefix/data_{suffix}.json" not in fake_client.keys_requested
+    finally:
+        lib._make_nsdf_s3_client = old_make_client
 
 
 def test_s3_surrogate_fallback_when_latest_triplet_missing() -> None:
@@ -1827,7 +2316,7 @@ def main() -> None:
         test_load_json_from_url_reads_prefix_via_data_json_key,
         test_env_file_parser_and_s3_config_detection,
         test_s3_bundle_loads_and_infers_surrogate_key,
-        test_dated_snapshot_falls_back_to_nearest_surrogate,
+        test_dated_snapshot_links_surrogate_by_snapshot_id_not_timestamp,
         test_latest_without_surrogate_json_uses_timestamped_fallback,
         test_s3_surrogate_fallback_when_latest_triplet_missing,
         test_local_data_dir_takes_priority_over_s3,
