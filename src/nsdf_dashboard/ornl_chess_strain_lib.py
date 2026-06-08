@@ -1501,15 +1501,22 @@ def _next_x_doc_is_recognized_format(doc: Any) -> bool:
     return isinstance(doc, list)
 
 
-def _next_x_coord_size(item: Mapping[str, Any]) -> int:
-    raw = item.get("dataset_x_size")
-    if isinstance(raw, int) and raw > 0:
-        return raw
-    if _is_number(raw):
-        parsed = int(raw)
-        if parsed > 0:
-            return parsed
-    return 2
+def _parse_next_x_coordinate_row(row_value: Any) -> Optional[Tuple[float, float]]:
+    """
+    Extract ``(labx, labz)`` from one ``next_x`` row.
+
+    The pipeline stores a single scan location as ``[labx, labz]`` even when
+    ``dataset_x_size`` describes the full GP input dimension (e.g. 16), not
+    the row width.
+    """
+    if not isinstance(row_value, list) or len(row_value) < 2:
+        return None
+    if not (_is_number(row_value[0]) and _is_number(row_value[1])):
+        return None
+    labx, labz = float(row_value[0]), float(row_value[1])
+    if not (math.isfinite(labx) and math.isfinite(labz)):
+        return None
+    return labx, labz
 
 
 def _iter_next_x_workflow_blocks(doc: Any) -> List[Mapping[str, Any]]:
@@ -1535,33 +1542,16 @@ def _parse_next_x_workflow_block(
     if not isinstance(data, list) or not data:
         warnings.append(f"Skipping {label} ({workflow_id!r}): data must be a non-empty list.")
         return None
-    coord_size = _next_x_coord_size(item)
     coords: List[Tuple[float, float]] = []
     for j, row_value in enumerate(data):
-        if not isinstance(row_value, list) or len(row_value) < coord_size:
+        parsed = _parse_next_x_coordinate_row(row_value)
+        if parsed is None:
             warnings.append(
-                f"Skipping {label} ({workflow_id!r}): data[{j}] must contain "
-                f"at least {coord_size} numeric coordinate value(s)."
+                f"Skipping {label} ({workflow_id!r}): data[{j}] must contain at least "
+                "two numeric labx/labz values."
             )
             return None
-        values = row_value[:coord_size]
-        if not all(_is_number(value) for value in values):
-            warnings.append(
-                f"Skipping {label} ({workflow_id!r}): data[{j}] must contain numeric values."
-            )
-            return None
-        floats = [float(value) for value in values]
-        if not all(math.isfinite(value) for value in floats):
-            warnings.append(
-                f"Skipping {label} ({workflow_id!r}): data[{j}] values must be finite."
-            )
-            return None
-        if coord_size < 2:
-            warnings.append(
-                f"Skipping {label} ({workflow_id!r}): dataset_x_size must be at least 2 for plotting."
-            )
-            return None
-        coords.append((floats[0], floats[1]))
+        coords.append(parsed)
     return NSDFNextXEntry(
         workflow_id=workflow_id,
         coordinates=np.asarray(coords, dtype=np.float64),
@@ -2699,9 +2689,11 @@ def validate_nsdf_next_x_doc(value: Any) -> NSDFNextXData:
 
     Current schema (single proposed point)::
 
-        {"workflow_id": "...", "dataset_x_size": 2, "data": [[labx, labz]]}
+        {"workflow_id": "...", "dataset_x_size": 16, "data": [[labx, labz]]}
 
-    Legacy schema (array of workflow blocks) is still accepted.
+    ``dataset_x_size`` is GP input metadata; plotting uses the first two values
+    in each ``data`` row as ``(labx, labz)``. Legacy array-of-blocks schema
+    is still accepted.
     """
     warnings: List[str] = []
     if value is None:

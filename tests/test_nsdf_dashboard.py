@@ -671,6 +671,24 @@ def test_next_x_object_schema_single_point() -> None:
     assert info.total_points == 1
 
 
+def test_next_x_accepts_lab_pair_when_dataset_x_size_is_gp_dim() -> None:
+    """dataset_x_size describes GP input width, not the labx/labz row length."""
+    doc = [
+        {
+            "workflow_id": "6a2735dc9e0fe89c4479904a",
+            "data": [[14.072018275201788, 33.247209043840385]],
+            "dataset_x_size": 16,
+        },
+    ]
+    info = validate_nsdf_next_x_doc(doc)
+    assert not info.warnings
+    assert len(info.entries) == 1
+    assert info.entries[0].workflow_id == "6a2735dc9e0fe89c4479904a"
+    assert info.entries[0].coordinates.shape == (1, 2)
+    assert float(info.entries[0].coordinates[0, 0]) == 14.072018275201788
+    assert float(info.entries[0].coordinates[0, 1]) == 33.247209043840385
+
+
 def test_next_x_object_schema_loads_from_local_bundle() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         data_path = os.path.join(tmp, "data.json")
