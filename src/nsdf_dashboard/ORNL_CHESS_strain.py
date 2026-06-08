@@ -811,8 +811,14 @@ else:
         else:
             workflow_div.text = _workflow_placeholder
 
-    def _refresh_auxiliary_suffix_options() -> None:
+    def _refresh_auxiliary_suffix_options(workflow_id: Optional[str] = None) -> None:
         base_paths = _resolve_base_paths()
+        index = grid_state.get("triplet_index")
+        wf = (workflow_id or grid_state.get("workflow_id") or "").strip()
+        if grid_state.get("catalog_ready") and index is not None and wf and index.has_workflow(wf):
+            grid_state["surrogate_suffix_options"] = index.surrogate_select_options(wf)
+            grid_state["next_x_suffix_options"] = index.next_x_select_options(wf)
+            return
         grid_state["surrogate_suffix_options"] = discover_nsdf_surrogate_version_options(
             base_paths,
             base_dir=_bd,
@@ -889,7 +895,6 @@ else:
         grid_state["catalog_ready"] = True
         grid_state["uncertainty_trend_points_key"] = ""
         grid_state["uncertainty_trend_points"] = None
-        _refresh_auxiliary_suffix_options()
 
         workflow_options = index.workflow_select_options()
         if not workflow_options:
@@ -917,6 +922,7 @@ else:
         if not preserve_snapshot or current_snapshot not in valid_snapshots:
             current_snapshot = index.default_snapshot_value(current_workflow)
         grid_state["version_suffix"] = current_snapshot
+        _refresh_auxiliary_suffix_options(current_workflow)
 
         grid_state["updating_controls"] = True
         try:
@@ -939,6 +945,7 @@ else:
                 snapshot_options = [("latest", "Latest (data.json)")]
             current_snapshot = index.default_snapshot_value(workflow_id)
         grid_state["version_suffix"] = current_snapshot
+        _refresh_auxiliary_suffix_options(workflow_id)
         grid_state["updating_controls"] = True
         try:
             version_select.options = snapshot_options

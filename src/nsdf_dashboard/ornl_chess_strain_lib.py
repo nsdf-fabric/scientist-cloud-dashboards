@@ -562,13 +562,33 @@ class NSDFTripletIndex:
         return list(self.by_workflow.get((workflow_id or "").strip()) or [])
 
     def snapshot_select_options(self, workflow_id: str) -> List[Tuple[str, str]]:
+        return self._suffix_select_options(
+            workflow_id,
+            latest_label="Latest (data.json)",
+        )
+
+    def surrogate_select_options(self, workflow_id: str) -> List[Tuple[str, str]]:
+        return self._suffix_select_options(
+            workflow_id,
+            latest_label="Latest (surrogate.json)",
+        )
+
+    def next_x_select_options(self, workflow_id: str) -> List[Tuple[str, str]]:
+        return self._suffix_select_options(
+            workflow_id,
+            latest_label="Latest (next_x.json)",
+        )
+
+    def _suffix_select_options(
+        self,
+        workflow_id: str,
+        *,
+        latest_label: str,
+    ) -> List[Tuple[str, str]]:
         options: List[Tuple[str, str]] = []
         for snap in self.snapshots_for_workflow(workflow_id):
             value = "latest" if not snap.suffix else snap.suffix
-            if value == "latest":
-                label = "Latest (data.json)"
-            else:
-                label = snap.suffix
+            label = latest_label if value == "latest" else snap.suffix
             options.append((value, label))
         return options
 

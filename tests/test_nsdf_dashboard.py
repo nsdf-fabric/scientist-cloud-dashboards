@@ -1358,6 +1358,15 @@ def test_triplet_index_groups_snapshots_by_workflow() -> None:
         wf_b_opts = index.snapshot_select_options("wf-b")
         assert ("20260607T100000Z", "20260607T100000Z") in wf_b_opts
         assert ("20260607T110000Z", "20260607T110000Z") in wf_b_opts
+        sur_b_opts = index.surrogate_select_options("wf-b")
+        nx_b_opts = index.next_x_select_options("wf-b")
+        assert len(sur_b_opts) == len(wf_b_opts)
+        assert [value for value, _label in sur_b_opts] == [
+            value for value, _label in wf_b_opts
+        ]
+        assert [value for value, _label in nx_b_opts] == [
+            value for value, _label in wf_b_opts
+        ]
 
 
 def test_triplet_index_infers_workflow_from_nearby_auxiliary_timestamps() -> None:
