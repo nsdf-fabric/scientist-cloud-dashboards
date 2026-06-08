@@ -480,6 +480,7 @@ else:
     grid_h = Spinner(title="Grid height", low=1, high=512, step=1, value=plot_cfg.grid_size[1], width=100)
     btn_reset_grid = _toolbar_button("Reset", button_type="default", width=80)
     btn_reload = _toolbar_button("Reload", button_type="primary", width=90)
+    btn_index_workflows = _toolbar_button("Index workflows", button_type="default", width=140)
     btn_toggle_status = _toolbar_button("Show status", button_type="default", width=110)
 
     loaded_bundle: Optional[NSDFLoadedBundle] = None
@@ -529,8 +530,19 @@ else:
         load_payload()
         rebuild_figures()
 
+    def _set_index_workflows_button_state(*, loading: bool = False) -> None:
+        if loading:
+            btn_index_workflows.label = "Indexing…"
+            btn_index_workflows.disabled = True
+        elif grid_state.get("catalog_ready"):
+            btn_index_workflows.label = "Re-index workflows"
+            btn_index_workflows.disabled = False
+        else:
+            btn_index_workflows.label = "Index workflows"
+            btn_index_workflows.disabled = False
+
     def _bootstrap_minimal_ui_state() -> None:
-        """Latest-only selectors until the full snapshot catalog is ready."""
+        """Latest-only selectors until the user indexes workflows/snapshots."""
         grid_state["catalog_ready"] = False
         grid_state["triplet_index"] = None
         grid_state["uncertainty_trend_points_key"] = ""
@@ -545,7 +557,7 @@ else:
         grid_state["updating_controls"] = True
         try:
             workflow_select.options = [
-                (NSDF_UNKNOWN_WORKFLOW_ID, "(indexing snapshots in background…)"),
+                (NSDF_UNKNOWN_WORKFLOW_ID, "(press Index workflows to browse)"),
             ]
             workflow_select.value = NSDF_UNKNOWN_WORKFLOW_ID
             version_select.options = [("latest", "Latest (data.json)")]
@@ -556,6 +568,7 @@ else:
             next_x_select.value = "latest"
         finally:
             grid_state["updating_controls"] = False
+        _set_index_workflows_button_state()
 
     def _update_workflow_hint_from_bundle() -> None:
         if loaded_bundle is None:
@@ -615,57 +628,6 @@ else:
         _fast_latest_triplet_load_data()
         _fast_latest_triplet_load_figures()
 
-    def _defer_fast_latest_triplet_load() -> None:
-        """Load JSON on one tick, paint figures on the next so the spinner can render."""
-        token = _begin_figures_loading("Loading latest triplet...")
-
-        def _load_data_tick() -> None:
-            if grid_state.get("loading_generation") != token:
-                return
-            try:
-                _fast_latest_triplet_load_data()
-            except Exception as exc:
-                traceback.print_exc()
-                if grid_state.get("loading_generation") == token:
-                    figures_column.children = [
-                        Div(
-                            text=(
-                                "<pre>Dashboard update failed: "
-                                f"{html.escape(str(exc))}</pre>"
-                            )
-                        )
-                    ]
-                    _set_controls_busy(False)
-                return
-            if grid_state.get("loading_generation") != token:
-                return
-            figures_column.children = [_loading_placeholder_div("Building plots...")]
-
-            def _build_figures_tick() -> None:
-                if grid_state.get("loading_generation") != token:
-                    return
-                try:
-                    _fast_latest_triplet_load_figures()
-                    _schedule_background_catalog()
-                except Exception as exc:
-                    traceback.print_exc()
-                    if grid_state.get("loading_generation") == token:
-                        figures_column.children = [
-                            Div(
-                                text=(
-                                    "<pre>Dashboard update failed: "
-                                    f"{html.escape(str(exc))}</pre>"
-                                )
-                            )
-                        ]
-                finally:
-                    if grid_state.get("loading_generation") == token:
-                        _set_controls_busy(False)
-
-            doc.add_next_tick_callback(_build_figures_tick)
-
-        doc.add_next_tick_callback(_load_data_tick)
-
     def _cancel_background_catalog() -> None:
         callback_id = grid_state.get("catalog_callback_id")
         if callback_id is not None:
@@ -676,48 +638,60 @@ else:
         grid_state["catalog_callback_id"] = None
         grid_state["catalog_loading"] = False
 
-    def _background_catalog_populate() -> None:
-        grid_state["catalog_callback_id"] = None
+    def _defer_catalog_index() -> None:
+        """Scan storage for workflow/snapshot dropdowns; only runs when user requests it."""
         if grid_state.get("catalog_loading"):
             return
+        _cancel_background_catalog()
         grid_state["catalog_loading"] = True
+        _set_index_workflows_button_state(loading=True)
+        _set_controls_busy(True)
         grid_state["updating_controls"] = True
         try:
             current_workflow = str(grid_state.get("workflow_id") or "").strip()
             if current_workflow and current_workflow != NSDF_UNKNOWN_WORKFLOW_ID:
                 workflow_select.options = [
-                    (current_workflow, f"{format_nsdf_workflow_select_label(current_workflow)} (indexing…)"),
+                    (
+                        current_workflow,
+                        f"{format_nsdf_workflow_select_label(current_workflow)} (indexing…)",
+                    ),
                 ]
                 workflow_select.value = current_workflow
             else:
                 workflow_select.options = [
-                    (NSDF_UNKNOWN_WORKFLOW_ID, "(indexing snapshots in background…)"),
+                    (NSDF_UNKNOWN_WORKFLOW_ID, "(indexing workflows and snapshots…)"),
                 ]
                 workflow_select.value = NSDF_UNKNOWN_WORKFLOW_ID
         finally:
             grid_state["updating_controls"] = False
-        try:
-            _rebuild_triplet_catalog(preserve_workflow=True, preserve_snapshot=True)
-            grid_state["catalog_ready"] = True
-            rebuild_figures(show_loading_gap=False)
-        except Exception:
-            traceback.print_exc()
-        finally:
-            grid_state["catalog_loading"] = False
 
-    def _schedule_background_catalog() -> None:
-        _cancel_background_catalog()
-        callback_id = doc.add_next_tick_callback(_background_catalog_populate)
+        def _run_catalog_index() -> None:
+            grid_state["catalog_callback_id"] = None
+            try:
+                _rebuild_triplet_catalog(preserve_workflow=True, preserve_snapshot=True)
+                rebuild_figures(show_loading_gap=False)
+                set_status(
+                    "Indexed workflows and snapshots. Selectors are ready for browsing.",
+                    ok=True,
+                )
+            except Exception as exc:
+                traceback.print_exc()
+                set_status(f"Workflow catalog index failed: {exc}", ok=False)
+            finally:
+                grid_state["catalog_loading"] = False
+                _set_index_workflows_button_state()
+                _set_controls_busy(False)
+
+        callback_id = doc.add_next_tick_callback(_run_catalog_index)
         grid_state["catalog_callback_id"] = callback_id
 
     def _initial_dashboard_load() -> None:
-        _defer_fast_latest_triplet_load()
+        _fast_latest_triplet_load()
 
-    def _full_catalog_reload() -> None:
-        _cancel_background_catalog()
-        _rebuild_triplet_catalog()
-        grid_state["catalog_ready"] = True
-        _reload_figures_view()
+    def _reload_current_view() -> None:
+        load_payload()
+        _update_workflow_hint_from_bundle()
+        rebuild_figures()
 
     def _wrap_log_html(inner_html: str) -> str:
         return (
@@ -1195,7 +1169,9 @@ else:
                 step_ids=[],
                 y=np.array([], dtype=np.float64),
                 labels=[],
-                warnings=["Uncertainty trend will update after snapshot catalog loads."],
+                warnings=[
+                    "Press Index workflows to build the full uncertainty trend across snapshots."
+                ],
             )
 
         index = grid_state.get("triplet_index")
@@ -1235,8 +1211,8 @@ else:
 
     def rebuild_figures(*, show_loading_gap: bool = True) -> None:
         apply_grid_size()
-        if show_loading_gap:
-            figures_column.children = []
+        if show_loading_gap and not figures_column.children:
+            figures_column.children = [_loading_placeholder_div("Building plots...")]
         if loaded_bundle is None:
             figures_column.children = [Div(text="<i>No NSDF data loaded.</i>")]
             return
@@ -1301,6 +1277,8 @@ else:
     def on_workflow_change(attr: str, old: Any, new: Any) -> None:
         if grid_state["updating_controls"]:
             return
+        if not grid_state.get("catalog_ready"):
+            return
         if (grid_state.get("playback") or {}).get("active"):
             _stop_playback()
         grid_state["workflow_id"] = str(new or "").strip()
@@ -1310,9 +1288,11 @@ else:
             message="Loading workflow and file selectors...",
         )
 
+    def on_index_workflows() -> None:
+        _defer_catalog_index()
+
     def on_reload() -> None:
-        grid_state["catalog_ready"] = False
-        _defer_fast_latest_triplet_load()
+        _defer_figures_work(_reload_current_view, message="Reloading latest triplet...")
 
     def on_external_refresh(_doc: Any = doc, _on_reload: Callable[[], None] = on_reload) -> None:
         _doc.add_next_tick_callback(_on_reload)
@@ -1358,6 +1338,7 @@ else:
     btn_play_stop.on_click(on_play_stop)
     btn_reset_grid.on_click(on_reset_grid)
     btn_reload.on_click(on_reload)
+    btn_index_workflows.on_click(on_index_workflows)
     btn_toggle_status.on_click(on_toggle_status)
     _busy_controls.extend(
         [
@@ -1367,6 +1348,7 @@ else:
             next_x_select,
             grid_w,
             grid_h,
+            btn_index_workflows,
             btn_reload,
             btn_reset_grid,
             btn_play_forward,
@@ -1384,7 +1366,14 @@ else:
             next_x_select,
             sizing_mode="scale_width",
         ),
-        _control_row(grid_w, grid_h, btn_reload, btn_reset_grid, btn_toggle_status),
+        _control_row(
+            grid_w,
+            grid_h,
+            btn_index_workflows,
+            btn_reload,
+            btn_reset_grid,
+            btn_toggle_status,
+        ),
         _control_row(
             play_interval_input,
             btn_play_backward,
@@ -1410,7 +1399,7 @@ else:
     doc.add_root(root)
 
     if paths.local_data_dir or paths.has_s3_source() or paths.local_json_path or paths.json_url:
-        _initial_dashboard_load()
+        _defer_figures_work(_initial_dashboard_load, message="Loading latest triplet...")
     else:
         _set_controls_busy(False)
         figures_column.children = [
@@ -1434,11 +1423,11 @@ else:
         ) -> None:
             try:
                 stop_playback()
-            except Exception:
+            except BaseException:
                 pass
             try:
                 cancel_catalog()
-            except Exception:
+            except BaseException:
                 pass
             unregister(token)
 

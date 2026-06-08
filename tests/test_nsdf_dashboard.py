@@ -762,6 +762,43 @@ def test_iter_surrogate_s3_key_candidates_strict_skips_listing(monkeypatch) -> N
     assert keys == ["prefix/surrogate.json"]
 
 
+def test_apply_nsdf_file_suffixes_keeps_explicit_s3_keys_for_latest() -> None:
+    paths = StrainDashboardPaths(
+        s3_bucket="b",
+        s3_data_key="chess-data/data.json",
+        s3_surrogate_key="test-chess/surrogate.json",
+        s3_next_x_key="test-chess/next_x.json",
+    )
+    versioned = apply_nsdf_file_suffixes(paths, strict=True)
+    assert versioned.s3_surrogate_key == "test-chess/surrogate.json"
+    assert versioned.s3_next_x_key == "test-chess/next_x.json"
+
+
+def test_apply_nsdf_file_suffixes_aligns_next_x_with_surrogate_prefix() -> None:
+    paths = StrainDashboardPaths(
+        s3_bucket="b",
+        s3_data_key="chess-data/data.json",
+        s3_surrogate_key="test-chess/surrogate.json",
+    )
+    versioned = apply_nsdf_file_suffixes(paths, strict=True)
+    assert versioned.s3_next_x_key == "test-chess/next_x.json"
+
+
+def test_data_s3_key_candidates_include_auxiliary_prefix() -> None:
+    paths = apply_nsdf_file_suffixes(
+        StrainDashboardPaths(
+            s3_bucket="b",
+            s3_data_key="chess-data/data.json",
+            s3_surrogate_key="test-chess/surrogate.json",
+        ),
+        strict=True,
+    )
+    assert lib._data_s3_key_candidates(paths) == [
+        "chess-data/data.json",
+        "test-chess/data.json",
+    ]
+
+
 def test_apply_nsdf_file_suffixes_independent() -> None:
     base = StrainDashboardPaths(local_data_dir="/tmp/chess-data")
     with _local_files_first_for_testing():

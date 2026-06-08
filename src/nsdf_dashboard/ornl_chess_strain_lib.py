@@ -902,8 +902,24 @@ def apply_nsdf_file_suffixes(
 
     if out.s3_data_key:
         out.s3_data_key = _replace_s3_key_basename(out.s3_data_key, data_fn)
-        out.s3_surrogate_key = _replace_s3_key_basename(out.s3_data_key, sur_fn)
-        out.s3_next_x_key = _replace_s3_key_basename(out.s3_data_key, nx_fn)
+        explicit_sur = (paths.s3_surrogate_key or "").strip()
+        explicit_nx = (paths.s3_next_x_key or "").strip()
+        if explicit_sur and sur_s == data_s:
+            out.s3_surrogate_key = explicit_sur
+        else:
+            out.s3_surrogate_key = _replace_s3_key_basename(out.s3_data_key, sur_fn)
+        if explicit_nx and nx_s == data_s:
+            out.s3_next_x_key = explicit_nx
+        elif (
+            explicit_sur
+            and sur_s == data_s
+            and not explicit_nx
+            and "/" in explicit_sur
+        ):
+            sur_prefix = explicit_sur.rsplit("/", 1)[0]
+            out.s3_next_x_key = f"{sur_prefix}/{nx_fn}"
+        else:
+            out.s3_next_x_key = _replace_s3_key_basename(out.s3_data_key, nx_fn)
 
     return out
 
@@ -2039,13 +2055,18 @@ def _prepare_nsdf_load_paths(
             strict_triplet_paths=load_paths.strict_triplet_paths,
         )
     if paths.strict_triplet_paths and load_paths.has_s3_source():
-        load_paths = apply_nsdf_file_suffixes(
-            load_paths,
-            data_suffix=paths.version_suffix or "",
-            surrogate_suffix=paths.surrogate_version_suffix,
-            next_x_suffix=paths.next_x_version_suffix,
-            strict=True,
+        needs_suffix_keys = not (
+            (load_paths.s3_surrogate_key or "").strip()
+            and (load_paths.s3_next_x_key or "").strip()
         )
+        if needs_suffix_keys:
+            load_paths = apply_nsdf_file_suffixes(
+                load_paths,
+                data_suffix=paths.version_suffix or "",
+                surrogate_suffix=paths.surrogate_version_suffix,
+                next_x_suffix=paths.next_x_version_suffix,
+                strict=True,
+            )
     return load_paths
 
 
@@ -2974,6 +2995,28 @@ def _iter_next_x_path_candidates(
     return candidates
 
 
+def _data_s3_key_candidates(paths: StrainDashboardPaths) -> List[str]:
+    """Ordered data.json keys to try when env prefixes disagree (e.g. chess-data vs test-chess)."""
+    data_fn, _, _ = nsdf_triplet_basenames(paths.version_suffix or "")
+    candidates: List[str] = []
+    seen: set[str] = set()
+
+    def add(key: str) -> None:
+        k = (key or "").strip()
+        if k and k not in seen:
+            seen.add(k)
+            candidates.append(k)
+
+    add((paths.s3_data_key or "").strip())
+    for aux_key in (
+        (paths.s3_surrogate_key or "").strip(),
+        (paths.s3_next_x_key or "").strip(),
+    ):
+        if aux_key and "/" in aux_key:
+            add(_replace_s3_key_basename(aux_key, data_fn))
+    return candidates
+
+
 def _iter_surrogate_s3_key_candidates(
     paths: StrainDashboardPaths,
     data_key: str,
@@ -3125,8 +3168,30 @@ def _make_nsdf_s3_client(
     return boto3.client("s3", **kwargs)
 
 
+def _format_s3_get_object_error(exc: Exception, *, bucket: str, key: str) -> str:
+    key_label = (key or "").strip() or "(empty key)"
+    bucket_label = (bucket or "").strip() or "(empty bucket)"
+    try:
+        from botocore.exceptions import ClientError
+
+        if isinstance(exc, ClientError):
+            err = (exc.response or {}).get("Error") or {}
+            code = str(err.get("Code") or "ClientError")
+            message = str(err.get("Message") or "").strip()
+            detail = message or str(exc)
+            return (
+                f"S3 GetObject failed ({code}) for s3://{bucket_label}/{key_label}: {detail}"
+            )
+    except Exception:
+        pass
+    return f"S3 GetObject failed for s3://{bucket_label}/{key_label}: {exc}"
+
+
 def _load_json_from_s3_key(client: Any, bucket: str, key: str) -> Any:
-    resp = client.get_object(Bucket=bucket, Key=key)
+    try:
+        resp = client.get_object(Bucket=bucket, Key=key)
+    except Exception as exc:
+        raise FileNotFoundError(_format_s3_get_object_error(exc, bucket=bucket, key=key)) from exc
     raw = resp["Body"].read()
     return json.loads(raw.decode("utf-8"))
 
@@ -3192,14 +3257,33 @@ def load_nsdf_json_bundle_from_s3(
     mongo_s3_auth: Optional[Dict[str, str]] = None,
 ) -> NSDFLoadedBundle:
     bucket = (paths.s3_bucket or "").strip()
-    data_key = (paths.s3_data_key or "").strip()
-    if not bucket or not data_key:
+    if not bucket:
         raise FileNotFoundError(
             "Set S3_BUCKET and S3_DATA_KEY to load NSDF data from S3."
         )
 
     client = _make_nsdf_s3_client(paths, mongo_s3_auth=mongo_s3_auth)
-    data = _load_json_from_s3_key(client, bucket, data_key)
+    data = None
+    data_key = ""
+    data_errors: List[str] = []
+    for candidate_key in _data_s3_key_candidates(paths):
+        try:
+            data = _load_json_from_s3_key(client, bucket, candidate_key)
+            data_key = candidate_key
+            break
+        except FileNotFoundError as exc:
+            data_errors.append(str(exc))
+        except Exception as exc:
+            if _s3_missing_error(exc):
+                data_errors.append(_format_s3_get_object_error(exc, bucket=bucket, key=candidate_key))
+                continue
+            raise
+    if data is None or not data_key:
+        tried = ", ".join(_data_s3_key_candidates(paths)) or "(none)"
+        detail = data_errors[-1] if data_errors else "object not found"
+        raise FileNotFoundError(
+            f"Could not load NSDF data.json from s3://{bucket}/. Tried: {tried}. {detail}"
+        )
     messages = [f"Loaded NSDF data JSON from s3://{bucket}/{data_key}"]
     display_size, _ = resolve_nsdf_grid_size(data)
 
@@ -3228,6 +3312,9 @@ def load_nsdf_json_bundle_from_s3(
             surrogate_key = candidate_key
             messages.append(f"Loaded surrogate JSON from s3://{bucket}/{candidate_key}")
             break
+        except FileNotFoundError as exc:
+            messages.append(f"S3 surrogate JSON skipped ({candidate_key}): {exc}")
+            continue
         except Exception as exc:
             if _s3_missing_error(exc):
                 continue
@@ -3251,6 +3338,9 @@ def load_nsdf_json_bundle_from_s3(
             messages.append(
                 f"S3 next_x JSON skipped ({candidate_key}): expected a JSON object or array."
             )
+        except FileNotFoundError as exc:
+            messages.append(f"S3 next_x JSON skipped ({candidate_key}): {exc}")
+            continue
         except Exception as exc:
             if _s3_missing_error(exc):
                 continue
