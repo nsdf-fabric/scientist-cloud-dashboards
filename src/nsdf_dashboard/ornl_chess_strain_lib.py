@@ -4172,7 +4172,8 @@ def make_strain_triplet_row(
     panel_w = int(p0.width or 0)
     panel_h = int(p0.height or 0)
     footer_plot1 = _strain_legend_footer_div(legend_items, width=panel_w)
-    footer_spacer = _strain_legend_footer_div([], width=panel_w)
+    footer_spacer_2 = _strain_legend_footer_div([], width=panel_w)
+    footer_spacer_3 = _strain_legend_footer_div([], width=panel_w)
 
     plot_row = row(
         p0,
@@ -4184,8 +4185,8 @@ def make_strain_triplet_row(
     )
     footer_row = row(
         footer_plot1,
-        footer_spacer,
-        footer_spacer,
+        footer_spacer_2,
+        footer_spacer_3,
         sizing_mode="fixed",
         width=panel_w * 3 if panel_w else None,
         height=_STRAIN_LEGEND_FOOTER_HEIGHT,

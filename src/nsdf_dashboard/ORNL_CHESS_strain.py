@@ -47,11 +47,12 @@ def _toolbar_button(label: str, *, button_type: str, width: int) -> Button:
 
 
 def _bottom_aligned_button(btn: Button) -> column:
+    btn_width = int(btn.width or 0) or None
     return column(
         Div(
             text="&nbsp;",
             height=_TITLED_WIDGET_LABEL_HEIGHT,
-            width=1,
+            width=btn_width or 1,
             styles={
                 "padding": "0",
                 "margin": "0",
@@ -64,6 +65,8 @@ def _bottom_aligned_button(btn: Button) -> column:
         ),
         btn,
         sizing_mode="fixed",
+        width=btn_width,
+        height=_TITLED_WIDGET_LABEL_HEIGHT + _CONTROL_BTN_HEIGHT,
     )
 
 
