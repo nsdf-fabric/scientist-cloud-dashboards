@@ -5051,6 +5051,58 @@ def make_strain_triplet_figures(
     return p0, p1, p2
 
 
+def _trend_axis_label_budget(point_count: int, *, panel_width: int) -> int:
+    """
+    Choose how many x-axis labels fit for a trend series.
+
+    Scales down as acquisitions grow and respects the panel width so ISO-like
+    step ids stay legible without overlapping.
+    """
+    n = max(0, int(point_count))
+    if n <= 0:
+        return 0
+    if n <= 8:
+        return n
+    width = max(120, int(panel_width or 0))
+    # Rotated timestamp ids need roughly this much horizontal space each.
+    width_cap = max(4, min(n, width // 50))
+    if n <= 16:
+        return min(n, max(width_cap, 6))
+    if n <= 32:
+        return min(n, max(width_cap, 5))
+    return min(n, width_cap)
+
+
+def _sparse_trend_axis_ticks(
+    step_ids: Sequence[str],
+    *,
+    panel_width: int = 360,
+    max_labels: Optional[int] = None,
+    highlight_id: Optional[str] = None,
+) -> List[str]:
+    """Pick a readable subset of categorical x-axis labels for dense trend series."""
+    ids = list(step_ids)
+    n = len(ids)
+    label_budget = max_labels if max_labels is not None else _trend_axis_label_budget(
+        n,
+        panel_width=panel_width,
+    )
+    if n <= label_budget:
+        ticks = list(ids)
+    elif label_budget <= 1:
+        ticks = [ids[-1]]
+    else:
+        positions = sorted(
+            {int(round(i * (n - 1) / (label_budget - 1))) for i in range(label_budget)}
+        )
+        ticks = [ids[pos] for pos in positions]
+    if highlight_id and highlight_id in ids and highlight_id not in ticks:
+        ticks.append(highlight_id)
+        order = {step_id: idx for idx, step_id in enumerate(ids)}
+        ticks.sort(key=lambda step_id: order[step_id])
+    return ticks
+
+
 def make_uncertainty_trend_figure(
     series: UncertaintyTrendSeries,
     cfg: StrainFieldPlotConfig,
@@ -5058,7 +5110,7 @@ def make_uncertainty_trend_figure(
     layout: StrainFigureLayout,
 ) -> Any:
     """Line plot of average uncertainty vs scan step (4th dashboard panel)."""
-    from bokeh.models import ColumnDataSource, Div
+    from bokeh.models import ColumnDataSource, Div, FixedTicker
     from bokeh.plotting import figure
 
     if not series.step_ids:
@@ -5101,7 +5153,16 @@ def make_uncertainty_trend_figure(
         toolbar_location="above",
     )
     _lock_strain_figure_layout(p, layout)
-    p.xaxis.major_label_orientation = math.pi / 4
+    highlight_id = None
+    if series.current_index is not None and 0 <= series.current_index < len(series.step_ids):
+        highlight_id = series.step_ids[series.current_index]
+    sparse_ticks = _sparse_trend_axis_ticks(
+        series.step_ids,
+        panel_width=layout.frame_width,
+        highlight_id=highlight_id,
+    )
+    p.xaxis.ticker = FixedTicker(ticks=sparse_ticks)
+    p.xaxis.major_label_orientation = math.pi / 4 if len(sparse_ticks) > 4 else 0.0
     source = ColumnDataSource(
         data={
             "step_id": list(series.step_ids),

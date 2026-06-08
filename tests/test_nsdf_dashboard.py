@@ -29,6 +29,8 @@ from nsdf_dashboard.ornl_chess_strain_lib import (
     build_strain_field_grids,
     build_uncertainty_trend_series,
     parse_transformed_stddevs_avg_points,
+    _sparse_trend_axis_ticks,
+    _trend_axis_label_budget,
     collect_nsdf_triplet_load_issues,
     discover_nsdf_triplet_index,
     discover_nsdf_version_options,
@@ -471,6 +473,30 @@ def test_next_x_validation_skips_bad_rows() -> None:
     assert len(info.entries) == 1
     assert info.entries[0].workflow_id == "ok"
     assert info.warnings
+
+
+def test_trend_axis_label_budget_scales_with_points() -> None:
+    assert _trend_axis_label_budget(5, panel_width=360) == 5
+    assert _trend_axis_label_budget(12, panel_width=360) == 7
+    assert _trend_axis_label_budget(48, panel_width=360) == 7
+    assert _trend_axis_label_budget(48, panel_width=250) == 5
+    assert _trend_axis_label_budget(120, panel_width=360) == 7
+
+
+def test_sparse_trend_axis_ticks() -> None:
+    ids = [f"step-{i:02d}" for i in range(48)]
+    budget = _trend_axis_label_budget(len(ids), panel_width=360)
+    ticks = _sparse_trend_axis_ticks(ids, panel_width=360)
+    assert len(ticks) == budget
+    assert ticks[0] == "step-00"
+    assert ticks[-1] == "step-47"
+
+    with_highlight = _sparse_trend_axis_ticks(
+        ids,
+        panel_width=360,
+        highlight_id="step-05",
+    )
+    assert "step-05" in with_highlight
 
 
 def test_parse_transformed_stddevs_avg_points() -> None:

@@ -77,6 +77,32 @@ def _control_row(*widgets: Any) -> row:
         sizing_mode="scale_width",
     )
 
+
+def _loading_placeholder_div(message: str) -> Div:
+    """Centered spinner shown while S3/catalog/figure work is in flight."""
+    safe_message = html.escape(message or "Loading...")
+    return Div(
+        text=(
+            "<style>"
+            "@keyframes nsdf-dashboard-spin { to { transform: rotate(360deg); } }"
+            ".nsdf-dashboard-loading {"
+            "min-height:360px;display:flex;align-items:center;justify-content:center;"
+            "flex-direction:column;gap:14px;color:#444;background:#fafafa;"
+            "border:1px solid #e6e6e6;border-radius:6px;"
+            "}"
+            ".nsdf-dashboard-spinner {"
+            "width:40px;height:40px;border:4px solid #ddd;border-top-color:#4E477F;"
+            "border-radius:50%;animation:nsdf-dashboard-spin 0.85s linear infinite;"
+            "}"
+            "</style>"
+            f'<div class="nsdf-dashboard-loading">'
+            f'<div class="nsdf-dashboard-spinner" aria-hidden="true"></div>'
+            f"<div>{safe_message}</div>"
+            "</div>"
+        ),
+        sizing_mode="stretch_width",
+    )
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 for _shared_candidate in (
     os.path.abspath(os.path.join(SCRIPT_DIR, "..")),
@@ -353,6 +379,7 @@ else:
             "index": 0,
             "callback_id": None,
         },
+        "loading_generation": 0,
     }
 
     def _resolve_base_paths() -> StrainDashboardPaths:
@@ -450,6 +477,54 @@ else:
 
     loaded_bundle: Optional[NSDFLoadedBundle] = None
     figures_column = column(sizing_mode="stretch_width")
+    _busy_controls: List[Any] = []
+
+    def _set_controls_busy(busy: bool) -> None:
+        for widget in _busy_controls:
+            try:
+                widget.disabled = busy
+            except Exception:
+                pass
+
+    def _begin_figures_loading(message: str) -> int:
+        grid_state["loading_generation"] = int(grid_state.get("loading_generation") or 0) + 1
+        token = int(grid_state["loading_generation"])
+        figures_column.children = [_loading_placeholder_div(message)]
+        _set_controls_busy(True)
+        return token
+
+    def _defer_figures_work(work_fn: Callable[[], None], *, message: str) -> None:
+        token = _begin_figures_loading(message)
+
+        def _run() -> None:
+            if grid_state.get("loading_generation") != token:
+                return
+            try:
+                work_fn()
+            except Exception as exc:
+                traceback.print_exc()
+                if grid_state.get("loading_generation") == token:
+                    figures_column.children = [
+                        Div(
+                            text=(
+                                "<pre>Dashboard update failed: "
+                                f"{html.escape(str(exc))}</pre>"
+                            )
+                        )
+                    ]
+            finally:
+                if grid_state.get("loading_generation") == token:
+                    _set_controls_busy(False)
+
+        doc.add_next_tick_callback(_run)
+
+    def _reload_figures_view() -> None:
+        load_payload()
+        rebuild_figures()
+
+    def _full_catalog_reload() -> None:
+        _rebuild_triplet_catalog()
+        _reload_figures_view()
 
     def _wrap_log_html(inner_html: str) -> str:
         return (
@@ -733,8 +808,7 @@ else:
         finally:
             grid_state["updating_controls"] = False
         _sync_auxiliary_selectors_from_data(reset_manual=True)
-        load_payload()
-        rebuild_figures()
+        _defer_figures_work(_reload_figures_view, message="Loading snapshot...")
 
     def _advance_playback() -> None:
         playback = grid_state.get("playback") or {}
@@ -994,25 +1068,21 @@ else:
         if (grid_state.get("playback") or {}).get("active"):
             _stop_playback()
         grid_state["version_suffix"] = str(new or "latest")
-        _sync_auxiliary_selectors_from_data(reset_manual=True)
-        load_payload()
-        rebuild_figures()
+        _defer_figures_work(_reload_figures_view, message="Loading data snapshot...")
 
     def on_surrogate_change(attr: str, old: Any, new: Any) -> None:
         if grid_state["updating_controls"]:
             return
         grid_state["surrogate_version_suffix"] = str(new or "latest")
         grid_state["surrogate_manual"] = True
-        load_payload()
-        rebuild_figures()
+        _defer_figures_work(_reload_figures_view, message="Loading surrogate snapshot...")
 
     def on_next_x_change(attr: str, old: Any, new: Any) -> None:
         if grid_state["updating_controls"]:
             return
         grid_state["next_x_version_suffix"] = str(new or "latest")
         grid_state["next_x_manual"] = True
-        load_payload()
-        rebuild_figures()
+        _defer_figures_work(_reload_figures_view, message="Loading next_x snapshot...")
 
     def on_workflow_change(attr: str, old: Any, new: Any) -> None:
         if grid_state["updating_controls"]:
@@ -1021,13 +1091,16 @@ else:
             _stop_playback()
         grid_state["workflow_id"] = str(new or "").strip()
         _refresh_snapshot_options_for_workflow(grid_state["workflow_id"])
-        load_payload()
-        rebuild_figures()
+        _defer_figures_work(
+            _reload_figures_view,
+            message="Loading workflow and file selectors...",
+        )
 
     def on_reload() -> None:
-        _rebuild_triplet_catalog()
-        load_payload()
-        rebuild_figures()
+        _defer_figures_work(
+            _full_catalog_reload,
+            message="Reloading catalog and visualization...",
+        )
 
     def on_external_refresh(_doc: Any = doc, _on_reload: Callable[[], None] = on_reload) -> None:
         _doc.add_next_tick_callback(_on_reload)
@@ -1039,7 +1112,7 @@ else:
         grid_state["manual_grid_size"] = manual_grid_size
         grid_state["active_source"] = "manual controls"
         plot_cfg.grid_size = manual_grid_size
-        rebuild_figures()
+        _defer_figures_work(rebuild_figures, message="Updating grid...")
 
     def on_reset_grid() -> None:
         grid_state["manual_grid_size"] = None
@@ -1056,7 +1129,7 @@ else:
         plot_cfg.grid_size = active_grid_size
         grid_state["active_source"] = active_grid_source
         _set_grid_controls(active_grid_size)
-        rebuild_figures()
+        _defer_figures_work(rebuild_figures, message="Resetting grid...")
 
     def on_toggle_status() -> None:
         log_panel_div.visible = not log_panel_div.visible
@@ -1074,6 +1147,22 @@ else:
     btn_reset_grid.on_click(on_reset_grid)
     btn_reload.on_click(on_reload)
     btn_toggle_status.on_click(on_toggle_status)
+    _busy_controls.extend(
+        [
+            workflow_select,
+            version_select,
+            surrogate_select,
+            next_x_select,
+            grid_w,
+            grid_h,
+            btn_reload,
+            btn_reset_grid,
+            btn_play_forward,
+            btn_play_backward,
+            btn_play_stop,
+            play_interval_input,
+        ]
+    )
 
     controls = column(
         row(
@@ -1105,11 +1194,13 @@ else:
         log_panel_div,
         sizing_mode="stretch_width",
     )
+    figures_column.children = [_loading_placeholder_div("Loading dashboard...")]
     doc.add_root(root)
 
     if paths.local_data_dir or paths.has_s3_source() or paths.local_json_path or paths.json_url:
-        on_reload()
+        _defer_figures_work(_full_catalog_reload, message="Loading dashboard...")
     else:
+        _set_controls_busy(False)
         figures_column.children = [
             Div(
                 text=(
