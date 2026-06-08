@@ -19,7 +19,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from bokeh.io import curdoc
 from bokeh.layouts import column, row
-from bokeh.models import Button, Div, InlineStyleSheet, Select, Spinner, TextInput
+from bokeh.models import Button, Checkbox, Div, InlineStyleSheet, Select, Spinner, TextInput
 
 # Match Bokeh titled-widget label + gap so plain buttons line up with inputs.
 _TITLED_WIDGET_LABEL_HEIGHT = 20
@@ -412,6 +412,7 @@ else:
         "color_range_mode": "dynamic",
         "color_range_lo": "",
         "color_range_hi": "",
+        "compute_plot4_trend": False,
     }
 
     def _resolve_base_paths() -> StrainDashboardPaths:
@@ -515,6 +516,11 @@ else:
     color_lo_input = TextInput(title="Color min", value="", width=110, disabled=True)
     color_hi_input = TextInput(title="Color max", value="", width=110, disabled=True)
     btn_reset_color_range = _toolbar_button("Reset range", button_type="default", width=100)
+    plot4_trend_checkbox = Checkbox(
+        label="Compute Plot 4 trend",
+        active=False,
+        width=180,
+    )
     btn_reset_grid = _toolbar_button("Reset", button_type="default", width=80)
     btn_reload = _toolbar_button("Reload", button_type="primary", width=90)
     btn_index_workflows = _toolbar_button("Index workflows", button_type="default", width=140)
@@ -1295,7 +1301,20 @@ else:
             f"{plot_cfg.grid_size[0]}x{plot_cfg.grid_size[1]}"
         )
 
+    def _plot4_trend_disabled_series() -> UncertaintyTrendSeries:
+        return UncertaintyTrendSeries(
+            step_ids=[],
+            y=np.array([], dtype=np.float64),
+            labels=[],
+            warnings=[
+                'Plot 4 trend is off. Enable "Compute Plot 4 trend" to scan surrogate history.'
+            ],
+        )
+
     def _uncertainty_trend_for_dashboard() -> Optional[UncertaintyTrendSeries]:
+        if not grid_state.get("compute_plot4_trend"):
+            return _plot4_trend_disabled_series()
+
         current_snap = str(grid_state.get("version_suffix") or "latest")
 
         if not grid_state.get("catalog_ready"):
@@ -1386,13 +1405,24 @@ else:
             active_workflow_id = active_workflow_id_from_grid_state(selected_workflow)
             if active_workflow_id is None and selected_workflow != NSDF_UNKNOWN_WORKFLOW_ID:
                 active_workflow_id = resolve_nsdf_workflow_id(surrogate_info, next_x_info)
+            uncertainty_trend: Optional[UncertaintyTrendSeries]
+            try:
+                uncertainty_trend = _uncertainty_trend_for_dashboard()
+            except Exception as trend_exc:
+                traceback.print_exc()
+                uncertainty_trend = UncertaintyTrendSeries(
+                    step_ids=[],
+                    y=np.array([], dtype=np.float64),
+                    labels=[],
+                    warnings=[f"Plot 4 trend unavailable: {trend_exc}"],
+                )
             triplet_row = make_strain_triplet_row(
                 grids,
                 plot_cfg,
                 row_subtitle="dataset_y",
                 next_x_info=next_x_info,
                 active_workflow_id=active_workflow_id,
-                uncertainty_trend=_uncertainty_trend_for_dashboard(),
+                uncertainty_trend=uncertainty_trend,
             )
             figures_column.children = [triplet_row]
             if grid_state.get("last_status") is not None:
@@ -1493,6 +1523,16 @@ else:
             return
         _defer_figures_work(rebuild_figures, message="Updating color range...")
 
+    def on_plot4_trend_change(attr: str, old: Any, new: Any) -> None:
+        if grid_state["updating_controls"]:
+            return
+        enabled = bool(new)
+        grid_state["compute_plot4_trend"] = enabled
+        if enabled:
+            _invalidate_uncertainty_trend_cache()
+        message = "Computing Plot 4 trend..." if enabled else "Updating plots..."
+        _defer_figures_work(rebuild_figures, message=message)
+
     def on_reset_grid() -> None:
         grid_state["manual_grid_size"] = None
         if loaded_bundle is None:
@@ -1519,6 +1559,7 @@ else:
     color_range_select.on_change("value", on_color_range_mode_change)
     color_lo_input.on_change("value", on_color_limit_change)
     color_hi_input.on_change("value", on_color_limit_change)
+    plot4_trend_checkbox.on_change("active", on_plot4_trend_change)
     workflow_select.on_change("value", on_workflow_change)
     version_select.on_change("value", on_version_change)
     surrogate_select.on_change("value", on_surrogate_change)
@@ -1543,6 +1584,7 @@ else:
             color_lo_input,
             color_hi_input,
             btn_reset_color_range,
+            plot4_trend_checkbox,
             btn_index_workflows,
             btn_reload,
             btn_reset_grid,
@@ -1568,6 +1610,7 @@ else:
             color_lo_input,
             color_hi_input,
             btn_reset_color_range,
+            plot4_trend_checkbox,
             btn_index_workflows,
             btn_reload,
             btn_reset_grid,

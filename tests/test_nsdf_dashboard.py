@@ -610,6 +610,41 @@ def test_build_uncertainty_trend_series_from_scalar_per_snapshot_surrogates() ->
         assert series.source == "per_snapshot_transformed_stddevs_avg"
 
 
+def test_build_uncertainty_trend_series_from_composite_snapshot_ids() -> None:
+    from nsdf_dashboard.ornl_chess_strain_lib import _build_triplet_index_from_directory
+
+    with tempfile.TemporaryDirectory() as tmp:
+        for snap_id, y in (
+            ("20260608T222314Z_48", 0.9),
+            ("20260608T222314Z_49", 0.6),
+            ("20260608T222314Z_50", 0.4),
+        ):
+            with open(os.path.join(tmp, f"data_{snap_id}.json"), "w", encoding="utf-8") as fh:
+                json.dump({**_base_data(), "workflow_id": "wf-composite"}, fh)
+            with open(os.path.join(tmp, f"surrogate_{snap_id}.json"), "w", encoding="utf-8") as fh:
+                json.dump(
+                    {"workflow_id": "wf-composite", "transformed_stddevs_avg": y},
+                    fh,
+                )
+        index = _build_triplet_index_from_directory(tmp)
+        paths = StrainDashboardPaths(local_json_path=os.path.join(tmp, "data.json"))
+        series = build_uncertainty_trend_series(
+            index,
+            paths,
+            workflow_id="wf-composite",
+            current_snapshot="20260608T222314Z_49",
+            grid_size=(11, 11),
+        )
+        assert series.step_ids == [
+            "20260608T222314Z_48",
+            "20260608T222314Z_49",
+            "20260608T222314Z_50",
+        ]
+        assert series.labels == ["48", "49", "50"]
+        assert series.current_index == 1
+        assert series.y.tolist() == [0.9, 0.6, 0.4]
+
+
 def test_build_uncertainty_trend_skips_per_snapshot_when_disabled() -> None:
     index = NSDFTripletIndex(
         snapshots=[
@@ -804,6 +839,37 @@ def test_nsdf_version_suffix_triplet_and_apply() -> None:
     assert parse_nsdf_data_filename("data.json") is None
     assert parse_nsdf_data_filename("data_20260606T223505Z.json") == "20260606T223505Z"
 
+    from nsdf_dashboard.ornl_chess_strain_lib import parse_nsdf_next_x_filename, parse_nsdf_surrogate_filename
+
+    assert parse_nsdf_surrogate_filename("surrogate_20260606T223505Z.json") == "20260606T223505Z"
+    assert parse_nsdf_surrogate_filename("surrogate_20260608T222409Z_50.json") == "20260608T222409Z_50"
+    assert parse_nsdf_surrogate_filename("surrogate_50.json") == "50"
+    assert parse_nsdf_next_x_filename("next_x_20260606T223505Z.json") == "20260606T223505Z"
+    assert parse_nsdf_next_x_filename("next_x_50.json") == "50"
+    assert parse_nsdf_data_filename("data_50.json") == "50"
+    assert nsdf_triplet_basenames("50") == (
+        "data_50.json",
+        "surrogate_50.json",
+        "next_x_50.json",
+    )
+    assert nsdf_triplet_basenames("20260608T222409Z_50") == (
+        "data_20260608T222409Z_50.json",
+        "surrogate_20260608T222409Z_50.json",
+        "next_x_20260608T222409Z_50.json",
+    )
+    assert parse_nsdf_data_filename("data_20260608T222314Z_49.json") == "20260608T222314Z_49"
+    assert parse_nsdf_surrogate_filename("surrogate_20260608T222314Z_49.json") == "20260608T222314Z_49"
+
+    from nsdf_dashboard.ornl_chess_strain_lib import triplet_suffix_trend_label
+
+    assert triplet_suffix_trend_label("20260608T222314Z_49") == "49"
+    assert triplet_suffix_trend_label("20260608T222409Z_50") == "50"
+    assert triplet_suffix_trend_label("49") == "49"
+    assert triplet_suffix_trend_label("20260606T223505Z") == "20260606T223505Z"
+    assert triplet_suffix_trend_label("latest") == "Latest"
+    assert parse_nsdf_surrogate_filename("surrogate_.json") is None
+    assert parse_nsdf_surrogate_filename("surrogate_bad id.json") is None
+
     base = StrainDashboardPaths(
         local_data_dir="/tmp/chess-data",
     )
@@ -837,6 +903,36 @@ def test_apply_nsdf_file_suffixes_accepts_latest_selector() -> None:
     assert versioned.local_json_path.endswith("data.json")
     assert versioned.surrogate_json_path.endswith("surrogate.json")
     assert versioned.next_x_json_path.endswith("next_x.json")
+
+
+def test_triplet_index_groups_files_by_snapshot_id_suffix() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        workflow = "wf-id-triplet"
+        for snap_id in ("48", "49", "50"):
+            with open(os.path.join(tmp, f"data_{snap_id}.json"), "w", encoding="utf-8") as fh:
+                json.dump({**_base_data(), "workflow_id": workflow}, fh)
+            with open(os.path.join(tmp, f"surrogate_{snap_id}.json"), "w", encoding="utf-8") as fh:
+                json.dump({"workflow_id": workflow, "transformed_stddevs_avg": float(snap_id)}, fh)
+            with open(os.path.join(tmp, f"next_x_{snap_id}.json"), "w", encoding="utf-8") as fh:
+                json.dump({"workflow_id": workflow, "data": [[1.0, 2.0]]}, fh)
+        index = _build_triplet_index_from_directory(tmp)
+        snaps = index.snapshots_for_workflow(workflow)
+        assert [snap.suffix for snap in snaps] == ["50", "49", "48"]
+        assert snaps[0].uncertainty_trend_y == 50.0
+
+        paths = StrainDashboardPaths(local_json_path=os.path.join(tmp, "data.json"))
+        versioned = apply_nsdf_file_suffixes(
+            paths,
+            data_suffix="49",
+            surrogate_suffix="49",
+            next_x_suffix="49",
+            strict=True,
+        )
+        assert versioned.local_json_path.endswith("data_49.json")
+        assert versioned.surrogate_json_path.endswith("surrogate_49.json")
+        assert versioned.next_x_json_path.endswith("next_x_49.json")
+        assert resolve_auxiliary_suffix_for_data_snapshot("49", ["48", "49", "50"]) == "49"
+        assert resolve_auxiliary_suffix_for_data_snapshot("49", ["48", "50"]) == "latest"
 
 
 def test_promote_gateway_preserves_strict_triplet_paths() -> None:
