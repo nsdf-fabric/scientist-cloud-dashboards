@@ -12,6 +12,8 @@ import html
 import os
 import sys
 import traceback
+
+import numpy as np
 from dataclasses import replace
 from typing import Any, Callable, Dict, List, Optional
 
@@ -179,6 +181,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (  # noqa: E402
     _snapshot_index_in_series,
     _snapshots_chronological,
     _trend_current_index,
+    build_uncertainty_trend_from_surrogate_paths,
     build_uncertainty_trend_series,
     apply_nsdf_file_suffixes,
     discover_nsdf_next_x_version_options,
@@ -380,6 +383,9 @@ else:
             "callback_id": None,
         },
         "loading_generation": 0,
+        "catalog_ready": False,
+        "catalog_loading": False,
+        "catalog_callback_id": None,
     }
 
     def _resolve_base_paths() -> StrainDashboardPaths:
@@ -522,8 +528,114 @@ else:
         load_payload()
         rebuild_figures()
 
+    def _bootstrap_minimal_ui_state() -> None:
+        """Latest-only selectors until the full snapshot catalog is ready."""
+        grid_state["catalog_ready"] = False
+        grid_state["triplet_index"] = None
+        grid_state["uncertainty_trend_points_key"] = ""
+        grid_state["uncertainty_trend_points"] = None
+        grid_state["version_suffix"] = "latest"
+        grid_state["surrogate_version_suffix"] = "latest"
+        grid_state["next_x_version_suffix"] = "latest"
+        grid_state["surrogate_manual"] = False
+        grid_state["next_x_manual"] = False
+        grid_state["surrogate_suffix_options"] = [("latest", "Latest (surrogate.json)")]
+        grid_state["next_x_suffix_options"] = [("latest", "Latest (next_x.json)")]
+        grid_state["updating_controls"] = True
+        try:
+            workflow_select.options = [
+                (NSDF_UNKNOWN_WORKFLOW_ID, "(indexing snapshots in background…)"),
+            ]
+            workflow_select.value = NSDF_UNKNOWN_WORKFLOW_ID
+            version_select.options = [("latest", "Latest (data.json)")]
+            version_select.value = "latest"
+            surrogate_select.options = list(grid_state["surrogate_suffix_options"])
+            surrogate_select.value = "latest"
+            next_x_select.options = list(grid_state["next_x_suffix_options"])
+            next_x_select.value = "latest"
+        finally:
+            grid_state["updating_controls"] = False
+
+    def _update_workflow_hint_from_bundle() -> None:
+        if loaded_bundle is None:
+            return
+        surrogate_info = validate_nsdf_surrogate_doc(loaded_bundle.surrogate)
+        next_x_info = validate_nsdf_next_x_doc(loaded_bundle.next_x)
+        workflow_id = resolve_nsdf_workflow_id(surrogate_info, next_x_info)
+        if not workflow_id:
+            return
+        grid_state["workflow_id"] = workflow_id
+        grid_state["updating_controls"] = True
+        try:
+            workflow_select.options = [
+                (workflow_id, format_nsdf_workflow_select_label(workflow_id)),
+            ]
+            workflow_select.value = workflow_id
+        finally:
+            grid_state["updating_controls"] = False
+
+    def _fast_latest_triplet_load() -> None:
+        _bootstrap_minimal_ui_state()
+        _reload_figures_view()
+        _update_workflow_hint_from_bundle()
+
+    def _cancel_background_catalog() -> None:
+        callback_id = grid_state.get("catalog_callback_id")
+        if callback_id is not None:
+            try:
+                doc.remove_next_tick_callback(callback_id)
+            except Exception:
+                pass
+        grid_state["catalog_callback_id"] = None
+        grid_state["catalog_loading"] = False
+
+    def _background_catalog_populate() -> None:
+        grid_state["catalog_callback_id"] = None
+        if grid_state.get("catalog_loading"):
+            return
+        grid_state["catalog_loading"] = True
+        grid_state["updating_controls"] = True
+        try:
+            current_workflow = str(grid_state.get("workflow_id") or "").strip()
+            if current_workflow and current_workflow != NSDF_UNKNOWN_WORKFLOW_ID:
+                workflow_select.options = [
+                    (current_workflow, f"{format_nsdf_workflow_select_label(current_workflow)} (indexing…)"),
+                ]
+                workflow_select.value = current_workflow
+            else:
+                workflow_select.options = [
+                    (NSDF_UNKNOWN_WORKFLOW_ID, "(indexing snapshots in background…)"),
+                ]
+                workflow_select.value = NSDF_UNKNOWN_WORKFLOW_ID
+        finally:
+            grid_state["updating_controls"] = False
+        try:
+            _rebuild_triplet_catalog(preserve_workflow=True, preserve_snapshot=True)
+            grid_state["catalog_ready"] = True
+            rebuild_figures(show_loading_gap=False)
+        except Exception:
+            traceback.print_exc()
+        finally:
+            grid_state["catalog_loading"] = False
+
+    def _schedule_background_catalog() -> None:
+        _cancel_background_catalog()
+        callback_id = doc.add_next_tick_callback(_background_catalog_populate)
+        grid_state["catalog_callback_id"] = callback_id
+
+    def _initial_dashboard_load() -> None:
+        _fast_latest_triplet_load()
+        _schedule_background_catalog()
+
+    def _reload_dashboard_fast_then_catalog() -> None:
+        grid_state["catalog_ready"] = False
+        _fast_latest_triplet_load()
+        _schedule_background_catalog()
+
     def _full_catalog_reload() -> None:
+        _cancel_background_catalog()
         _rebuild_triplet_catalog()
+        grid_state["catalog_ready"] = True
         _reload_figures_view()
 
     def _wrap_log_html(inner_html: str) -> str:
@@ -712,6 +824,7 @@ else:
             remote_linked=_remote_linked,
         )
         grid_state["triplet_index"] = index
+        grid_state["catalog_ready"] = True
         grid_state["uncertainty_trend_points_key"] = ""
         grid_state["uncertainty_trend_points"] = None
         _refresh_auxiliary_suffix_options()
@@ -985,13 +1098,29 @@ else:
         )
 
     def _uncertainty_trend_for_dashboard() -> Optional[UncertaintyTrendSeries]:
+        current_snap = str(grid_state.get("version_suffix") or "latest")
+        if not grid_state.get("catalog_ready"):
+            quick = build_uncertainty_trend_from_surrogate_paths(
+                _resolve_paths(),
+                current_snapshot=current_snap,
+                mongo_s3_auth=_dataset_s3_auth_override(),
+                remote_linked=_remote_linked,
+            )
+            if quick is not None:
+                return quick
+            return UncertaintyTrendSeries(
+                step_ids=[],
+                y=np.array([], dtype=np.float64),
+                labels=[],
+                warnings=["Uncertainty trend will update after snapshot catalog loads."],
+            )
+
         index = grid_state.get("triplet_index")
         if not isinstance(index, NSDFTripletIndex):
             return None
         workflow = str(grid_state.get("workflow_id") or "").strip()
         if not workflow or workflow == NSDF_UNKNOWN_WORKFLOW_ID:
             return None
-        current_snap = str(grid_state.get("version_suffix") or "latest")
         cache_key = _uncertainty_trend_points_cache_key(workflow, index)
         cached = grid_state.get("uncertainty_trend_points")
         if (
@@ -1015,14 +1144,16 @@ else:
             mongo_s3_auth=_dataset_s3_auth_override(),
             remote_linked=_remote_linked,
             surrogate_paths=_resolve_paths(),
+            allow_per_snapshot_fallback=True,
         )
         grid_state["uncertainty_trend_points_key"] = cache_key
         grid_state["uncertainty_trend_points"] = replace(series, current_index=None)
         return series
 
-    def rebuild_figures() -> None:
+    def rebuild_figures(*, show_loading_gap: bool = True) -> None:
         apply_grid_size()
-        figures_column.children = []
+        if show_loading_gap:
+            figures_column.children = []
         if loaded_bundle is None:
             figures_column.children = [Div(text="<i>No NSDF data loaded.</i>")]
             return
@@ -1098,8 +1229,8 @@ else:
 
     def on_reload() -> None:
         _defer_figures_work(
-            _full_catalog_reload,
-            message="Reloading catalog and visualization...",
+            _reload_dashboard_fast_then_catalog,
+            message="Reloading latest triplet...",
         )
 
     def on_external_refresh(_doc: Any = doc, _on_reload: Callable[[], None] = on_reload) -> None:
@@ -1198,7 +1329,7 @@ else:
     doc.add_root(root)
 
     if paths.local_data_dir or paths.has_s3_source() or paths.local_json_path or paths.json_url:
-        _defer_figures_work(_full_catalog_reload, message="Loading dashboard...")
+        _defer_figures_work(_initial_dashboard_load, message="Loading latest triplet...")
     else:
         _set_controls_busy(False)
         figures_column.children = [
@@ -1218,8 +1349,16 @@ else:
             token: int = _refresh_token,
             unregister: Callable[[int], None] = unregister_refresh_callback,
             stop_playback: Callable[[], None] = _stop_playback,
+            cancel_catalog: Callable[[], None] = _cancel_background_catalog,
         ) -> None:
-            stop_playback()
+            try:
+                stop_playback()
+            except Exception:
+                pass
+            try:
+                cancel_catalog()
+            except Exception:
+                pass
             unregister(token)
 
         doc.on_session_destroyed(_cleanup_refresh_callback)

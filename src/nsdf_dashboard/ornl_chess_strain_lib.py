@@ -4395,6 +4395,47 @@ def _trend_current_index(
     return fallback
 
 
+def build_uncertainty_trend_from_surrogate_paths(
+    surrogate_paths: StrainDashboardPaths,
+    *,
+    current_snapshot: str = "latest",
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+    remote_linked: bool = False,
+) -> Optional[UncertaintyTrendSeries]:
+    """
+    Fast uncertainty trend from one ``surrogate.json`` (``transformed_stddevs_avg`` only).
+
+    Returns ``None`` when the selected surrogate does not contain a multi-point series.
+    """
+    trend_doc = load_surrogate_doc_for_paths(
+        surrogate_paths,
+        mongo_s3_auth=mongo_s3_auth,
+        remote_linked=remote_linked,
+    )
+    full_points, parse_warnings = parse_transformed_stddevs_avg_points(
+        (trend_doc or {}).get("transformed_stddevs_avg")
+    )
+    if len(full_points) < 2:
+        return None
+    step_ids = [point[0] for point in full_points]
+    ys = np.asarray([point[1] for point in full_points], dtype=np.float64)
+    current_snapshot = (current_snapshot or "latest").strip() or "latest"
+    current_index: Optional[int] = None
+    if current_snapshot != "latest":
+        for idx, step_id in enumerate(step_ids):
+            if step_id == current_snapshot:
+                current_index = idx
+                break
+    return UncertaintyTrendSeries(
+        step_ids=step_ids,
+        y=ys,
+        labels=list(step_ids),
+        current_index=current_index,
+        source="transformed_stddevs_avg",
+        warnings=parse_warnings,
+    )
+
+
 def build_uncertainty_trend_series(
     triplet_index: NSDFTripletIndex,
     base_paths: StrainDashboardPaths,
@@ -4405,6 +4446,7 @@ def build_uncertainty_trend_series(
     mongo_s3_auth: Optional[Dict[str, str]] = None,
     remote_linked: bool = False,
     surrogate_paths: Optional[StrainDashboardPaths] = None,
+    allow_per_snapshot_fallback: bool = True,
 ) -> UncertaintyTrendSeries:
     """
     Build avg-uncertainty vs time-step series for the active workflow.
@@ -4448,6 +4490,15 @@ def build_uncertainty_trend_series(
             current_index=current_index,
             source="transformed_stddevs_avg",
             warnings=warnings,
+        )
+
+    if not allow_per_snapshot_fallback:
+        return UncertaintyTrendSeries(
+            step_ids=[],
+            y=np.zeros(0, dtype=np.float64),
+            labels=[],
+            warnings=warnings
+            or ["Uncertainty trend will update after the snapshot catalog finishes loading."],
         )
 
     step_ids_out: List[str] = []
@@ -5110,7 +5161,7 @@ def make_uncertainty_trend_figure(
     layout: StrainFigureLayout,
 ) -> Any:
     """Line plot of average uncertainty vs scan step (4th dashboard panel)."""
-    from bokeh.models import ColumnDataSource, Div, FixedTicker
+    from bokeh.models import ColumnDataSource, Div
     from bokeh.plotting import figure
 
     if not series.step_ids:
@@ -5161,7 +5212,12 @@ def make_uncertainty_trend_figure(
         panel_width=layout.frame_width,
         highlight_id=highlight_id,
     )
-    p.xaxis.ticker = FixedTicker(ticks=sparse_ticks)
+    sparse_set = set(sparse_ticks)
+    # FactorRange is categorical: blank overrides hide labels without changing point positions.
+    p.xaxis.major_label_overrides = {
+        step_id: step_id if step_id in sparse_set else ""
+        for step_id in series.step_ids
+    }
     p.xaxis.major_label_orientation = math.pi / 4 if len(sparse_ticks) > 4 else 0.0
     source = ColumnDataSource(
         data={

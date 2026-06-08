@@ -27,6 +27,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (
     discover_nsdf_surrogate_version_options,
     resolve_auxiliary_suffix_for_data_snapshot,
     build_strain_field_grids,
+    build_uncertainty_trend_from_surrogate_paths,
     build_uncertainty_trend_series,
     parse_transformed_stddevs_avg_points,
     _sparse_trend_axis_ticks,
@@ -521,6 +522,53 @@ def test_parse_transformed_stddevs_avg_points() -> None:
 
     points, _ = parse_transformed_stddevs_avg_points([[1.0, 0.5], [2.0, 0.3]])
     assert points == [("1", 0.5), ("2", 0.3)]
+
+
+def test_build_uncertainty_trend_skips_per_snapshot_when_disabled() -> None:
+    index = NSDFTripletIndex(
+        snapshots=[
+            NSDFSnapshotRef(suffix="20260601T100000Z", workflow_id="wf-trend", sort_key="20260601T100000Z"),
+        ],
+        by_workflow={
+            "wf-trend": [
+                NSDFSnapshotRef(suffix="20260601T100000Z", workflow_id="wf-trend", sort_key="20260601T100000Z"),
+            ],
+        },
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "surrogate.json"), "w", encoding="utf-8") as fh:
+            json.dump({"workflow_id": "wf-trend", "surrogate": [1.0, 2.0, 3.0, 4.0]}, fh)
+        paths = StrainDashboardPaths(local_json_path=os.path.join(tmp, "data.json"))
+        series = build_uncertainty_trend_series(
+            index,
+            paths,
+            workflow_id="wf-trend",
+            grid_size=(2, 2),
+            allow_per_snapshot_fallback=False,
+        )
+        assert series.step_ids == []
+        assert "catalog" in " ".join(series.warnings).lower()
+
+
+def test_build_uncertainty_trend_from_surrogate_paths() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "surrogate.json"), "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "workflow_id": "wf-trend",
+                    "transformed_stddevs_avg": [["a", 0.9], ["b", 0.4]],
+                },
+                fh,
+            )
+        paths = StrainDashboardPaths(
+            local_json_path=os.path.join(tmp, "data.json"),
+            surrogate_json_path=os.path.join(tmp, "surrogate.json"),
+            strict_triplet_paths=True,
+        )
+        series = build_uncertainty_trend_from_surrogate_paths(paths)
+        assert series is not None
+        assert series.step_ids == ["a", "b"]
+        assert series.y.tolist() == [0.9, 0.4]
 
 
 def test_build_uncertainty_trend_series_from_local_surrogates() -> None:
