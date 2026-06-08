@@ -422,6 +422,8 @@ class StrainFieldPlotConfig:
     colormap_estimate: str = "Viridis256"
     colormap_variance: str = "Coolwarm256"
     colormap_mask: Tuple[str, str] = ("#ffffff", "#ffffff")
+    estimate_color_low: Optional[float] = None
+    estimate_color_high: Optional[float] = None
 
 
 @dataclass
@@ -4481,6 +4483,26 @@ def _shared_field_limits(
     return lo, hi
 
 
+def resolve_estimate_color_limits(
+    *arrays: np.ndarray,
+    manual_low: Optional[float] = None,
+    manual_high: Optional[float] = None,
+    fallback: Tuple[float, float] = (0.0, 1.0),
+) -> Tuple[float, float]:
+    """
+    Color scale for measurement + prediction panels.
+
+    Uses ``manual_low`` / ``manual_high`` when both are finite and ``low < high``;
+    otherwise falls back to data-driven min/max via ``_shared_field_limits``.
+    """
+    if manual_low is not None and manual_high is not None:
+        lo = float(manual_low)
+        hi = float(manual_high)
+        if math.isfinite(lo) and math.isfinite(hi) and lo < hi:
+            return lo, hi
+    return _shared_field_limits(*arrays, fallback=fallback)
+
+
 _STRAIN_COLORBAR_MARGIN = 75
 _STRAIN_FRAME_BASE = 360
 _STRAIN_MIN_BORDER_LEFT = 58
@@ -5625,7 +5647,12 @@ def _build_strain_triplet_figures(
         measured_vals = np.array([], dtype=np.float64)
 
     est_palette = _resolve_bokeh_palette(cfg.colormap_estimate)
-    est_lo, est_hi = _shared_field_limits(est, measured_vals)
+    est_lo, est_hi = resolve_estimate_color_limits(
+        est,
+        measured_vals,
+        manual_low=cfg.estimate_color_low,
+        manual_high=cfg.estimate_color_high,
+    )
     est_mapper = LinearColorMapper(palette=est_palette, low=est_lo, high=est_hi)
     panel_layout = _strain_figure_layout(nx, ny)
 

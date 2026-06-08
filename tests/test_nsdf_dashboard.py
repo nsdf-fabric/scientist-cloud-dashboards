@@ -689,6 +689,22 @@ def test_next_x_accepts_lab_pair_when_dataset_x_size_is_gp_dim() -> None:
     assert float(info.entries[0].coordinates[0, 1]) == 33.247209043840385
 
 
+def test_resolve_estimate_color_limits_manual_and_dynamic() -> None:
+    from nsdf_dashboard.ornl_chess_strain_lib import resolve_estimate_color_limits
+
+    est = np.array([[0.1, 0.5], [0.2, 0.8]], dtype=np.float64)
+    measured = np.array([0.05, 0.9], dtype=np.float64)
+    assert resolve_estimate_color_limits(est, measured) == (0.05, 0.9)
+    assert resolve_estimate_color_limits(est, measured, manual_low=-1.0, manual_high=1.0) == (
+        -1.0,
+        1.0,
+    )
+    assert resolve_estimate_color_limits(est, measured, manual_low=1.0, manual_high=-1.0) == (
+        0.05,
+        0.9,
+    )
+
+
 def test_next_x_object_schema_loads_from_local_bundle() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         data_path = os.path.join(tmp, "data.json")

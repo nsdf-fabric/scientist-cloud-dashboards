@@ -209,6 +209,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (  # noqa: E402
     resolve_nsdf_workflow_id,
     resolve_strain_paths_for_session,
     resolve_nsdf_grid_size,
+    resolve_estimate_color_limits,
     scientistcloud_dataset_is_remote_linked,
     surrogate_doc_defines_grid_size,
     validate_nsdf_measurement_doc,
@@ -227,6 +228,23 @@ def _dashboard_env_value(*names: str) -> str:
         if value:
             return value
     return ""
+
+
+def _float_value(raw: str) -> Optional[float]:
+    try:
+        value = float(str(raw).strip())
+    except ValueError:
+        return None
+    if not np.isfinite(value):
+        return None
+    return value
+
+
+def _format_color_limit(value: float) -> str:
+    magnitude = abs(float(value))
+    if magnitude != 0.0 and (magnitude < 1e-3 or magnitude >= 1e4):
+        return f"{float(value):.4e}"
+    return f"{float(value):.6g}"
 
 
 def _int_value(raw: str) -> Optional[int]:
@@ -388,6 +406,9 @@ else:
         "catalog_ready": False,
         "catalog_loading": False,
         "catalog_callback_id": None,
+        "color_range_mode": "dynamic",
+        "color_range_lo": "",
+        "color_range_hi": "",
     }
 
     def _resolve_base_paths() -> StrainDashboardPaths:
@@ -479,6 +500,18 @@ else:
     btn_play_stop = _toolbar_button("Stop", button_type="warning", width=_play_btn_width)
     grid_w = Spinner(title="Grid width", low=1, high=512, step=1, value=plot_cfg.grid_size[0], width=100)
     grid_h = Spinner(title="Grid height", low=1, high=512, step=1, value=plot_cfg.grid_size[1], width=100)
+    color_range_select = Select(
+        title="Plot 1–2 color range",
+        value="dynamic",
+        options=[
+            ("dynamic", "Auto (data min/max)"),
+            ("manual", "Fixed min/max"),
+        ],
+        width=170,
+    )
+    color_lo_input = TextInput(title="Color min", value="", width=110, disabled=True)
+    color_hi_input = TextInput(title="Color max", value="", width=110, disabled=True)
+    btn_reset_color_range = _toolbar_button("Reset range", button_type="default", width=100)
     btn_reset_grid = _toolbar_button("Reset", button_type="default", width=80)
     btn_reload = _toolbar_button("Reload", button_type="primary", width=90)
     btn_index_workflows = _toolbar_button("Index workflows", button_type="default", width=140)
@@ -767,6 +800,8 @@ else:
             f"Unique coordinates in data (sparse hint): {last_status['inferred_grid_size'][0]} x {last_status['inferred_grid_size'][1]}.",
             f"Plot grid size: {active_grid_size[0]} x {active_grid_size[1]}.",
             f"Grid source: {grid_state['active_source']} (bounds/surrogate define the scan canvas).",
+            last_status.get("color_range_line")
+            or _color_range_status_line(*grid_state.get("last_color_range", (0.0, 1.0))),
             f"Coordinate normalization: {last_status['bounds_source']}.",
             "Compatible fields: " + ", ".join(last_status["fields"]) + ".",
         ]
@@ -1157,6 +1192,55 @@ else:
     def apply_grid_size() -> None:
         plot_cfg.grid_size = _grid_size_from_controls()
 
+    def _color_range_mode() -> str:
+        mode = str(grid_state.get("color_range_mode") or "dynamic").strip()
+        return mode if mode in ("dynamic", "manual") else "dynamic"
+
+    def _sync_color_range_control_state() -> None:
+        manual = _color_range_mode() == "manual"
+        color_lo_input.disabled = not manual
+        color_hi_input.disabled = not manual
+        btn_reset_color_range.disabled = not manual
+
+    def apply_plot_color_range() -> None:
+        if _color_range_mode() == "manual":
+            lo = _float_value(str(color_lo_input.value or ""))
+            hi = _float_value(str(color_hi_input.value or ""))
+            plot_cfg.estimate_color_low = lo
+            plot_cfg.estimate_color_high = hi
+        else:
+            plot_cfg.estimate_color_low = None
+            plot_cfg.estimate_color_high = None
+
+    def _update_color_range_display(lo: float, hi: float) -> None:
+        grid_state["last_color_range"] = (lo, hi)
+        if _color_range_mode() != "dynamic":
+            return
+        grid_state["updating_controls"] = True
+        try:
+            color_lo_input.value = _format_color_limit(lo)
+            color_hi_input.value = _format_color_limit(hi)
+        finally:
+            grid_state["updating_controls"] = False
+
+    def _color_range_status_line(lo: float, hi: float) -> str:
+        lo_text = _format_color_limit(lo)
+        hi_text = _format_color_limit(hi)
+        if _color_range_mode() == "manual":
+            manual_lo = plot_cfg.estimate_color_low
+            manual_hi = plot_cfg.estimate_color_high
+            if (
+                manual_lo is not None
+                and manual_hi is not None
+                and manual_lo < manual_hi
+            ):
+                return f"Plot 1–2 color range: fixed [{lo_text}, {hi_text}]."
+            return (
+                "Plot 1–2 color range: invalid manual min/max; "
+                f"using auto [{lo_text}, {hi_text}]."
+            )
+        return f"Plot 1–2 color range: auto [{lo_text}, {hi_text}]."
+
     def _uncertainty_trend_points_cache_key(workflow_id: str, index: NSDFTripletIndex) -> str:
         resolved = _resolve_paths()
         return (
@@ -1228,6 +1312,7 @@ else:
 
     def rebuild_figures(*, show_loading_gap: bool = True) -> None:
         apply_grid_size()
+        apply_plot_color_range()
         if show_loading_gap and not figures_column.children:
             figures_column.children = [_loading_placeholder_div("Building plots...")]
         if loaded_bundle is None:
@@ -1235,6 +1320,21 @@ else:
             return
         try:
             grids = build_strain_field_grids(loaded_bundle.data, plot_cfg, loaded_bundle.surrogate)
+            measured_vals = grids.meta.get("measurement_values")
+            if not isinstance(measured_vals, np.ndarray):
+                measured_vals = np.array([], dtype=np.float64)
+            est_lo, est_hi = resolve_estimate_color_limits(
+                grids.estimate,
+                measured_vals,
+                manual_low=plot_cfg.estimate_color_low,
+                manual_high=plot_cfg.estimate_color_high,
+            )
+            _update_color_range_display(est_lo, est_hi)
+            if grid_state.get("last_status") is not None:
+                grid_state["last_status"]["color_range_line"] = _color_range_status_line(
+                    est_lo,
+                    est_hi,
+                )
             surrogate_info = validate_nsdf_surrogate_doc(loaded_bundle.surrogate)
             next_x_info = validate_nsdf_next_x_doc(loaded_bundle.next_x)
             selected_workflow = str(grid_state.get("workflow_id") or "").strip()
@@ -1324,6 +1424,30 @@ else:
         plot_cfg.grid_size = manual_grid_size
         _defer_figures_work(rebuild_figures, message="Updating grid...")
 
+    def on_reset_color_range() -> None:
+        grid_state["color_range_mode"] = "dynamic"
+        grid_state["updating_controls"] = True
+        try:
+            color_range_select.value = "dynamic"
+        finally:
+            grid_state["updating_controls"] = False
+        _sync_color_range_control_state()
+        _defer_figures_work(rebuild_figures, message="Resetting color range...")
+
+    def on_color_range_mode_change(attr: str, old: Any, new: Any) -> None:
+        if grid_state["updating_controls"]:
+            return
+        grid_state["color_range_mode"] = str(new or "dynamic")
+        _sync_color_range_control_state()
+        _defer_figures_work(rebuild_figures, message="Updating color range...")
+
+    def on_color_limit_change(attr: str, old: Any, new: Any) -> None:
+        if grid_state["updating_controls"]:
+            return
+        if _color_range_mode() != "manual":
+            return
+        _defer_figures_work(rebuild_figures, message="Updating color range...")
+
     def on_reset_grid() -> None:
         grid_state["manual_grid_size"] = None
         if loaded_bundle is None:
@@ -1347,6 +1471,9 @@ else:
 
     grid_w.on_change("value", on_grid_control_change)
     grid_h.on_change("value", on_grid_control_change)
+    color_range_select.on_change("value", on_color_range_mode_change)
+    color_lo_input.on_change("value", on_color_limit_change)
+    color_hi_input.on_change("value", on_color_limit_change)
     workflow_select.on_change("value", on_workflow_change)
     version_select.on_change("value", on_version_change)
     surrogate_select.on_change("value", on_surrogate_change)
@@ -1355,6 +1482,7 @@ else:
     btn_play_backward.on_click(on_play_backward)
     btn_play_stop.on_click(on_play_stop)
     btn_reset_grid.on_click(on_reset_grid)
+    btn_reset_color_range.on_click(on_reset_color_range)
     btn_reload.on_click(on_reload)
     btn_index_workflows.on_click(on_index_workflows)
     btn_toggle_status.on_click(on_toggle_status)
@@ -1366,6 +1494,10 @@ else:
             next_x_select,
             grid_w,
             grid_h,
+            color_range_select,
+            color_lo_input,
+            color_hi_input,
+            btn_reset_color_range,
             btn_index_workflows,
             btn_reload,
             btn_reset_grid,
@@ -1387,6 +1519,10 @@ else:
         _control_row(
             grid_w,
             grid_h,
+            color_range_select,
+            color_lo_input,
+            color_hi_input,
+            btn_reset_color_range,
             btn_index_workflows,
             btn_reload,
             btn_reset_grid,
@@ -1414,6 +1550,7 @@ else:
         sizing_mode="stretch_width",
     )
     figures_column.children = [_loading_placeholder_div("Loading dashboard...")]
+    _sync_color_range_control_state()
     doc.add_root(root)
 
     if paths.local_data_dir or paths.has_s3_source() or paths.local_json_path or paths.json_url:
