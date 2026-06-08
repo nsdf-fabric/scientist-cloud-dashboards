@@ -374,8 +374,8 @@ class StrainFieldPlotConfig:
     title_estimate: str = "Prediction"
     title_variance: str = "Uncertainty"
     flip_y_for_display: bool = True
-    colormap_estimate: str = "Coolwarm256"
-    colormap_variance: str = "Viridis256"
+    colormap_estimate: str = "Viridis256"
+    colormap_variance: str = "Coolwarm256"
     colormap_mask: Tuple[str, str] = ("#ffffff", "#ffffff")
 
 
@@ -2962,7 +2962,7 @@ def _symmetric_rdbu_limits(
     *arrays: np.ndarray,
     fallback: Tuple[float, float] = (-1.0, 1.0),
 ) -> Tuple[float, float]:
-    """Symmetric limits centered at zero for diverging RdBu maps."""
+    """Symmetric limits centered at zero for diverging RdBu / coolwarm maps."""
     chunks: List[np.ndarray] = []
     for arr in arrays:
         if arr is None:
@@ -2975,6 +2975,28 @@ def _symmetric_rdbu_limits(
     combined = np.concatenate(chunks)
     abs_max = max(float(np.max(np.abs(combined))), 1e-12)
     return -abs_max, abs_max
+
+
+def _shared_field_limits(
+    *arrays: np.ndarray,
+    fallback: Tuple[float, float] = (0.0, 1.0),
+) -> Tuple[float, float]:
+    """Shared min/max color scale for measurement + prediction panels."""
+    chunks: List[np.ndarray] = []
+    for arr in arrays:
+        if arr is None:
+            continue
+        finite = np.asarray(arr, dtype=np.float64)[np.isfinite(arr)]
+        if finite.size:
+            chunks.append(finite)
+    if not chunks:
+        return fallback
+    combined = np.concatenate(chunks)
+    lo = float(np.min(combined))
+    hi = float(np.max(combined))
+    if lo == hi:
+        hi = lo + 1e-12
+    return lo, hi
 
 
 _STRAIN_COLORBAR_MARGIN = 75
@@ -3578,7 +3600,7 @@ def make_strain_measurement_figure(
     hi: float,
     layout: Optional[StrainFigureLayout] = None,
 ) -> Tuple[Any, Optional[Any]]:
-    """White canvas with square markers colored by dataset_y (RdBu) and matching colorbar."""
+    """White canvas with square markers colored by dataset_y and matching colorbar."""
     nx, ny = cfg.grid_size
     p = _strain_plot_figure(title, nx, ny, cfg, layout=layout)
     _add_strain_white_grid_image(p, nx, ny, cfg)
@@ -3625,9 +3647,9 @@ def _build_strain_triplet_figures(
     if not isinstance(measured_vals, np.ndarray):
         measured_vals = np.array([], dtype=np.float64)
 
-    rdbu_palette = _resolve_bokeh_palette(cfg.colormap_estimate)
-    rdbu_lo, rdbu_hi = _symmetric_rdbu_limits(est, measured_vals)
-    rdbu_mapper = LinearColorMapper(palette=rdbu_palette, low=rdbu_lo, high=rdbu_hi)
+    est_palette = _resolve_bokeh_palette(cfg.colormap_estimate)
+    est_lo, est_hi = _shared_field_limits(est, measured_vals)
+    est_mapper = LinearColorMapper(palette=est_palette, low=est_lo, high=est_hi)
     panel_layout = _strain_figure_layout(nx, ny)
 
     if measured_gx.size:
@@ -3637,15 +3659,15 @@ def _build_strain_triplet_figures(
             gx=measured_gx,
             gy=measured_gy,
             values=measured_vals,
-            mapper=rdbu_mapper,
-            lo=rdbu_lo,
-            hi=rdbu_hi,
+            mapper=est_mapper,
+            lo=est_lo,
+            hi=est_hi,
             layout=panel_layout,
         )
     else:
         p0 = _strain_plot_figure(f"{cfg.title_measurements}{sub}", nx, ny, cfg, layout=panel_layout)
         _add_strain_white_grid_image(p0, nx, ny, cfg)
-        _attach_heatmap_colorbar(p0, rdbu_mapper, rdbu_lo, rdbu_hi)
+        _attach_heatmap_colorbar(p0, est_mapper, est_lo, est_hi)
         _lock_strain_figure_layout(p0, panel_layout)
         sampled_renderer = None
 
@@ -3682,7 +3704,7 @@ def _build_strain_triplet_figures(
         grids.estimate,
         cfg,
         palette_name=cfg.colormap_estimate,
-        low_high=(rdbu_lo, rdbu_hi),
+        low_high=(est_lo, est_hi),
         show_colorbar=True,
         layout=panel_layout,
     )
