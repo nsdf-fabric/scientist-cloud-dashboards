@@ -2875,6 +2875,35 @@ def _add_grid_point_overlay(
     return figure.scatter(px, py, **scatter_kwargs)
 
 
+def _add_proposed_next_scan_overlay(
+    figure: Any,
+    gx: np.ndarray,
+    gy: np.ndarray,
+    nx: int,
+    ny: int,
+    flip_y: bool,
+    *,
+    size: int = 15,
+    line_width: float = 2.0,
+) -> Optional[Any]:
+    """Hollow black ring over proposed next-scan cells; sampled viridis squares show inside."""
+    if gx.size == 0:
+        return None
+    px, py = _grid_display_coords(gx, gy, nx, ny, flip_y)
+    return figure.scatter(
+        px,
+        py,
+        marker="circle",
+        size=size,
+        color=None,
+        fill_color=None,
+        fill_alpha=0.0,
+        line_color="#000000",
+        line_width=line_width,
+        line_alpha=1.0,
+    )
+
+
 def _hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
     value = hex_color.lstrip("#")
     return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
@@ -3020,7 +3049,9 @@ def _strain_legend_footer_div(
         if label == "Sampled":
             chips.append('<span style="color:#333;">&#9632; Sampled</span>')
         elif label == "Proposed next scan":
-            chips.append('<span style="color:#ff6600;font-weight:600;">+ Proposed next scan</span>')
+            chips.append(
+                '<span style="color:#000;">&#9675; Proposed next scan</span>'
+            )
         else:
             chips.append(f"<span>{label}</span>")
     html = "&nbsp;&nbsp;&nbsp;".join(chips)
@@ -3683,19 +3714,13 @@ def _build_strain_triplet_figures(
             bounds,
         )
         if nx_gx.size:
-            proposed_renderer = _add_grid_point_overlay(
+            proposed_renderer = _add_proposed_next_scan_overlay(
                 p0,
                 nx_gx,
                 nx_gy,
                 nx,
                 ny,
                 cfg.flip_y_for_display,
-                color="#ff6600",
-                marker="cross",
-                size=16,
-                line_color="#ff6600",
-                line_width=2.5,
-                fill_alpha=0.0,
             )
             if proposed_renderer is not None:
                 point_legend_items.append(("Proposed next scan", proposed_renderer))
