@@ -183,7 +183,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (  # noqa: E402
     _trend_current_index,
     build_uncertainty_trend_from_surrogate_paths,
     build_uncertainty_trend_series,
-    parse_transformed_stddevs_avg_points,
+    uncertainty_trend_from_surrogate_doc,
     apply_nsdf_file_suffixes,
     discover_nsdf_next_x_version_options,
     discover_nsdf_surrogate_version_options,
@@ -591,31 +591,12 @@ else:
     def _uncertainty_trend_from_loaded_surrogate(
         current_snap: str,
     ) -> Optional[UncertaintyTrendSeries]:
-        if loaded_bundle is None or not isinstance(loaded_bundle.surrogate, dict):
+        if loaded_bundle is None:
             return None
-        full_points, parse_warnings = parse_transformed_stddevs_avg_points(
-            loaded_bundle.surrogate.get("transformed_stddevs_avg")
-        )
-        if len(full_points) < 1:
-            return None
-        step_ids = [point[0] for point in full_points]
-        ys = np.asarray([point[1] for point in full_points], dtype=np.float64)
-        current_snapshot = (current_snap or "latest").strip() or "latest"
-        current_index: Optional[int] = None
-        if current_snapshot != "latest":
-            for idx, step_id in enumerate(step_ids):
-                if step_id == current_snapshot:
-                    current_index = idx
-                    break
-        elif step_ids:
-            current_index = len(step_ids) - 1
-        return UncertaintyTrendSeries(
-            step_ids=step_ids,
-            y=ys,
-            labels=list(step_ids),
-            current_index=current_index,
-            source="transformed_stddevs_avg",
-            warnings=parse_warnings,
+        return uncertainty_trend_from_surrogate_doc(
+            loaded_bundle.surrogate,
+            current_snapshot=current_snap,
+            grid_size=plot_cfg.grid_size,
         )
 
     def _fast_latest_triplet_load_data() -> None:
@@ -1188,6 +1169,7 @@ else:
             quick = build_uncertainty_trend_from_surrogate_paths(
                 _resolve_paths(),
                 current_snapshot=current_snap,
+                grid_size=plot_cfg.grid_size,
                 mongo_s3_auth=_dataset_s3_auth_override(),
                 remote_linked=_remote_linked,
             )
@@ -1452,11 +1434,11 @@ else:
         ) -> None:
             try:
                 stop_playback()
-            except BaseException:
+            except Exception:
                 pass
             try:
                 cancel_catalog()
-            except BaseException:
+            except Exception:
                 pass
             unregister(token)
 
