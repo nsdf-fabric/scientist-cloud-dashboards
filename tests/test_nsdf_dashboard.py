@@ -15,11 +15,13 @@ import nsdf_dashboard.ornl_chess_strain_lib as lib
 from nsdf_dashboard import refresh_api, refresh_bus
 from nsdf_dashboard.ornl_chess_strain_lib import (
     NSDFLoadedBundle,
+    NSDF_UNKNOWN_WORKFLOW_ID,
     StrainDashboardPaths,
     StrainFieldPlotConfig,
     apply_nsdf_version_suffix,
     build_strain_field_grids,
     collect_nsdf_triplet_load_issues,
+    discover_nsdf_triplet_index,
     discover_nsdf_version_options,
     enrich_strain_paths_from_dataset_doc,
     infer_nsdf_bounds_grid_size,
@@ -28,7 +30,9 @@ from nsdf_dashboard.ornl_chess_strain_lib import (
     parse_nsdf_plot_dim,
     format_nsdf_workflow_display,
     next_x_grid_coords_for_workflow,
+    _build_triplet_index_from_directory,
     _grid_display_coords,
+    resolve_default_workflow_selection,
     resolve_nsdf_workflow_id,
     list_nsdf_field_headers,
     list_nsdf_version_suffixes_from_directory,
@@ -46,6 +50,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (
     validate_nsdf_measurement_doc,
     validate_nsdf_next_x_doc,
     validate_nsdf_surrogate_doc,
+    workflow_id_from_dataset_doc,
 )
 
 
@@ -944,6 +949,36 @@ def test_nsdf_suffixes_after_reference() -> None:
         "20260606T223505Z",
     )
     assert after == ["20260606T223507Z"]
+
+
+def test_triplet_index_groups_snapshots_by_workflow() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "data.json"), "w", encoding="utf-8") as fh:
+            json.dump(_base_data(), fh)
+        with open(os.path.join(tmp, "surrogate.json"), "w", encoding="utf-8") as fh:
+            json.dump({"workflow_id": "wf-a", "surrogate": [1.0, 2.0, 3.0, 4.0]}, fh)
+        with open(os.path.join(tmp, "data_20260607T100000Z.json"), "w", encoding="utf-8") as fh:
+            json.dump(_base_data(), fh)
+        with open(os.path.join(tmp, "surrogate_20260607T100000Z.json"), "w", encoding="utf-8") as fh:
+            json.dump({"workflow_id": "wf-b", "surrogate": [1.0, 2.0, 3.0, 4.0]}, fh)
+        with open(os.path.join(tmp, "data_20260607T110000Z.json"), "w", encoding="utf-8") as fh:
+            json.dump(_base_data(), fh)
+        index = _build_triplet_index_from_directory(tmp)
+        assert index.has_workflow("wf-a")
+        assert index.has_workflow("wf-b")
+        assert index.has_workflow(NSDF_UNKNOWN_WORKFLOW_ID)
+        assert index.default_snapshot_value("wf-b") == "20260607T100000Z"
+        assert resolve_default_workflow_selection(index) == "wf-a"
+        assert resolve_default_workflow_selection(
+            index,
+            dataset_workflow_id="wf-a",
+        ) == "wf-a"
+        assert resolve_default_workflow_selection(
+            index,
+            dataset_workflow_id="wf-b",
+        ) == "wf-b"
+        unknown_opts = index.snapshot_select_options(NSDF_UNKNOWN_WORKFLOW_ID)
+        assert unknown_opts == [("20260607T110000Z", "20260607T110000Z")]
 
 
 def test_s3_surrogate_fallback_when_latest_triplet_missing() -> None:

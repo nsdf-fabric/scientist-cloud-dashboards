@@ -457,6 +457,117 @@ class NSDFLoadedBundle:
     paths: StrainDashboardPaths = field(default_factory=StrainDashboardPaths)
 
 
+NSDF_UNKNOWN_WORKFLOW_ID = "__unknown__"
+
+
+@dataclass(frozen=True)
+class NSDFSnapshotRef:
+    """One timestamped (or latest) triplet attributed to a workflow."""
+
+    suffix: str  # ``""`` = latest trio (`data.json`, etc.)
+    workflow_id: str
+    sort_key: str  # ISO suffix or ``latest`` for ordering
+
+
+@dataclass
+class NSDFTripletIndex:
+    """Workflow-scoped snapshot catalog built once per Reload."""
+
+    snapshots: List[NSDFSnapshotRef] = field(default_factory=list)
+    by_workflow: Dict[str, List[NSDFSnapshotRef]] = field(default_factory=dict)
+
+    def has_workflow(self, workflow_id: str) -> bool:
+        key = (workflow_id or "").strip()
+        return bool(key) and key in self.by_workflow
+
+    def workflow_ids_newest_first(self) -> List[str]:
+        """Workflow ids ordered by each workflow's newest snapshot."""
+        ranked: List[Tuple[str, str]] = []
+        for workflow_id, snaps in self.by_workflow.items():
+            if not snaps:
+                continue
+            ranked.append((snaps[0].sort_key, workflow_id))
+        ranked.sort(reverse=True)
+        return [workflow_id for _sort, workflow_id in ranked]
+
+    def workflow_select_options(self) -> List[Tuple[str, str]]:
+        options: List[Tuple[str, str]] = []
+        for workflow_id in self.workflow_ids_newest_first():
+            count = len(self.by_workflow.get(workflow_id) or [])
+            label = format_nsdf_workflow_select_label(workflow_id)
+            if count > 1:
+                label = f"{label} ({count} snapshots)"
+            options.append((workflow_id, label))
+        return options
+
+    def snapshots_for_workflow(self, workflow_id: str) -> List[NSDFSnapshotRef]:
+        return list(self.by_workflow.get((workflow_id or "").strip()) or [])
+
+    def snapshot_select_options(self, workflow_id: str) -> List[Tuple[str, str]]:
+        options: List[Tuple[str, str]] = []
+        for snap in self.snapshots_for_workflow(workflow_id):
+            value = "latest" if not snap.suffix else snap.suffix
+            if value == "latest":
+                label = "Latest (data.json)"
+            else:
+                label = snap.suffix
+            options.append((value, label))
+        return options
+
+    def newest_workflow_id(self) -> str:
+        ordered = self.workflow_ids_newest_first()
+        return ordered[0] if ordered else NSDF_UNKNOWN_WORKFLOW_ID
+
+    def default_snapshot_value(self, workflow_id: str) -> str:
+        snaps = self.snapshots_for_workflow(workflow_id)
+        if not snaps:
+            return "latest"
+        return "latest" if not snaps[0].suffix else snaps[0].suffix
+
+
+def format_nsdf_workflow_select_label(workflow_id: str) -> str:
+    if workflow_id == NSDF_UNKNOWN_WORKFLOW_ID:
+        return "(unknown)"
+    return workflow_id
+
+
+def workflow_id_from_dataset_doc(doc: Optional[Mapping[str, Any]]) -> Optional[str]:
+    """Best-effort workflow id stored on a ScientistCloud dataset record."""
+    if not isinstance(doc, Mapping):
+        return None
+    for key in ("workflow_id", "nsdf_workflow_id"):
+        value = str(doc.get(key) or "").strip()
+        if value:
+            return value
+    metadata = doc.get("metadata")
+    if isinstance(metadata, Mapping):
+        value = str(metadata.get("workflow_id") or "").strip()
+        if value:
+            return value
+    return None
+
+
+def resolve_default_workflow_selection(
+    index: NSDFTripletIndex,
+    *,
+    dataset_workflow_id: Optional[str] = None,
+    query_workflow_id: Optional[str] = None,
+) -> str:
+    """Prefer URL param, then dataset record, then globally newest snapshot."""
+    for candidate in (query_workflow_id, dataset_workflow_id):
+        if candidate and index.has_workflow(candidate):
+            return candidate
+    return index.newest_workflow_id()
+
+
+def active_workflow_id_from_grid_state(workflow_id: str) -> Optional[str]:
+    """Map selector value to plot/filter workflow id (``None`` for unknown)."""
+    key = (workflow_id or "").strip()
+    if not key or key == NSDF_UNKNOWN_WORKFLOW_ID:
+        return None
+    return key
+
+
 # ---------------------------------------------------------------------------
 # JSON I/O
 # ---------------------------------------------------------------------------
@@ -1074,6 +1185,274 @@ def discover_nsdf_version_options(
             options.append((suffix, suffix))
 
     return options
+
+
+def _suffix_from_data_basename(name: str) -> Optional[str]:
+    base = os.path.basename((name or "").strip())
+    if base == "data.json":
+        return ""
+    parsed = parse_nsdf_data_filename(base)
+    return parsed if parsed else None
+
+
+def _suffix_from_surrogate_basename(name: str) -> Optional[str]:
+    base = os.path.basename((name or "").strip())
+    if base == "surrogate.json":
+        return ""
+    return parse_nsdf_surrogate_filename(base)
+
+
+def _suffix_from_next_x_basename(name: str) -> Optional[str]:
+    base = os.path.basename((name or "").strip())
+    if base == "next_x.json":
+        return ""
+    return parse_nsdf_next_x_filename(base)
+
+
+def _snapshot_sort_key(suffix: str) -> str:
+    """Sort newest-first: ISO timestamps lexicographic; latest trio sorts above all."""
+    return suffix if suffix else "z_latest"
+
+
+def _peek_workflow_id_from_json_doc(doc: Any) -> Optional[str]:
+    if not isinstance(doc, Mapping):
+        return None
+    value = doc.get("workflow_id")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _peek_workflow_id_from_next_x_doc(doc: Any) -> Optional[str]:
+    if not isinstance(doc, list):
+        return None
+    found: set[str] = set()
+    for item in doc:
+        if not isinstance(item, Mapping):
+            continue
+        value = str(item.get("workflow_id") or "").strip()
+        if value:
+            found.add(value)
+    if len(found) == 1:
+        return next(iter(found))
+    return None
+
+
+def _attribute_workflow_to_triplet_files(
+    *,
+    surrogate_doc: Any = None,
+    data_doc: Any = None,
+    next_x_doc: Any = None,
+) -> str:
+    for doc in (surrogate_doc, data_doc, next_x_doc):
+        workflow_id = _peek_workflow_id_from_json_doc(doc)
+        if workflow_id:
+            return workflow_id
+    workflow_id = _peek_workflow_id_from_next_x_doc(next_x_doc)
+    if workflow_id:
+        return workflow_id
+    return NSDF_UNKNOWN_WORKFLOW_ID
+
+
+def _triplet_groups_from_object_keys(keys: Sequence[str]) -> Dict[str, Dict[str, str]]:
+    groups: Dict[str, Dict[str, str]] = {}
+    for key in keys:
+        name = os.path.basename((key or "").strip())
+        if not name:
+            continue
+        data_suffix = _suffix_from_data_basename(name)
+        if data_suffix is not None:
+            groups.setdefault(data_suffix, {})["data"] = key
+            continue
+        surrogate_suffix = _suffix_from_surrogate_basename(name)
+        if surrogate_suffix is not None:
+            groups.setdefault(surrogate_suffix, {})["surrogate"] = key
+            continue
+        next_x_suffix = _suffix_from_next_x_basename(name)
+        if next_x_suffix is not None:
+            groups.setdefault(next_x_suffix, {})["next_x"] = key
+    return groups
+
+
+def _read_json_if_exists_local(path: str) -> Any:
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        return load_json_from_local_path(path)
+    except Exception:
+        return None
+
+
+def _build_triplet_index_from_directory(directory: str) -> NSDFTripletIndex:
+    d = (directory or "").strip()
+    if not d or not os.path.isdir(d):
+        return NSDFTripletIndex()
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return NSDFTripletIndex()
+    keys = [os.path.join(d, name) for name in names if name.endswith(".json")]
+    groups = _triplet_groups_from_object_keys(keys)
+    snapshots: List[NSDFSnapshotRef] = []
+    by_workflow: Dict[str, List[NSDFSnapshotRef]] = {}
+    for suffix in sorted(groups.keys(), key=_snapshot_sort_key, reverse=True):
+        files = groups[suffix]
+        data_path = files.get("data") or ""
+        if not data_path:
+            continue
+        surrogate_doc = _read_json_if_exists_local(files.get("surrogate") or "")
+        data_doc = _read_json_if_exists_local(data_path)
+        next_x_doc = _read_json_if_exists_local(files.get("next_x") or "")
+        workflow_id = _attribute_workflow_to_triplet_files(
+            surrogate_doc=surrogate_doc,
+            data_doc=data_doc,
+            next_x_doc=next_x_doc,
+        )
+        ref = NSDFSnapshotRef(
+            suffix=suffix,
+            workflow_id=workflow_id,
+            sort_key=_snapshot_sort_key(suffix),
+        )
+        snapshots.append(ref)
+        by_workflow.setdefault(workflow_id, []).append(ref)
+    for workflow_id in by_workflow:
+        by_workflow[workflow_id].sort(key=lambda snap: snap.sort_key, reverse=True)
+    return NSDFTripletIndex(snapshots=snapshots, by_workflow=by_workflow)
+
+
+def _list_nsdf_object_keys_from_s3(
+    paths: StrainDashboardPaths,
+    *,
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    bucket = (paths.s3_bucket or "").strip()
+    data_key = (paths.s3_data_key or "").strip()
+    if not bucket and (paths.json_url or "").strip():
+        cfg = _parse_gateway_url_with_query_keys((paths.json_url or "").strip())
+        if cfg:
+            bucket = (cfg.get("bucket") or "").strip()
+            data_key = (cfg.get("key") or "").strip()
+    if not bucket:
+        return []
+
+    prefix = ""
+    if data_key:
+        if "/" in data_key:
+            prefix = data_key.rsplit("/", 1)[0] + "/"
+        elif parse_nsdf_data_filename(data_key) is None and data_key.lower() != "data.json":
+            prefix = data_key.rstrip("/") + "/"
+
+    list_paths = StrainDashboardPaths(
+        s3_bucket=bucket,
+        s3_data_key=data_key or "data.json",
+        s3_endpoint_url=paths.s3_endpoint_url,
+        s3_region=paths.s3_region,
+        s3_env_file=paths.s3_env_file,
+        json_url=paths.json_url,
+    )
+    try:
+        client = _make_nsdf_s3_client(list_paths, mongo_s3_auth=mongo_s3_auth)
+    except Exception:
+        return []
+
+    keys: List[str] = []
+    continuation: Optional[str] = None
+    try:
+        while True:
+            params: Dict[str, Any] = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": 1000}
+            if continuation:
+                params["ContinuationToken"] = continuation
+            result = client.list_objects_v2(**params)
+            for obj in result.get("Contents") or []:
+                key = str(obj.get("Key") or "").strip()
+                if key.endswith(".json"):
+                    keys.append(key)
+            if not result.get("IsTruncated"):
+                break
+            continuation = result.get("NextContinuationToken")
+            if not continuation:
+                break
+    except Exception:
+        return []
+    return keys
+
+
+def _read_json_if_exists_s3(client: Any, bucket: str, key: str) -> Any:
+    if not key:
+        return None
+    try:
+        return _load_json_from_s3_key(client, bucket, key)
+    except Exception as exc:
+        if _s3_missing_error(exc):
+            return None
+        return None
+
+
+def _build_triplet_index_from_s3(
+    paths: StrainDashboardPaths,
+    *,
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+) -> NSDFTripletIndex:
+    bucket = (paths.s3_bucket or "").strip()
+    if not bucket and (paths.json_url or "").strip():
+        cfg = _parse_gateway_url_with_query_keys((paths.json_url or "").strip())
+        if cfg:
+            bucket = (cfg.get("bucket") or "").strip()
+    if not bucket:
+        return NSDFTripletIndex()
+
+    keys = _list_nsdf_object_keys_from_s3(paths, mongo_s3_auth=mongo_s3_auth)
+    groups = _triplet_groups_from_object_keys(keys)
+    try:
+        client = _make_nsdf_s3_client(paths, mongo_s3_auth=mongo_s3_auth)
+    except Exception:
+        return NSDFTripletIndex()
+
+    snapshots: List[NSDFSnapshotRef] = []
+    by_workflow: Dict[str, List[NSDFSnapshotRef]] = {}
+    for suffix in sorted(groups.keys(), key=_snapshot_sort_key, reverse=True):
+        files = groups[suffix]
+        data_key = files.get("data") or ""
+        if not data_key:
+            continue
+        surrogate_doc = _read_json_if_exists_s3(client, bucket, files.get("surrogate") or "")
+        data_doc = _read_json_if_exists_s3(client, bucket, data_key)
+        next_x_doc = _read_json_if_exists_s3(client, bucket, files.get("next_x") or "")
+        workflow_id = _attribute_workflow_to_triplet_files(
+            surrogate_doc=surrogate_doc,
+            data_doc=data_doc,
+            next_x_doc=next_x_doc,
+        )
+        ref = NSDFSnapshotRef(
+            suffix=suffix,
+            workflow_id=workflow_id,
+            sort_key=_snapshot_sort_key(suffix),
+        )
+        snapshots.append(ref)
+        by_workflow.setdefault(workflow_id, []).append(ref)
+    for workflow_id in by_workflow:
+        by_workflow[workflow_id].sort(key=lambda snap: snap.sort_key, reverse=True)
+    return NSDFTripletIndex(snapshots=snapshots, by_workflow=by_workflow)
+
+
+def discover_nsdf_triplet_index(
+    paths: StrainDashboardPaths,
+    *,
+    base_dir: str = "",
+    save_dir: str = "",
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+) -> NSDFTripletIndex:
+    """
+    Build a workflow-scoped snapshot catalog (list + lightweight JSON peeks).
+
+    Called once per Reload; snapshot/workflow UI filters use the cached index.
+    """
+    local_dir = nsdf_listing_directory(paths, base_dir=base_dir, save_dir=save_dir)
+    if local_dir:
+        return _build_triplet_index_from_directory(local_dir)
+    if _remote_snapshot_listing_enabled(paths):
+        return _build_triplet_index_from_s3(paths, mongo_s3_auth=mongo_s3_auth)
+    return NSDFTripletIndex()
 
 
 def _credential_is_placeholder(value: str) -> bool:

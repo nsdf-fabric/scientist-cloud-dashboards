@@ -145,21 +145,23 @@ from nsdf_dashboard.ornl_chess_strain_lib import (  # noqa: E402
     StrainDashboardPaths,
     StrainFieldPlotConfig,
     apply_nsdf_version_suffix,
+    active_workflow_id_from_grid_state,
     build_strain_field_grids,
     collect_nsdf_triplet_load_issues,
-    discover_nsdf_version_options,
+    discover_nsdf_triplet_index,
     enrich_strain_paths_from_dataset_doc,
+    format_nsdf_workflow_select_label,
     find_strain_json_under_dataset_dir,
     infer_nsdf_grid_size,
     is_scientistcloud_portal_data_mount_context,
     list_nsdf_field_headers,
     load_simple_env_file,
     load_nsdf_json_bundle,
+    NSDF_UNKNOWN_WORKFLOW_ID,
     promote_gateway_json_url_to_s3_paths,
-    make_strain_triplet_figures,
     make_strain_triplet_row,
     infer_nsdf_bounds_grid_size,
-    format_nsdf_workflow_display,
+    resolve_default_workflow_selection,
     resolve_nsdf_workflow_id,
     resolve_strain_paths_for_session,
     resolve_nsdf_grid_size,
@@ -167,6 +169,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (  # noqa: E402
     validate_nsdf_measurement_doc,
     validate_nsdf_next_x_doc,
     validate_nsdf_surrogate_doc,
+    workflow_id_from_dataset_doc,
 )
 from nsdf_dashboard.refresh_bus import register_refresh_callback, unregister_refresh_callback  # noqa: E402
 
@@ -241,6 +244,7 @@ else:
     _query_surrogate_url0 = _first_arg("surrogate_json_url")
     _query_next_x_path0 = _first_arg("next_x_json_path")
     _query_next_x_url0 = _first_arg("next_x_json_url")
+    _query_workflow_id0 = _first_arg("workflow_id")
 
     _bd = str(_params.get("base_dir") or "")
     _sd = str(_params.get("save_dir") or "")
@@ -312,6 +316,8 @@ else:
         "updating_controls": False,
         "last_status": {},
         "version_suffix": "latest",
+        "workflow_id": "",
+        "triplet_index": None,
         "playback": {
             "active": False,
             "order": [],
@@ -365,6 +371,12 @@ else:
         'min-height:1.35em;line-height:1.35em;color:#888;">Workflow ID: —</div>'
     )
     workflow_div = Div(text=_workflow_placeholder, sizing_mode="stretch_width")
+    workflow_select = Select(
+        title="Workflow",
+        value="",
+        options=[],
+        width=280,
+    )
     version_select = Select(
         title="Snapshot",
         value="latest",
@@ -496,22 +508,70 @@ else:
         else:
             workflow_div.text = _workflow_placeholder
 
-    def _refresh_version_options() -> None:
-        options = discover_nsdf_version_options(
+    def _rebuild_triplet_catalog(
+        *,
+        preserve_workflow: bool = True,
+        preserve_snapshot: bool = True,
+    ) -> None:
+        index = discover_nsdf_triplet_index(
             _resolve_base_paths(),
             base_dir=_bd,
             save_dir=_sd,
             mongo_s3_auth=_dataset_s3_auth_override(),
         )
-        current = str(grid_state.get("version_suffix") or "latest")
-        valid_values = {value for value, _label in options}
-        if current not in valid_values:
-            current = "latest"
-            grid_state["version_suffix"] = current
+        grid_state["triplet_index"] = index
+
+        workflow_options = index.workflow_select_options()
+        if not workflow_options:
+            workflow_options = [(NSDF_UNKNOWN_WORKFLOW_ID, "(unknown)")]
+
+        current_workflow = str(grid_state.get("workflow_id") or "").strip()
+        if (
+            not preserve_workflow
+            or not current_workflow
+            or not index.has_workflow(current_workflow)
+        ):
+            current_workflow = resolve_default_workflow_selection(
+                index,
+                dataset_workflow_id=workflow_id_from_dataset_doc(_dataset_doc),
+                query_workflow_id=_query_workflow_id0,
+            )
+        grid_state["workflow_id"] = current_workflow
+
+        snapshot_options = index.snapshot_select_options(current_workflow)
+        if not snapshot_options:
+            snapshot_options = [("latest", "Latest (data.json)")]
+
+        current_snapshot = str(grid_state.get("version_suffix") or "latest")
+        valid_snapshots = {value for value, _label in snapshot_options}
+        if not preserve_snapshot or current_snapshot not in valid_snapshots:
+            current_snapshot = index.default_snapshot_value(current_workflow)
+        grid_state["version_suffix"] = current_snapshot
+
         grid_state["updating_controls"] = True
         try:
-            version_select.options = options
-            version_select.value = current
+            workflow_select.options = workflow_options
+            workflow_select.value = current_workflow
+            version_select.options = snapshot_options
+            version_select.value = current_snapshot
+        finally:
+            grid_state["updating_controls"] = False
+
+    def _refresh_snapshot_options_for_workflow(workflow_id: str) -> None:
+        index = grid_state.get("triplet_index")
+        if index is None:
+            snapshot_options = [("latest", "Latest (data.json)")]
+            current_snapshot = "latest"
+        else:
+            snapshot_options = index.snapshot_select_options(workflow_id)
+            if not snapshot_options:
+                snapshot_options = [("latest", "Latest (data.json)")]
+            current_snapshot = index.default_snapshot_value(workflow_id)
+        grid_state["version_suffix"] = current_snapshot
+        grid_state["updating_controls"] = True
+        try:
+            version_select.options = snapshot_options
+            version_select.value = current_snapshot
         finally:
             grid_state["updating_controls"] = False
 
@@ -550,7 +610,8 @@ else:
             version_select.value = grid_state["version_suffix"]
         finally:
             grid_state["updating_controls"] = False
-        on_reload()
+        load_payload()
+        rebuild_figures()
 
     def _advance_playback() -> None:
         playback = grid_state.get("playback") or {}
@@ -597,7 +658,6 @@ else:
     def load_payload() -> None:
         global loaded_bundle  # noqa: PLW0603
 
-        _refresh_version_options()
         p = _resolve_paths()
         try:
             bundle = load_nsdf_json_bundle(p, mongo_s3_auth=_dataset_s3_auth_override())
@@ -636,7 +696,10 @@ else:
             loc = (bundle.paths.local_json_path or "").strip()
             source_line = f"Source: {loc or bundle.paths.json_url}"
         next_x_summary = ""
-        active_workflow_id = resolve_nsdf_workflow_id(surrogate_info, next_x_info)
+        selected_workflow = str(grid_state.get("workflow_id") or "").strip()
+        active_workflow_id = active_workflow_id_from_grid_state(selected_workflow)
+        if active_workflow_id is None and selected_workflow != NSDF_UNKNOWN_WORKFLOW_ID:
+            active_workflow_id = resolve_nsdf_workflow_id(surrogate_info, next_x_info)
         if next_x_info.entries and active_workflow_id:
             active_points = sum(
                 int(entry.coordinates.shape[0])
@@ -651,7 +714,10 @@ else:
             next_x_summary = "next_x: loaded but no active non-demo workflow entry."
         elif bundle.next_x is not None:
             next_x_summary = "next_x: loaded but no valid workflow entries."
-        workflow_line = format_nsdf_workflow_display(surrogate_info, next_x_info)
+        workflow_label = format_nsdf_workflow_select_label(
+            selected_workflow or NSDF_UNKNOWN_WORKFLOW_ID
+        )
+        workflow_line = f"Workflow: {workflow_label}"
         surrogate_grid_line = ""
         if surrogate_info.plot_dim:
             surrogate_grid_line = f"Surrogate plot dim: {surrogate_info.plot_dim}."
@@ -704,7 +770,10 @@ else:
             grids = build_strain_field_grids(loaded_bundle.data, plot_cfg, loaded_bundle.surrogate)
             surrogate_info = validate_nsdf_surrogate_doc(loaded_bundle.surrogate)
             next_x_info = validate_nsdf_next_x_doc(loaded_bundle.next_x)
-            active_workflow_id = resolve_nsdf_workflow_id(surrogate_info, next_x_info)
+            selected_workflow = str(grid_state.get("workflow_id") or "").strip()
+            active_workflow_id = active_workflow_id_from_grid_state(selected_workflow)
+            if active_workflow_id is None and selected_workflow != NSDF_UNKNOWN_WORKFLOW_ID:
+                active_workflow_id = resolve_nsdf_workflow_id(surrogate_info, next_x_info)
             triplet_row = make_strain_triplet_row(
                 grids,
                 plot_cfg,
@@ -738,9 +807,21 @@ else:
         if (grid_state.get("playback") or {}).get("active"):
             _stop_playback()
         grid_state["version_suffix"] = str(new or "latest")
-        on_reload()
+        load_payload()
+        rebuild_figures()
+
+    def on_workflow_change(attr: str, old: Any, new: Any) -> None:
+        if grid_state["updating_controls"]:
+            return
+        if (grid_state.get("playback") or {}).get("active"):
+            _stop_playback()
+        grid_state["workflow_id"] = str(new or "").strip()
+        _refresh_snapshot_options_for_workflow(grid_state["workflow_id"])
+        load_payload()
+        rebuild_figures()
 
     def on_reload() -> None:
+        _rebuild_triplet_catalog()
         load_payload()
         rebuild_figures()
 
@@ -779,6 +860,7 @@ else:
 
     grid_w.on_change("value", on_grid_control_change)
     grid_h.on_change("value", on_grid_control_change)
+    workflow_select.on_change("value", on_workflow_change)
     version_select.on_change("value", on_version_change)
     btn_play_forward.on_click(on_play_forward)
     btn_play_backward.on_click(on_play_backward)
@@ -788,7 +870,7 @@ else:
     btn_toggle_status.on_click(on_toggle_status)
 
     controls = column(
-        row(version_select, sizing_mode="scale_width"),
+        row(workflow_select, version_select, sizing_mode="scale_width"),
         _control_row(grid_w, grid_h, btn_reload, btn_reset_grid, btn_toggle_status),
         _control_row(
             play_interval_input,
