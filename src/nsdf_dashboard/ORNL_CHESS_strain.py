@@ -212,6 +212,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (  # noqa: E402
     scientistcloud_dataset_is_remote_linked,
     surrogate_doc_defines_grid_size,
     validate_nsdf_measurement_doc,
+    _select_next_x_entry,
     validate_nsdf_next_x_doc,
     validate_nsdf_surrogate_doc,
     workflow_id_from_dataset_doc,
@@ -1076,16 +1077,15 @@ else:
         active_workflow_id = active_workflow_id_from_grid_state(selected_workflow)
         if active_workflow_id is None and selected_workflow != NSDF_UNKNOWN_WORKFLOW_ID:
             active_workflow_id = resolve_nsdf_workflow_id(surrogate_info, next_x_info)
-        if next_x_info.entries and active_workflow_id:
-            active_points = sum(
-                int(entry.coordinates.shape[0])
-                for entry in next_x_info.entries
-                if entry.workflow_id == active_workflow_id
+        overlay_entry = _select_next_x_entry(next_x_info, active_workflow_id)
+        if overlay_entry is not None and overlay_entry.coordinates.size:
+            active_points = int(overlay_entry.coordinates.shape[0])
+            next_x_summary = (
+                f"next_x: {active_points} proposed point(s) for workflow "
+                f"{overlay_entry.workflow_id}."
             )
-            if active_points:
-                next_x_summary = (
-                    f"next_x: {active_points} proposed point(s) for workflow {active_workflow_id}."
-                )
+        elif next_x_info.entries and active_workflow_id:
+            active_points = 0
         elif next_x_info.entries:
             next_x_summary = "next_x: loaded but no active non-demo workflow entry."
         elif bundle.next_x is not None:

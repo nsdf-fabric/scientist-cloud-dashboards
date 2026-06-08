@@ -381,6 +381,42 @@ def test_next_x_grid_coords_for_active_workflow() -> None:
     assert float(py[0]) == 0.5
 
 
+def test_next_x_grid_coords_use_entry_when_workflow_ids_differ() -> None:
+    next_x = validate_nsdf_next_x_doc(
+        [
+            {
+                "workflow_id": "6a2703cf602e29e5f9e92e02",
+                "data": [[26.89545926444786, 29.734165857560694]],
+            },
+        ],
+    )
+    bounds = ((0.0, 30.0), (0.0, 39.0))
+    gx, gy = next_x_grid_coords_for_workflow(
+        next_x,
+        "6a26fb54602e29e5f9e92e01",
+        30,
+        39,
+        bounds,
+    )
+    assert gx.shape == (1,)
+    assert gy.shape == (1,)
+    assert abs(float(gx[0]) - 25.999) < 0.01
+    assert abs(float(gy[0]) - 28.972) < 0.01
+    px, py = _grid_display_coords(gx, gy, 30, 39, flip_y=False)
+    assert abs(float(px[0]) - 26.5) < 0.01
+    assert abs(float(py[0]) - 29.5) < 0.01
+
+
+def test_resolve_strain_plot_bounds_falls_back_to_surrogate_bounds() -> None:
+    from nsdf_dashboard.ornl_chess_strain_lib import _resolve_strain_plot_bounds
+
+    meta = {
+        "measurement_bounds": None,
+        "surrogate_bounds": ((0.0, 30.0), (0.0, 39.0)),
+    }
+    assert _resolve_strain_plot_bounds(meta) == ((0.0, 30.0), (0.0, 39.0))
+
+
 def test_parse_nsdf_plot_dim() -> None:
     assert parse_nsdf_plot_dim("2D") == ("2D", None)
     assert parse_nsdf_plot_dim("3d") == ("3D", None)

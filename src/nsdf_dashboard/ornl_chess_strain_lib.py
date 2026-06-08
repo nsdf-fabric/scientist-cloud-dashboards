@@ -4035,6 +4035,35 @@ def _validate_bounds(value: Any) -> Optional[Tuple[Tuple[float, float], Tuple[fl
     return out[0], out[1]
 
 
+def _coerce_bounds_pair(
+    value: Any,
+) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
+    """Normalize bounds stored as nested lists or tuples."""
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return _validate_bounds(value)
+    if (
+        isinstance(value, tuple)
+        and len(value) == 2
+        and all(isinstance(axis, (list, tuple)) and len(axis) >= 2 for axis in value)
+    ):
+        as_list = [list(axis[:2]) for axis in value]
+        return _validate_bounds(as_list)
+    return None
+
+
+def _resolve_strain_plot_bounds(
+    meta: Mapping[str, Any],
+) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
+    """Bounds for mapping lab coordinates onto the dashboard grid."""
+    for key in ("measurement_bounds", "surrogate_bounds"):
+        bounds = _coerce_bounds_pair(meta.get(key))
+        if bounds is not None:
+            return bounds
+    return None
+
+
 def validate_nsdf_measurement_doc(doc: Mapping[str, Any]) -> NSDFMeasurementData:
     """Validate native NSDF ``data.json`` and return normalized arrays."""
     if not isinstance(doc, Mapping):
@@ -4186,6 +4215,22 @@ def resolve_nsdf_workflow_id(
     return None
 
 
+def _select_next_x_entry(
+    next_x_info: NSDFNextXData,
+    workflow_id: Optional[str],
+) -> Optional[NSDFNextXEntry]:
+    """Pick the next_x workflow block to plot (preferred id, else first real entry)."""
+    preferred = (workflow_id or "").strip()
+    if preferred:
+        for entry in next_x_info.entries:
+            if entry.workflow_id == preferred:
+                return entry
+    for entry in next_x_info.entries:
+        if entry.workflow_id and not _is_demo_workflow_id(entry.workflow_id):
+            return entry
+    return None
+
+
 def next_x_grid_coords_for_workflow(
     next_x_info: NSDFNextXData,
     workflow_id: Optional[str],
@@ -4194,17 +4239,10 @@ def next_x_grid_coords_for_workflow(
     bounds: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Map proposed next-scan coordinates onto the dashboard grid for one workflow."""
-    if not workflow_id:
+    entry = _select_next_x_entry(next_x_info, workflow_id)
+    if entry is None or entry.coordinates.size == 0:
         return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
-    coords: List[Tuple[float, float]] = []
-    for entry in next_x_info.entries:
-        if entry.workflow_id != workflow_id:
-            continue
-        for row in entry.coordinates:
-            coords.append((float(row[0]), float(row[1])))
-    if not coords:
-        return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
-    arr = np.asarray(coords, dtype=np.float64)
+    arr = np.asarray(entry.coordinates, dtype=np.float64)
     return _norm_positions_to_grid(arr[:, 0], arr[:, 1], nx, ny, bounds)
 
 
@@ -5387,6 +5425,7 @@ def build_strain_field_grids(
         "n_points": int(values.shape[0]),
         "bounds_source": measurement.bounds_source,
         "measurement_bounds": measurement.bounds,
+        "surrogate_bounds": surrogate.bounds,
         "measurement_gx": gx,
         "measurement_gy": gy,
         "measurement_values": values.copy(),
@@ -5561,9 +5600,7 @@ def _build_strain_triplet_figures(
     sub = f" — {row_subtitle}" if row_subtitle else ""
     est = grids.estimate
     nx, ny = cfg.grid_size
-    bounds = grids.meta.get("measurement_bounds")
-    if not isinstance(bounds, tuple):
-        bounds = None
+    bounds = _resolve_strain_plot_bounds(grids.meta)
 
     measured_gx = grids.meta.get("measurement_gx")
     measured_gy = grids.meta.get("measurement_gy")
