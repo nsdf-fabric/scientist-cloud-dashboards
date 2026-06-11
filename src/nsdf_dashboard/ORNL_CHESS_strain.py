@@ -537,21 +537,37 @@ else:
             except Exception:
                 pass
 
-    def _begin_figures_loading(message: str) -> int:
+    def _begin_figures_loading(
+        message: str,
+        *,
+        show_placeholder: bool = True,
+        busy_controls: bool = True,
+    ) -> int:
         grid_state["loading_generation"] = int(grid_state.get("loading_generation") or 0) + 1
         token = int(grid_state["loading_generation"])
-        figures_column.children = [_loading_placeholder_div(message)]
-        _set_controls_busy(True)
+        if show_placeholder:
+            figures_column.children = [_loading_placeholder_div(message)]
+        if busy_controls:
+            _set_controls_busy(True)
         return token
 
-    def _defer_figures_work(work_fn: Callable[[], None], *, message: str) -> None:
+    def _defer_figures_work(
+        work_fn: Callable[[], None],
+        *,
+        message: str,
+        show_loading: bool = True,
+    ) -> None:
         grid_state["pending_figures_work"] = work_fn
         if grid_state.get("figures_work_tick_scheduled"):
-            if figures_column.children:
+            if show_loading and figures_column.children:
                 figures_column.children = [_loading_placeholder_div(message)]
             return
 
-        token = _begin_figures_loading(message)
+        token = _begin_figures_loading(
+            message,
+            show_placeholder=show_loading,
+            busy_controls=show_loading,
+        )
         grid_state["figures_work_tick_scheduled"] = True
 
         def _run() -> None:
@@ -1076,7 +1092,12 @@ else:
         finally:
             grid_state["updating_controls"] = False
         _sync_auxiliary_selectors_from_data(reset_manual=True)
-        _defer_figures_work(_reload_figures_view, message="Loading snapshot...")
+        # Keep the current plots visible during playback so recordings do not flash a spinner.
+        _defer_figures_work(
+            _reload_figures_view,
+            message="Loading snapshot...",
+            show_loading=False,
+        )
 
     def _advance_playback() -> None:
         playback = grid_state.get("playback") or {}
