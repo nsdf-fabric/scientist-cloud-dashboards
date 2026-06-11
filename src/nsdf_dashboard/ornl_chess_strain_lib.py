@@ -6298,7 +6298,26 @@ def make_uncertainty_trend_figure(
             },
         )
 
-    from bokeh.models import FactorRange
+    from bokeh.models import FixedTicker
+
+    point_count = len(series.step_ids)
+    tick_text = {
+        step_id: (
+            series.labels[idx]
+            if idx < len(series.labels) and series.labels[idx]
+            else triplet_suffix_trend_label(step_id)
+        )
+        for idx, step_id in enumerate(series.step_ids)
+    }
+    highlight_id = None
+    if series.current_index is not None and 0 <= series.current_index < point_count:
+        highlight_id = series.step_ids[series.current_index]
+    sparse_ticks = _sparse_trend_axis_ticks(
+        series.step_ids,
+        panel_width=layout.frame_width,
+        highlight_id=highlight_id,
+    )
+    sparse_positions = [series.step_ids.index(step_id) for step_id in sparse_ticks]
 
     p = figure(
         title=cfg.title_uncertainty_trend,
@@ -6314,45 +6333,31 @@ def make_uncertainty_trend_figure(
         tools="pan,wheel_zoom,box_zoom,reset,save",
         x_axis_label=cfg.trend_x_axis_label,
         y_axis_label=cfg.trend_y_axis_label,
-        x_range=FactorRange(factors=list(series.step_ids)),
+        x_range=(-0.5, max(point_count - 1, 0) + 0.5),
         toolbar_location="above",
     )
     _lock_strain_figure_layout(p, layout)
-    highlight_id = None
-    if series.current_index is not None and 0 <= series.current_index < len(series.step_ids):
-        highlight_id = series.step_ids[series.current_index]
-    sparse_ticks = _sparse_trend_axis_ticks(
-        series.step_ids,
-        panel_width=layout.frame_width,
-        highlight_id=highlight_id,
-    )
-    sparse_set = set(sparse_ticks)
-    tick_text = {
-        step_id: (
-            series.labels[idx]
-            if idx < len(series.labels) and series.labels[idx]
-            else triplet_suffix_trend_label(step_id)
-        )
-        for idx, step_id in enumerate(series.step_ids)
-    }
-    # FactorRange is categorical: blank overrides hide labels without changing point positions.
+    p.xaxis.ticker = FixedTicker(ticks=sparse_positions)
     p.xaxis.major_label_overrides = {
-        step_id: tick_text[step_id] if step_id in sparse_set else ""
-        for step_id in series.step_ids
+        pos: tick_text[step_id] for pos, step_id in zip(sparse_positions, sparse_ticks)
     }
-    p.xaxis.major_label_orientation = math.pi / 4 if len(sparse_ticks) > 4 else 0.0
+    shown_labels = [tick_text[step_id] for step_id in sparse_ticks]
+    p.xaxis.major_label_orientation = (
+        math.pi / 4 if any(len(label) > 4 for label in shown_labels) else 0.0
+    )
     source = ColumnDataSource(
         data={
+            "x": list(range(point_count)),
             "step_id": list(series.step_ids),
             "y": series.y.tolist(),
             "label": series.labels or _trend_labels_for_step_ids(series.step_ids),
         }
     )
-    p.line("step_id", "y", source=source, line_width=2, color="#2c7bb6")
-    p.scatter("step_id", "y", source=source, size=6, color="#2c7bb6", alpha=0.7, line_color="#1f4f73")
-    if series.current_index is not None and 0 <= series.current_index < len(series.step_ids):
+    p.line("x", "y", source=source, line_width=2, color="#2c7bb6")
+    p.scatter("x", "y", source=source, size=6, color="#2c7bb6", alpha=0.7, line_color="#1f4f73")
+    if series.current_index is not None and 0 <= series.current_index < point_count:
         p.scatter(
-            [series.step_ids[series.current_index]],
+            [series.current_index],
             [float(series.y[series.current_index])],
             size=11,
             color="#ffffff",

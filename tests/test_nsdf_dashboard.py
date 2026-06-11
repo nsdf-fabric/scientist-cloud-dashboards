@@ -536,6 +536,36 @@ def test_sparse_trend_axis_ticks() -> None:
     assert "step-05" in with_highlight
 
 
+def test_make_uncertainty_trend_figure_sparse_short_labels() -> None:
+    from bokeh.models import FixedTicker
+
+    from nsdf_dashboard.ornl_chess_strain_lib import (
+        StrainFigureLayout,
+        make_uncertainty_trend_figure,
+    )
+
+    step_ids = [f"20260608T222314Z_{idx}" for idx in range(48)]
+    labels = [str(idx) for idx in range(48)]
+    series = UncertaintyTrendSeries(
+        step_ids=step_ids,
+        y=np.linspace(0.4, 0.05, len(step_ids)),
+        labels=labels,
+        current_index=5,
+    )
+    layout = StrainFigureLayout(
+        frame_width=360,
+        frame_height=280,
+        outer_width=420,
+        outer_height=320,
+    )
+    fig = make_uncertainty_trend_figure(series, StrainFieldPlotConfig(), layout=layout)
+    assert isinstance(fig.xaxis.ticker, FixedTicker)
+    assert len(fig.xaxis.ticker.ticks) < len(step_ids)
+    assert 5 in fig.xaxis.ticker.ticks
+    assert set(fig.xaxis.major_label_overrides.values()) <= set(labels)
+    assert all(len(label) <= 2 for label in fig.xaxis.major_label_overrides.values())
+
+
 def test_parse_transformed_stddevs_avg_points() -> None:
     points, warnings = parse_transformed_stddevs_avg_points(
         [["20260601T100000Z", 0.5], ["20260602T100000Z", 0.3]]
