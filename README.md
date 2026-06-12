@@ -191,6 +191,17 @@ Then open:
 http://localhost:8059/
 ```
 
+## Workflow catalog (`catalog.json`)
+
+Archived snapshot metadata can be stored in ``catalog.json`` beside ``data.json`` (same
+directory or S3 prefix). In the dashboard toolbar, click **Index workflows**:
+
+- If ``catalog.json`` exists, selectors load immediately from it.
+- Otherwise the dashboard scans archived JSON files once, then writes ``catalog.json``
+  locally or on S3 when write access is available.
+
+Click **Re-index workflows** to force a fresh scan and update ``catalog.json``.
+
 ## Smoke Checks
 
 ```bash

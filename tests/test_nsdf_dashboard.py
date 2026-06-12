@@ -34,6 +34,8 @@ from nsdf_dashboard.ornl_chess_strain_lib import (
     _trend_axis_label_budget,
     collect_nsdf_triplet_load_issues,
     discover_nsdf_triplet_index,
+    triplet_index_from_catalog_doc,
+    triplet_index_to_catalog_doc,
     discover_nsdf_version_options,
     enrich_strain_paths_from_dataset_doc,
     infer_nsdf_bounds_grid_size,
@@ -1921,12 +1923,12 @@ def test_discover_triplet_index_prefers_s3_over_sparse_portal_mirror(monkeypatch
             s3_bucket="my-bucket",
             s3_data_key="prefix/data.json",
         )
-        index = discover_nsdf_triplet_index(
+        result = discover_nsdf_triplet_index(
             paths,
             base_dir=upload_dir,
             save_dir="",
         )
-        assert index.has_workflow("wf-from-s3")
+        assert result.index.has_workflow("wf-from-s3")
         assert local_calls == []
 
 
@@ -1951,9 +1953,107 @@ def test_discover_triplet_index_falls_back_to_local_when_s3_empty(monkeypatch) -
             s3_bucket="my-bucket",
             s3_data_key="prefix/data.json",
         )
-        index = discover_nsdf_triplet_index(paths, base_dir=upload_dir, save_dir="")
+        result = discover_nsdf_triplet_index(paths, base_dir=upload_dir, save_dir="")
         assert local_calls == [upload_dir]
-        assert index.has_workflow(NSDF_UNKNOWN_WORKFLOW_ID)
+        assert result.index.has_workflow(NSDF_UNKNOWN_WORKFLOW_ID)
+
+
+def test_catalog_doc_roundtrip_matches_directory_index() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        workflow = "wf-catalog"
+        for snap_id, y in (("48", 0.9), ("49", 0.6)):
+            with open(os.path.join(tmp, f"data_{snap_id}.json"), "w", encoding="utf-8") as fh:
+                json.dump({**_base_data(), "workflow_id": workflow}, fh)
+            with open(os.path.join(tmp, f"surrogate_{snap_id}.json"), "w", encoding="utf-8") as fh:
+                json.dump({"workflow_id": workflow, "transformed_stddevs_avg": y}, fh)
+        scanned = _build_triplet_index_from_directory(tmp)
+        doc = triplet_index_to_catalog_doc(scanned)
+        restored = triplet_index_from_catalog_doc(doc)
+        assert restored is not None
+        assert [snap.suffix for snap in restored.snapshots_for_workflow(workflow)] == [
+            "49",
+            "48",
+        ]
+        assert restored.snapshots_for_workflow(workflow)[0].uncertainty_trend_y == 0.6
+
+
+def test_discover_prefers_catalog_json_over_full_scan(monkeypatch) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        workflow = "wf-fast"
+        index = NSDFTripletIndex(
+            snapshots=[
+                NSDFSnapshotRef(
+                    suffix="49",
+                    workflow_id=workflow,
+                    sort_key="49",
+                    uncertainty_trend_y=0.5,
+                    has_surrogate_archive=True,
+                )
+            ],
+            by_workflow={
+                workflow: [
+                    NSDFSnapshotRef(
+                        suffix="49",
+                        workflow_id=workflow,
+                        sort_key="49",
+                        uncertainty_trend_y=0.5,
+                        has_surrogate_archive=True,
+                    )
+                ]
+            },
+        )
+        with open(os.path.join(tmp, "catalog.json"), "w", encoding="utf-8") as fh:
+            json.dump(triplet_index_to_catalog_doc(index), fh)
+
+        def _fail_scan(*_args, **_kwargs):
+            raise AssertionError("full scan should not run when catalog.json exists")
+
+        monkeypatch.setattr(lib, "_scan_triplet_index", _fail_scan)
+        paths = StrainDashboardPaths(local_json_path=os.path.join(tmp, "data.json"))
+        result = discover_nsdf_triplet_index(paths, base_dir=tmp, save_dir="")
+        assert result.source == "catalog_json"
+        assert result.index.has_workflow(workflow)
+
+
+def test_discover_full_scan_writes_catalog_json_locally() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        workflow = "wf-write"
+        with open(os.path.join(tmp, f"data_49.json"), "w", encoding="utf-8") as fh:
+            json.dump({**_base_data(), "workflow_id": workflow}, fh)
+        with open(os.path.join(tmp, f"surrogate_49.json"), "w", encoding="utf-8") as fh:
+            json.dump({"workflow_id": workflow, "transformed_stddevs_avg": 0.4}, fh)
+        paths = StrainDashboardPaths(local_json_path=os.path.join(tmp, "data.json"))
+        result = discover_nsdf_triplet_index(paths, base_dir=tmp, save_dir="")
+        assert result.source == "full_scan"
+        assert result.catalog_written is True
+        catalog_path = os.path.join(tmp, "catalog.json")
+        assert os.path.isfile(catalog_path)
+        second = discover_nsdf_triplet_index(paths, base_dir=tmp, save_dir="")
+        assert second.source == "catalog_json"
+
+
+def test_discover_force_rescan_skips_catalog_json(monkeypatch) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "catalog.json"), "w", encoding="utf-8") as fh:
+            json.dump({"version": 1, "snapshots": []}, fh)
+        scan_calls: list[str] = []
+
+        def _fake_scan(_paths, **kwargs):
+            scan_calls.append("scan")
+            return _build_triplet_index_from_directory(tmp)
+
+        monkeypatch.setattr(lib, "_scan_triplet_index", _fake_scan)
+        with open(os.path.join(tmp, f"data_49.json"), "w", encoding="utf-8") as fh:
+            json.dump({**_base_data(), "workflow_id": "wf"}, fh)
+        paths = StrainDashboardPaths(local_json_path=os.path.join(tmp, "data.json"))
+        result = discover_nsdf_triplet_index(
+            paths,
+            base_dir=tmp,
+            save_dir="",
+            force_rescan=True,
+        )
+        assert scan_calls == ["scan"]
+        assert result.source == "full_scan"
 
 
 def test_prepare_nsdf_load_paths_keeps_live_triplet_for_latest() -> None:

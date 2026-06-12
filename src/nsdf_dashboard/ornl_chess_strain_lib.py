@@ -44,6 +44,10 @@ and Bokeh heatmaps.
   **Triplet matching:** archived ``data`` / ``surrogate`` / ``next_x`` files are paired by
   shared ``workflow_id`` and the numeric **id** at the end of the filename (e.g. ``_48``).
   Timestamps in the middle of the suffix may differ across the three files.
+
+- **Workflow catalog (optional):** ``catalog.json`` beside the triplet files lists archived
+  snapshots (workflow id, suffix, trend scalar). The dashboard reads it on **Index workflows**
+  when present; otherwise it scans JSON files and writes ``catalog.json`` locally or on S3.
 """
 from __future__ import annotations
 
@@ -54,6 +58,7 @@ import math
 import os
 import re
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -68,6 +73,8 @@ _LOG = logging.getLogger(__name__)
 
 DEFAULT_GRID_SIZE: Tuple[int, int] = (26, 26)
 NSDF_DATA_JSON_BASENAME = "data.json"
+NSDF_CATALOG_JSON_BASENAME = "catalog.json"
+NSDF_CATALOG_VERSION = 1
 NSDF_VERSION_SUFFIX_RE = re.compile(r"^\d{8}T\d{6}Z$", re.IGNORECASE)
 NSDF_SNAPSHOT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", re.IGNORECASE)
 NSDF_COMPOSITE_SNAPSHOT_SUFFIX_RE = re.compile(
@@ -701,6 +708,17 @@ class NSDFTripletIndex:
         if not snaps:
             return "latest"
         return "latest" if not snaps[0].suffix else snaps[0].suffix
+
+
+@dataclass
+class NSDFTripletIndexDiscoverResult:
+    """Outcome of ``discover_nsdf_triplet_index`` (catalog read, scan, and optional write)."""
+
+    index: NSDFTripletIndex
+    source: str = "empty"  # ``catalog_json``, ``full_scan``, or ``empty``
+    catalog_written: bool = False
+    catalog_write_location: str = ""
+    catalog_write_error: str = ""
 
 
 def format_nsdf_workflow_select_label(workflow_id: str) -> str:
@@ -1991,7 +2009,226 @@ def _build_triplet_index_from_s3(
     return _build_triplet_index_from_groups(groups, read_doc=read_doc)
 
 
-def discover_nsdf_triplet_index(
+def _resolve_nsdf_s3_bucket_and_prefix(
+    paths: StrainDashboardPaths,
+) -> Tuple[str, str]:
+    """Return ``(bucket, prefix)``; ``prefix`` has a trailing slash when non-empty."""
+    bucket = (paths.s3_bucket or "").strip()
+    data_key = (paths.s3_data_key or "").strip()
+    if not bucket and (paths.json_url or "").strip():
+        cfg = _parse_gateway_url_with_query_keys((paths.json_url or "").strip())
+        if cfg:
+            bucket = (cfg.get("bucket") or "").strip()
+            data_key = (cfg.get("key") or "").strip()
+    if not bucket:
+        return "", ""
+    prefix = ""
+    if data_key:
+        if "/" in data_key:
+            prefix = data_key.rsplit("/", 1)[0] + "/"
+        elif parse_nsdf_data_filename(data_key) is None and data_key.lower() != "data.json":
+            prefix = data_key.rstrip("/") + "/"
+    return bucket, prefix
+
+
+def _nsdf_catalog_local_path(directory: str) -> str:
+    return os.path.join((directory or "").strip(), NSDF_CATALOG_JSON_BASENAME)
+
+
+def _nsdf_catalog_s3_key(paths: StrainDashboardPaths) -> str:
+    _bucket, prefix = _resolve_nsdf_s3_bucket_and_prefix(paths)
+    return f"{prefix}{NSDF_CATALOG_JSON_BASENAME}" if prefix else NSDF_CATALOG_JSON_BASENAME
+
+
+def triplet_index_to_catalog_doc(index: NSDFTripletIndex) -> Dict[str, Any]:
+    """Serialize a triplet index to ``catalog.json`` document format."""
+    return {
+        "version": NSDF_CATALOG_VERSION,
+        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "snapshots": [
+            {
+                "suffix": snap.suffix,
+                "workflow_id": snap.workflow_id,
+                "sort_key": snap.sort_key,
+                "uncertainty_trend_y": snap.uncertainty_trend_y,
+                "has_surrogate_archive": snap.has_surrogate_archive,
+                "has_next_x_archive": snap.has_next_x_archive,
+            }
+            for snap in index.snapshots
+        ],
+    }
+
+
+def triplet_index_from_catalog_doc(doc: Any) -> Optional[NSDFTripletIndex]:
+    """Parse ``catalog.json`` into a triplet index; return ``None`` when invalid."""
+    if not isinstance(doc, Mapping):
+        return None
+    if doc.get("version") != NSDF_CATALOG_VERSION:
+        return None
+    raw_snaps = doc.get("snapshots")
+    if not isinstance(raw_snaps, list) or not raw_snaps:
+        return None
+
+    snapshots: List[NSDFSnapshotRef] = []
+    for item in raw_snaps:
+        if not isinstance(item, Mapping):
+            continue
+        suffix = str(item.get("suffix") or "")
+        if suffix and not is_valid_nsdf_snapshot_suffix(suffix):
+            continue
+        workflow_id = str(item.get("workflow_id") or "").strip() or NSDF_UNKNOWN_WORKFLOW_ID
+        sort_key = str(item.get("sort_key") or _snapshot_sort_key(suffix))
+        trend_raw = item.get("uncertainty_trend_y")
+        trend_y: Optional[float] = None
+        if _is_number(trend_raw):
+            trend_y = float(trend_raw)
+        snapshots.append(
+            NSDFSnapshotRef(
+                suffix=suffix,
+                workflow_id=workflow_id,
+                sort_key=sort_key,
+                uncertainty_trend_y=trend_y,
+                has_surrogate_archive=bool(item.get("has_surrogate_archive")),
+                has_next_x_archive=bool(item.get("has_next_x_archive")),
+            )
+        )
+    if not snapshots:
+        return None
+
+    by_workflow: Dict[str, List[NSDFSnapshotRef]] = {}
+    for snap in snapshots:
+        by_workflow.setdefault(snap.workflow_id, []).append(snap)
+    for workflow_id in by_workflow:
+        by_workflow[workflow_id].sort(key=lambda snap: snap.sort_key, reverse=True)
+    return NSDFTripletIndex(snapshots=snapshots, by_workflow=by_workflow)
+
+
+def _load_catalog_index_from_local_directory(directory: str) -> Optional[NSDFTripletIndex]:
+    path = _nsdf_catalog_local_path(directory)
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except Exception as exc:
+        _LOG.warning("Could not read local catalog %s: %s", path, exc)
+        return None
+    index = triplet_index_from_catalog_doc(doc)
+    if index is None:
+        _LOG.warning("Local catalog %s is missing or has invalid format.", path)
+    return index
+
+
+def _load_catalog_index_from_s3(
+    paths: StrainDashboardPaths,
+    *,
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+) -> Optional[NSDFTripletIndex]:
+    bucket, _prefix = _resolve_nsdf_s3_bucket_and_prefix(paths)
+    if not bucket:
+        return None
+    key = _nsdf_catalog_s3_key(paths)
+    try:
+        client = _make_nsdf_s3_client(paths, mongo_s3_auth=mongo_s3_auth)
+        doc = _load_json_from_s3_key(client, bucket, key)
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        _LOG.warning("Could not read S3 catalog s3://%s/%s: %s", bucket, key, exc)
+        return None
+    index = triplet_index_from_catalog_doc(doc)
+    if index is None:
+        _LOG.warning("S3 catalog s3://%s/%s has invalid format.", bucket, key)
+    return index
+
+
+def _write_catalog_index_to_local_directory(
+    directory: str,
+    index: NSDFTripletIndex,
+) -> Tuple[bool, str, str]:
+    d = (directory or "").strip()
+    if not d or not os.path.isdir(d):
+        return False, "", "local directory not found"
+    path = _nsdf_catalog_local_path(d)
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(triplet_index_to_catalog_doc(index), fh, indent=2)
+            fh.write("\n")
+        return True, path, ""
+    except OSError as exc:
+        return False, "", str(exc)
+
+
+def _write_catalog_index_to_s3(
+    paths: StrainDashboardPaths,
+    index: NSDFTripletIndex,
+    *,
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+) -> Tuple[bool, str, str]:
+    bucket, _prefix = _resolve_nsdf_s3_bucket_and_prefix(paths)
+    if not bucket:
+        return False, "", "S3 bucket not configured"
+    key = _nsdf_catalog_s3_key(paths)
+    body = json.dumps(triplet_index_to_catalog_doc(index), indent=2).encode("utf-8")
+    try:
+        client = _make_nsdf_s3_client(paths, mongo_s3_auth=mongo_s3_auth)
+        client.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=body,
+            ContentType="application/json",
+        )
+        return True, f"s3://{bucket}/{key}", ""
+    except Exception as exc:
+        return False, "", str(exc)
+
+
+def _try_load_catalog_index(
+    paths: StrainDashboardPaths,
+    *,
+    base_dir: str = "",
+    save_dir: str = "",
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+    remote_linked: bool = False,
+) -> Optional[NSDFTripletIndex]:
+    if _local_data_dir_active(paths):
+        local_dir = nsdf_listing_directory(paths, base_dir=base_dir, save_dir=save_dir)
+        if local_dir:
+            return _load_catalog_index_from_local_directory(local_dir)
+        return None
+
+    if remote_linked:
+        if not _remote_snapshot_listing_enabled(paths):
+            local_dir = nsdf_listing_directory(paths, base_dir=base_dir, save_dir=save_dir)
+            if local_dir:
+                return _load_catalog_index_from_local_directory(local_dir)
+            return None
+        remote_paths = (
+            paths if paths.has_s3_source() else promote_gateway_json_url_to_s3_paths(paths)
+        )
+        index = _load_catalog_index_from_s3(remote_paths, mongo_s3_auth=mongo_s3_auth)
+        if index is not None and index.snapshots:
+            return index
+        local_dir = nsdf_listing_directory(paths, base_dir=base_dir, save_dir=save_dir)
+        if local_dir:
+            return _load_catalog_index_from_local_directory(local_dir)
+        return None
+
+    if _remote_snapshot_listing_enabled(paths):
+        remote_paths = (
+            paths if paths.has_s3_source() else promote_gateway_json_url_to_s3_paths(paths)
+        )
+        index = _load_catalog_index_from_s3(remote_paths, mongo_s3_auth=mongo_s3_auth)
+        if index is not None and index.snapshots:
+            return index
+
+    local_dir = nsdf_listing_directory(paths, base_dir=base_dir, save_dir=save_dir)
+    if local_dir:
+        return _load_catalog_index_from_local_directory(local_dir)
+    return None
+
+
+def _scan_triplet_index(
     paths: StrainDashboardPaths,
     *,
     base_dir: str = "",
@@ -1999,14 +2236,7 @@ def discover_nsdf_triplet_index(
     mongo_s3_auth: Optional[Dict[str, str]] = None,
     remote_linked: bool = False,
 ) -> NSDFTripletIndex:
-    """
-    Build a workflow-scoped snapshot catalog (list + lightweight JSON peeks).
-
-    Called once per Reload; snapshot/workflow UI filters use the cached index.
-
-    ScientistCloud S3-linked datasets must list only the remote prefix (never the
-    sparse upload mirror). Uploaded-file datasets use the local upload tree.
-    """
+    """Full JSON scan (legacy index path) when ``catalog.json`` is absent or stale."""
     if _local_data_dir_active(paths):
         local_dir = nsdf_listing_directory(paths, base_dir=base_dir, save_dir=save_dir)
         if local_dir:
@@ -2017,17 +2247,13 @@ def discover_nsdf_triplet_index(
         if not _remote_snapshot_listing_enabled(paths):
             return NSDFTripletIndex()
         remote_paths = (
-            paths
-            if paths.has_s3_source()
-            else promote_gateway_json_url_to_s3_paths(paths)
+            paths if paths.has_s3_source() else promote_gateway_json_url_to_s3_paths(paths)
         )
         return _build_triplet_index_from_s3(remote_paths, mongo_s3_auth=mongo_s3_auth)
 
     if _remote_snapshot_listing_enabled(paths):
         remote_paths = (
-            paths
-            if paths.has_s3_source()
-            else promote_gateway_json_url_to_s3_paths(paths)
+            paths if paths.has_s3_source() else promote_gateway_json_url_to_s3_paths(paths)
         )
         index = _build_triplet_index_from_s3(remote_paths, mongo_s3_auth=mongo_s3_auth)
         if index.snapshots:
@@ -2037,6 +2263,110 @@ def discover_nsdf_triplet_index(
     if local_dir:
         return _build_triplet_index_from_directory(local_dir)
     return NSDFTripletIndex()
+
+
+def _try_write_catalog_index(
+    paths: StrainDashboardPaths,
+    index: NSDFTripletIndex,
+    *,
+    base_dir: str = "",
+    save_dir: str = "",
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+    remote_linked: bool = False,
+) -> Tuple[bool, str, str]:
+    """Write ``catalog.json`` beside triplet files (S3 when configured, else local dir)."""
+    if not index.snapshots:
+        return False, "", "empty index"
+
+    if _local_data_dir_active(paths):
+        local_dir = nsdf_listing_directory(paths, base_dir=base_dir, save_dir=save_dir)
+        if local_dir:
+            return _write_catalog_index_to_local_directory(local_dir, index)
+        return False, "", "local directory not found"
+
+    last_error = ""
+
+    if remote_linked or _remote_snapshot_listing_enabled(paths):
+        remote_paths = (
+            paths if paths.has_s3_source() else promote_gateway_json_url_to_s3_paths(paths)
+        )
+        if remote_paths.has_s3_source() or _resolve_nsdf_s3_bucket_and_prefix(remote_paths)[0]:
+            ok, loc, err = _write_catalog_index_to_s3(
+                remote_paths,
+                index,
+                mongo_s3_auth=mongo_s3_auth,
+            )
+            if ok:
+                return True, loc, ""
+            last_error = err or last_error
+
+    local_dir = nsdf_listing_directory(paths, base_dir=base_dir, save_dir=save_dir)
+    if local_dir:
+        ok, loc, err = _write_catalog_index_to_local_directory(local_dir, index)
+        if ok:
+            return True, loc, ""
+        last_error = err or last_error
+
+    return False, "", last_error or "no writable catalog location"
+
+
+def discover_nsdf_triplet_index(
+    paths: StrainDashboardPaths,
+    *,
+    base_dir: str = "",
+    save_dir: str = "",
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+    remote_linked: bool = False,
+    force_rescan: bool = False,
+) -> NSDFTripletIndexDiscoverResult:
+    """
+    Build a workflow-scoped snapshot catalog for workflow/snapshot UI selectors.
+
+    Reads ``catalog.json`` when present (unless ``force_rescan``). Otherwise scans JSON
+    files and writes ``catalog.json`` locally or on S3 when permitted.
+
+    ScientistCloud S3-linked datasets must list only the remote prefix (never the
+    sparse upload mirror). Uploaded-file datasets use the local upload tree.
+    """
+    if not force_rescan:
+        catalog_index = _try_load_catalog_index(
+            paths,
+            base_dir=base_dir,
+            save_dir=save_dir,
+            mongo_s3_auth=mongo_s3_auth,
+            remote_linked=remote_linked,
+        )
+        if catalog_index is not None and catalog_index.snapshots:
+            return NSDFTripletIndexDiscoverResult(
+                index=catalog_index,
+                source="catalog_json",
+            )
+
+    index = _scan_triplet_index(
+        paths,
+        base_dir=base_dir,
+        save_dir=save_dir,
+        mongo_s3_auth=mongo_s3_auth,
+        remote_linked=remote_linked,
+    )
+    if not index.snapshots:
+        return NSDFTripletIndexDiscoverResult(index=index, source="empty")
+
+    wrote, location, write_error = _try_write_catalog_index(
+        paths,
+        index,
+        base_dir=base_dir,
+        save_dir=save_dir,
+        mongo_s3_auth=mongo_s3_auth,
+        remote_linked=remote_linked,
+    )
+    return NSDFTripletIndexDiscoverResult(
+        index=index,
+        source="full_scan",
+        catalog_written=wrote,
+        catalog_write_location=location,
+        catalog_write_error=write_error,
+    )
 
 
 def _credential_is_placeholder(value: str) -> bool:

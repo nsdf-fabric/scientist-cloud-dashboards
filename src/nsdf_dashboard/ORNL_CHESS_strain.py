@@ -725,12 +725,12 @@ else:
         def _run_catalog_index() -> None:
             grid_state["catalog_callback_id"] = None
             try:
-                _rebuild_triplet_catalog(preserve_workflow=True, preserve_snapshot=True)
-                rebuild_figures(show_loading_gap=False)
-                set_status(
-                    "Indexed workflows and snapshots. Selectors are ready for browsing.",
-                    ok=True,
+                status_message = _rebuild_triplet_catalog(
+                    preserve_workflow=True,
+                    preserve_snapshot=True,
                 )
+                rebuild_figures(show_loading_gap=False)
+                set_status(status_message, ok=True)
             except Exception as exc:
                 traceback.print_exc()
                 set_status(f"Workflow catalog index failed: {exc}", ok=False)
@@ -981,19 +981,44 @@ else:
         finally:
             grid_state["updating_controls"] = False
 
+    def _catalog_index_status_message(result: Any) -> str:
+        index = result.index
+        count = len(index.snapshots)
+        if result.source == "catalog_json":
+            return (
+                f"Loaded catalog.json ({count} snapshot{'s' if count != 1 else ''}). "
+                "Selectors are ready for browsing."
+            )
+        if result.catalog_written:
+            loc = str(result.catalog_write_location or "catalog.json").strip()
+            return (
+                f"Indexed {count} snapshot{'s' if count != 1 else ''} and wrote catalog.json "
+                f"({loc}). Selectors are ready for browsing."
+            )
+        if result.catalog_write_error:
+            return (
+                f"Indexed {count} snapshot{'s' if count != 1 else ''} "
+                f"(catalog.json not written: {result.catalog_write_error}). "
+                "Selectors are ready for browsing."
+            )
+        return "Indexed workflows and snapshots. Selectors are ready for browsing."
+
     def _rebuild_triplet_catalog(
         *,
         preserve_workflow: bool = True,
         preserve_snapshot: bool = True,
-    ) -> None:
-        index = discover_nsdf_triplet_index(
+    ) -> str:
+        discover_result = discover_nsdf_triplet_index(
             _resolve_base_paths(),
             base_dir=_bd,
             save_dir=_sd,
             mongo_s3_auth=_dataset_s3_auth_override(),
             remote_linked=_remote_linked,
+            force_rescan=bool(grid_state.get("catalog_ready")),
         )
+        index = discover_result.index
         grid_state["triplet_index"] = index
+        grid_state["catalog_discover"] = discover_result
         grid_state["catalog_ready"] = True
         grid_state["uncertainty_trend_points_key"] = ""
         grid_state["uncertainty_trend_points"] = None
@@ -1035,6 +1060,7 @@ else:
         finally:
             grid_state["updating_controls"] = False
         _sync_auxiliary_selectors_from_data(reset_manual=not preserve_snapshot)
+        return _catalog_index_status_message(discover_result)
 
     def _refresh_snapshot_options_for_workflow(workflow_id: str) -> None:
         index = grid_state.get("triplet_index")
