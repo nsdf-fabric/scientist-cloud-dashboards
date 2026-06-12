@@ -280,7 +280,7 @@ def strain_paths_are_loadable(paths: StrainDashboardPaths) -> bool:
     if loc:
         if _looks_like_http_url(loc):
             return True
-        if os.path.isfile(loc):
+        if _local_path_is_nsdf_data_json(loc):
             return True
     return _local_data_dir_active(paths)
 
@@ -313,7 +313,13 @@ def format_nsdf_path_resolution_hint(
     elif (paths.json_url or "").strip():
         lines.append(f"Resolved URL: {paths.json_url[:120]}")
     elif (paths.local_json_path or "").strip():
-        lines.append(f"Resolved local path: {paths.local_json_path}")
+        loc = paths.local_json_path
+        if _local_path_is_nsdf_data_json(loc):
+            lines.append(f"Resolved local data.json: {loc}")
+        else:
+            lines.append(
+                f"Ignored non-data local JSON (e.g. catalog.json): {loc}"
+            )
     elif (paths.local_data_dir or "").strip() and not _local_data_dir_active(paths):
         lines.append(
             f"LOCAL_DATA_DIR={paths.local_data_dir!r} is set but LOCAL_FILES_FIRST_FOR_TESTING is off."
@@ -322,14 +328,21 @@ def format_nsdf_path_resolution_hint(
 
 
 def _copy_s3_fields(src: StrainDashboardPaths, dst: StrainDashboardPaths) -> StrainDashboardPaths:
-    dst.local_data_dir = src.local_data_dir
-    dst.s3_env_file = src.s3_env_file
-    dst.s3_bucket = src.s3_bucket
-    dst.s3_data_key = src.s3_data_key
-    dst.s3_surrogate_key = src.s3_surrogate_key
-    dst.s3_next_x_key = src.s3_next_x_key
-    dst.s3_endpoint_url = src.s3_endpoint_url
-    dst.s3_region = src.s3_region
+    """Merge env/session auxiliary fields from *src* into resolved *dst* (dst routing wins)."""
+    if (src.local_data_dir or "").strip():
+        dst.local_data_dir = src.local_data_dir
+    if (src.s3_env_file or "").strip():
+        dst.s3_env_file = src.s3_env_file
+    for attr in (
+        "s3_bucket",
+        "s3_data_key",
+        "s3_surrogate_key",
+        "s3_next_x_key",
+        "s3_endpoint_url",
+        "s3_region",
+    ):
+        if not (getattr(dst, attr) or "").strip():
+            setattr(dst, attr, getattr(src, attr))
     return dst
 
 
@@ -370,11 +383,29 @@ def is_scientistcloud_portal_data_mount_context(base_dir: str, save_dir: str) ->
     return bd.startswith(root) or sd.startswith(root)
 
 
+def _local_path_is_nsdf_data_json(path: str) -> bool:
+    """True when *path* points at an NSDF measurement ``data*.json`` file (not catalog/surrogate/next_x)."""
+    p = (path or "").strip()
+    if not p or _looks_like_http_url(p):
+        return bool(p)
+    if not os.path.isfile(p):
+        return False
+    base = os.path.basename(p)
+    if base.lower() == NSDF_CATALOG_JSON_BASENAME.lower():
+        return False
+    if base.lower() in ("surrogate.json", "next_x.json"):
+        return False
+    if parse_nsdf_data_filename(base) is not None:
+        return True
+    return base.lower() in ("data.json", "reduced_data.json")
+
+
 def find_strain_json_under_dataset_dir(directory: str) -> str:
     """
-    Pick an NSDF JSON file under ``directory`` (upload or converted tree for one UUID).
+    Pick an NSDF **data** JSON file under ``directory`` (upload or converted tree for one UUID).
 
-    Prefers ``data.json``; otherwise the first ``*.json`` (sorted by name).
+    Prefers ``data.json``; otherwise the first archived ``data_*.json`` (sorted by name).
+    Ignores ``catalog.json``, surrogate, and next_x sidecars.
     """
     d = (directory or "").strip()
     if not d or not os.path.isdir(d):
@@ -389,6 +420,12 @@ def find_strain_json_under_dataset_dir(directory: str) -> str:
         return ""
     for name in names:
         if not name.lower().endswith(".json"):
+            continue
+        if name.lower() == NSDF_CATALOG_JSON_BASENAME.lower():
+            continue
+        if name.lower() in ("surrogate.json", "next_x.json"):
+            continue
+        if parse_nsdf_data_filename(name) is None:
             continue
         full = os.path.join(d, name)
         if os.path.isfile(full):
@@ -2642,6 +2679,7 @@ def apply_scientistcloud_storage_policy(
             doc,
             base_dir=base_dir,
             save_dir=save_dir,
+            remote_linked=True,
         )
     return finalized
 
@@ -2652,16 +2690,39 @@ def enrich_strain_paths_from_dataset_doc(
     *,
     base_dir: str = "",
     save_dir: str = "",
+    remote_linked: bool = False,
 ) -> StrainDashboardPaths:
     """
     When URL args and env did not resolve JSON, use the Mongo dataset record
     (same fields as portal dashboard share links).
     """
-    if (paths.local_json_path or "").strip() or (paths.json_url or "").strip():
-        return _finalize_strain_paths(paths)
+    loc = (paths.local_json_path or "").strip()
+    if loc and not _local_path_is_nsdf_data_json(loc):
+        loc = ""
+    if loc or (paths.json_url or "").strip():
+        return _finalize_strain_paths(
+            StrainDashboardPaths(
+                local_json_path=loc,
+                json_url=paths.json_url,
+                surrogate_json_path=paths.surrogate_json_path,
+                surrogate_json_url=paths.surrogate_json_url,
+                next_x_json_path=paths.next_x_json_path,
+                next_x_json_url=paths.next_x_json_url,
+                local_data_dir=paths.local_data_dir,
+                s3_env_file=paths.s3_env_file,
+                s3_bucket=paths.s3_bucket,
+                s3_data_key=paths.s3_data_key,
+                s3_surrogate_key=paths.s3_surrogate_key,
+                s3_next_x_key=paths.s3_next_x_key,
+                s3_endpoint_url=paths.s3_endpoint_url,
+                s3_region=paths.s3_region,
+            )
+        )
     bd = (base_dir or "").strip()
     sd = (save_dir or "").strip()
-    mirror = find_strain_json_under_dataset_dir(bd) or find_strain_json_under_dataset_dir(sd)
+    mirror = ""
+    if not remote_linked:
+        mirror = find_strain_json_under_dataset_dir(bd) or find_strain_json_under_dataset_dir(sd)
     if mirror:
         return _finalize_strain_paths(
             _copy_s3_fields(

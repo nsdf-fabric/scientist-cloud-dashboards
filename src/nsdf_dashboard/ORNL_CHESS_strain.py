@@ -439,6 +439,7 @@ else:
                 _dataset_doc,
                 base_dir=_bd,
                 save_dir=_sd,
+                remote_linked=_remote_linked,
             ),
             _dataset_doc,
             server_param=str(_params.get("server") or ""),

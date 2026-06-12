@@ -38,6 +38,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (
     triplet_index_to_catalog_doc,
     discover_nsdf_version_options,
     enrich_strain_paths_from_dataset_doc,
+    find_strain_json_under_dataset_dir,
     infer_nsdf_bounds_grid_size,
     infer_nsdf_grid_size,
     infer_grid_size_from_dim,
@@ -1194,6 +1195,74 @@ def test_enrich_directory_link_resolves_s3_prefix_for_direct_read() -> None:
     assert paths.s3_bucket == "scientistcloud"
     assert paths.s3_data_key == "test-chess/data.json"
     assert paths.s3_endpoint_url == "https://us-east-1.gw.example.com"
+
+
+def test_enrich_ignores_catalog_json_mirror_for_remote_linked(tmp_path) -> None:
+    upload = tmp_path / "uuid"
+    upload.mkdir()
+    (upload / "catalog.json").write_text('{"version": 1, "snapshots": []}', encoding="utf-8")
+    doc = {
+        "google_drive_link": "s3://scientistcloud/chess-data/data.json",
+        "s3_access_key_id": "AK",
+        "s3_secret_access_key": "SK",
+        "s3_endpoint_url": "https://us-east-1.gw.example.com",
+    }
+    paths = enrich_strain_paths_from_dataset_doc(
+        StrainDashboardPaths(),
+        doc,
+        base_dir=str(upload),
+        save_dir=str(tmp_path / "converted"),
+        remote_linked=True,
+    )
+    assert paths.local_json_path == ""
+    assert paths.has_s3_source()
+    assert paths.s3_data_key == "chess-data/data.json"
+
+
+def test_storage_policy_uses_mongo_gateway_when_only_catalog_in_upload(tmp_path) -> None:
+    upload = tmp_path / "a94cc82a-6335-450f-8f19-6cfe7ab3c958"
+    upload.mkdir()
+    (upload / "catalog.json").write_text('{"version": 1, "snapshots": []}', encoding="utf-8")
+    doc = {
+        "viewer_url": (
+            "https://us-east-1.gw.example.com/scientistcloud/chess-data/"
+            "?access_key=AK&secret_key=SK"
+        ),
+        "s3_access_key_id": "AK",
+        "s3_secret_access_key": "SK",
+        "s3_endpoint_url": "https://us-east-1.gw.example.com",
+    }
+    from nsdf_dashboard.ornl_chess_strain_lib import apply_scientistcloud_storage_policy
+
+    paths = apply_scientistcloud_storage_policy(
+        enrich_strain_paths_from_dataset_doc(
+            resolve_strain_paths_for_session(
+                base_dir=str(upload),
+                save_dir=str(tmp_path / "converted"),
+                remote_linked=True,
+            ),
+            doc,
+            base_dir=str(upload),
+            save_dir=str(tmp_path / "converted"),
+            remote_linked=True,
+        ),
+        doc,
+        server_param="true",
+        base_dir=str(upload),
+        save_dir=str(tmp_path / "converted"),
+    )
+    assert paths.local_json_path == ""
+    assert paths.has_s3_source()
+    assert paths.s3_data_key == "chess-data/data.json"
+
+
+def test_find_strain_json_skips_catalog_json(tmp_path) -> None:
+    d = tmp_path / "ds"
+    d.mkdir()
+    (d / "catalog.json").write_text("{}", encoding="utf-8")
+    assert find_strain_json_under_dataset_dir(str(d)) == ""
+    (d / "data.json").write_text("{}", encoding="utf-8")
+    assert find_strain_json_under_dataset_dir(str(d)).endswith("data.json")
 
 
 def test_collect_triplet_errors_for_stub_surrogate_and_fallback() -> None:
