@@ -744,6 +744,7 @@ else:
 
     def _initial_dashboard_load() -> None:
         _fast_latest_triplet_load()
+        _defer_auto_load_saved_catalog()
 
     def _invalidate_uncertainty_trend_cache() -> None:
         grid_state["uncertainty_trend_points_key"] = ""
@@ -1003,19 +1004,12 @@ else:
             )
         return "Indexed workflows and snapshots. Selectors are ready for browsing."
 
-    def _rebuild_triplet_catalog(
+    def _apply_triplet_catalog_from_discover(
+        discover_result: Any,
         *,
         preserve_workflow: bool = True,
         preserve_snapshot: bool = True,
     ) -> str:
-        discover_result = discover_nsdf_triplet_index(
-            _resolve_base_paths(),
-            base_dir=_bd,
-            save_dir=_sd,
-            mongo_s3_auth=_dataset_s3_auth_override(),
-            remote_linked=_remote_linked,
-            force_rescan=bool(grid_state.get("catalog_ready")),
-        )
         index = discover_result.index
         grid_state["triplet_index"] = index
         grid_state["catalog_discover"] = discover_result
@@ -1061,6 +1055,51 @@ else:
             grid_state["updating_controls"] = False
         _sync_auxiliary_selectors_from_data(reset_manual=not preserve_snapshot)
         return _catalog_index_status_message(discover_result)
+
+    def _rebuild_triplet_catalog(
+        *,
+        preserve_workflow: bool = True,
+        preserve_snapshot: bool = True,
+    ) -> str:
+        discover_result = discover_nsdf_triplet_index(
+            _resolve_base_paths(),
+            base_dir=_bd,
+            save_dir=_sd,
+            mongo_s3_auth=_dataset_s3_auth_override(),
+            remote_linked=_remote_linked,
+            force_rescan=bool(grid_state.get("catalog_ready")),
+        )
+        return _apply_triplet_catalog_from_discover(
+            discover_result,
+            preserve_workflow=preserve_workflow,
+            preserve_snapshot=preserve_snapshot,
+        )
+
+    def _defer_auto_load_saved_catalog() -> None:
+        """On new sessions, load ``catalog.json`` when present (no full S3 scan)."""
+
+        def _run_auto_load_saved_catalog() -> None:
+            try:
+                discover_result = discover_nsdf_triplet_index(
+                    _resolve_base_paths(),
+                    base_dir=_bd,
+                    save_dir=_sd,
+                    mongo_s3_auth=_dataset_s3_auth_override(),
+                    remote_linked=_remote_linked,
+                    force_rescan=False,
+                )
+                if discover_result.source != "catalog_json" or not discover_result.index.snapshots:
+                    return
+                _apply_triplet_catalog_from_discover(
+                    discover_result,
+                    preserve_workflow=True,
+                    preserve_snapshot=True,
+                )
+                _set_index_workflows_button_state()
+            except Exception:
+                traceback.print_exc()
+
+        doc.add_next_tick_callback(_run_auto_load_saved_catalog)
 
     def _refresh_snapshot_options_for_workflow(workflow_id: str) -> None:
         index = grid_state.get("triplet_index")
