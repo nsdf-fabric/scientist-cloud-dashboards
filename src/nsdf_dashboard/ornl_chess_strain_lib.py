@@ -3584,19 +3584,31 @@ def _iter_surrogate_s3_key_candidates(
             if not sur_suffix:
                 add(prefix + live_sur_fn)
             else:
+                snapshot_id = triplet_snapshot_id(parse_nsdf_data_filename(data_basename) or "")
+                if snapshot_id:
+                    _add_s3_keys_for_matching_snapshot_id(
+                        add,
+                        prefix=prefix,
+                        snapshot_id=snapshot_id,
+                        listed_suffixes=list_nsdf_surrogate_suffixes_from_s3(
+                            paths,
+                            mongo_s3_auth=mongo_s3_auth,
+                        ),
+                        role="surrogate",
+                    )
                 add(_sibling_surrogate_s3_key(data_key))
                 add((paths.s3_surrogate_key or "").strip())
-                snapshot_id = triplet_snapshot_id(parse_nsdf_data_filename(data_basename) or "")
-                _add_s3_keys_for_matching_snapshot_id(
-                    add,
-                    prefix=prefix,
-                    snapshot_id=snapshot_id,
-                    listed_suffixes=list_nsdf_surrogate_suffixes_from_s3(
-                        paths,
-                        mongo_s3_auth=mongo_s3_auth,
-                    ),
-                    role="surrogate",
-                )
+                if not snapshot_id:
+                    _add_s3_keys_for_matching_snapshot_id(
+                        add,
+                        prefix=prefix,
+                        snapshot_id=snapshot_id,
+                        listed_suffixes=list_nsdf_surrogate_suffixes_from_s3(
+                            paths,
+                            mongo_s3_auth=mongo_s3_auth,
+                        ),
+                        role="surrogate",
+                    )
                 add(prefix + live_sur_fn)
         else:
             add((paths.s3_surrogate_key or "").strip())
@@ -3650,19 +3662,31 @@ def _iter_next_x_s3_key_candidates(
             if not nx_suffix:
                 add(prefix + live_nx_fn)
             else:
+                snapshot_id = triplet_snapshot_id(parse_nsdf_data_filename(data_basename) or "")
+                if snapshot_id:
+                    _add_s3_keys_for_matching_snapshot_id(
+                        add,
+                        prefix=prefix,
+                        snapshot_id=snapshot_id,
+                        listed_suffixes=list_nsdf_next_x_suffixes_from_s3(
+                            paths,
+                            mongo_s3_auth=mongo_s3_auth,
+                        ),
+                        role="next_x",
+                    )
                 add(_sibling_next_x_s3_key(data_key))
                 add((paths.s3_next_x_key or "").strip())
-                snapshot_id = triplet_snapshot_id(parse_nsdf_data_filename(data_basename) or "")
-                _add_s3_keys_for_matching_snapshot_id(
-                    add,
-                    prefix=prefix,
-                    snapshot_id=snapshot_id,
-                    listed_suffixes=list_nsdf_next_x_suffixes_from_s3(
-                        paths,
-                        mongo_s3_auth=mongo_s3_auth,
-                    ),
-                    role="next_x",
-                )
+                if not snapshot_id:
+                    _add_s3_keys_for_matching_snapshot_id(
+                        add,
+                        prefix=prefix,
+                        snapshot_id=snapshot_id,
+                        listed_suffixes=list_nsdf_next_x_suffixes_from_s3(
+                            paths,
+                            mongo_s3_auth=mongo_s3_auth,
+                        ),
+                        role="next_x",
+                    )
                 add(prefix + live_nx_fn)
         else:
             add((paths.s3_next_x_key or "").strip())
@@ -3961,6 +3985,7 @@ def load_nsdf_json_bundle_from_s3(
         data_key,
         mongo_s3_auth=mongo_s3_auth,
     )
+    surrogate_probe_skips: List[str] = []
     for candidate_key in surrogate_candidates:
         try:
             candidate_doc = _load_json_from_s3_key(client, bucket, candidate_key)
@@ -3969,7 +3994,7 @@ def load_nsdf_json_bundle_from_s3(
                 display_size=display_size,
             ):
                 length = len((candidate_doc or {}).get("surrogate") or [])
-                messages.append(
+                surrogate_probe_skips.append(
                     f"S3 surrogate JSON skipped ({candidate_key}): "
                     f"model grid too small for display ({length} values for "
                     f"{display_size[0]}x{display_size[1]} grid)."
@@ -3980,20 +4005,23 @@ def load_nsdf_json_bundle_from_s3(
             messages.append(f"Loaded surrogate JSON from s3://{bucket}/{candidate_key}")
             break
         except FileNotFoundError as exc:
-            messages.append(f"S3 surrogate JSON skipped ({candidate_key}): {exc}")
+            surrogate_probe_skips.append(f"S3 surrogate JSON skipped ({candidate_key}): {exc}")
             continue
         except Exception as exc:
             if _s3_missing_error(exc):
-                messages.append(
+                surrogate_probe_skips.append(
                     f"S3 surrogate JSON skipped ({candidate_key}): "
                     f"{_format_s3_get_object_error(exc, bucket=bucket, key=candidate_key)}"
                 )
                 continue
             messages.append(f"S3 surrogate JSON skipped ({candidate_key}): {exc}")
             break
+    if surrogate is None:
+        messages.extend(surrogate_probe_skips)
 
     next_x = None
     next_x_key = ""
+    next_x_probe_skips: List[str] = []
     for candidate_key in _iter_next_x_s3_key_candidates(
         aux_paths,
         data_key,
@@ -4012,31 +4040,41 @@ def load_nsdf_json_bundle_from_s3(
                 else:
                     messages.append(f"Loaded next_x JSON from s3://{bucket}/{candidate_key}")
                 break
-            messages.append(
+            next_x_probe_skips.append(
                 f"S3 next_x JSON skipped ({candidate_key}): expected a JSON object or array."
             )
         except FileNotFoundError as exc:
-            messages.append(f"S3 next_x JSON skipped ({candidate_key}): {exc}")
+            next_x_probe_skips.append(f"S3 next_x JSON skipped ({candidate_key}): {exc}")
             continue
         except Exception as exc:
             if _s3_missing_error(exc):
-                messages.append(
+                next_x_probe_skips.append(
                     f"S3 next_x JSON skipped ({candidate_key}): "
                     f"{_format_s3_get_object_error(exc, bucket=bucket, key=candidate_key)}"
                 )
                 continue
             messages.append(f"S3 next_x JSON skipped ({candidate_key}): {exc}")
             break
+    if next_x is None:
+        messages.extend(next_x_probe_skips)
 
     effective_version = (paths.version_suffix or "").strip() or loaded_suffix
     surrogate_version = (aux_paths.surrogate_version_suffix or "").strip()
     next_x_version = (aux_paths.next_x_version_suffix or "").strip()
     live_sur_basename = nsdf_triplet_basenames("")[1]
     live_nx_basename = nsdf_triplet_basenames("")[2]
-    if surrogate_key and _location_basename(surrogate_key) == live_sur_basename and loaded_suffix:
-        surrogate_version = ""
-    if next_x_key and _location_basename(next_x_key) == live_nx_basename and loaded_suffix:
-        next_x_version = ""
+    if surrogate_key:
+        parsed_sur_suffix = parse_nsdf_surrogate_filename(_location_basename(surrogate_key))
+        if parsed_sur_suffix is not None:
+            surrogate_version = parsed_sur_suffix
+        elif _location_basename(surrogate_key) == live_sur_basename and loaded_suffix:
+            surrogate_version = ""
+    if next_x_key:
+        parsed_nx_suffix = parse_nsdf_next_x_filename(_location_basename(next_x_key))
+        if parsed_nx_suffix is not None:
+            next_x_version = parsed_nx_suffix
+        elif _location_basename(next_x_key) == live_nx_basename and loaded_suffix:
+            next_x_version = ""
 
     effective = StrainDashboardPaths(
         s3_env_file=paths.s3_env_file,
@@ -4125,6 +4163,46 @@ def primary_nsdf_triplet_locations(paths: StrainDashboardPaths) -> Dict[str, str
     return loc
 
 
+def _parsed_triplet_role_suffix(basename: str, role: str) -> Optional[str]:
+    """Suffix token from a triplet basename, or ``None`` for the live rolling file."""
+    parsers = {
+        "data": parse_nsdf_data_filename,
+        "surrogate": parse_nsdf_surrogate_filename,
+        "next_x": parse_nsdf_next_x_filename,
+    }
+    parser = parsers.get(role)
+    if not parser:
+        return None
+    return parser((basename or "").strip())
+
+
+def _triplet_role_files_match_by_snapshot_id(
+    primary_basename: str,
+    loaded_basename: str,
+    role: str,
+) -> bool:
+    """
+    True when two triplet files are the same object or share a snapshot id.
+
+    DIAL may write ``data_<tsA>_8.json`` and ``surrogate_<tsB>_8.json`` with different
+    timestamps; matching by trailing id is intentional, not a load failure.
+    """
+    primary_base = (primary_basename or "").strip()
+    loaded_base = (loaded_basename or "").strip()
+    if not primary_base or not loaded_base:
+        return False
+    if primary_base == loaded_base:
+        return True
+    primary_suffix = _parsed_triplet_role_suffix(primary_base, role)
+    loaded_suffix = _parsed_triplet_role_suffix(loaded_base, role)
+    if primary_suffix is None or loaded_suffix is None:
+        return False
+    primary_id = triplet_snapshot_id(primary_suffix)
+    if not primary_id:
+        return False
+    return primary_id == triplet_snapshot_id(loaded_suffix)
+
+
 def _message_targets_location(message: str, location: str) -> bool:
     msg = (message or "").strip()
     loc = (location or "").strip()
@@ -4187,10 +4265,33 @@ def collect_nsdf_triplet_load_issues(
     primary_sur = (primary.get("surrogate") or "").strip()
     primary_nx = (primary.get("next_x") or "").strip()
 
+    sur_id_match = bool(
+        bundle.surrogate is not None
+        and primary_sur
+        and loaded_sur
+        and _triplet_role_files_match_by_snapshot_id(
+            _location_basename(primary_sur),
+            _location_basename(loaded_sur),
+            "surrogate",
+        )
+    )
+    nx_id_match = bool(
+        bundle.next_x is not None
+        and primary_nx
+        and loaded_nx
+        and _triplet_role_files_match_by_snapshot_id(
+            _location_basename(primary_nx),
+            _location_basename(loaded_nx),
+            "next_x",
+        )
+    )
+
     for msg in bundle.messages:
         if _message_targets_location(msg, primary_sur) and any(
             token in msg.lower() for token in ("skipped", "not found", "not loaded", "missing")
         ):
+            if sur_id_match:
+                continue
             detail = msg.split(":", 1)[-1].strip() if ":" in msg else msg
             if live_triplet:
                 errors.append(f"{sur_fn}: {detail}")
@@ -4202,6 +4303,8 @@ def collect_nsdf_triplet_load_issues(
         elif _message_targets_location(msg, primary_nx) and any(
             token in msg.lower() for token in ("skipped", "not found", "not loaded", "missing")
         ):
+            if nx_id_match:
+                continue
             detail = msg.split(":", 1)[-1].strip() if ":" in msg else msg
             if "expected a json object or array" in msg.lower():
                 errors.append(f"{nx_fn}: {detail}")
@@ -4220,10 +4323,21 @@ def collect_nsdf_triplet_load_issues(
     elif primary_sur:
         primary_base = _location_basename(primary_sur)
         loaded_base = _location_basename(loaded_sur)
-        if primary_base and loaded_base and primary_base != loaded_base:
-            errors.append(
-                f"{sur_fn}: using fallback {loaded_base} (primary {primary_base} missing or invalid)."
+        if (
+            primary_base
+            and loaded_base
+            and primary_base != loaded_base
+            and not _triplet_role_files_match_by_snapshot_id(
+                primary_base,
+                loaded_base,
+                "surrogate",
             )
+        ):
+            if live_triplet:
+                errors.append(
+                    f"{sur_fn}: using fallback {loaded_base} "
+                    f"(primary {primary_base} missing or invalid)."
+                )
 
     if bundle.next_x is None and primary_nx:
         if not any(nx_fn in item for item in errors + warnings):

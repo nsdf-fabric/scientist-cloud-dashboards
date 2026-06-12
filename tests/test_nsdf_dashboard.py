@@ -1369,6 +1369,49 @@ def test_s3_archived_data_loads_live_next_x_overlay() -> None:
         lib._make_nsdf_s3_client = old_make_client
 
 
+def test_collect_triplet_ok_when_archived_auxiliary_timestamps_differ_by_id() -> None:
+    """Same snapshot id with different timestamps is normal DIAL output, not an error."""
+    data_suffix = "20260609T003832Z_8"
+    sur_suffix = "20260609T003833Z_8"
+    nx_suffix = "20260609T003830Z_8"
+    paths = apply_nsdf_file_suffixes(
+        StrainDashboardPaths(
+            s3_bucket="scientistcloud",
+            s3_data_key="chess-data/data.json",
+        ),
+        data_suffix=data_suffix,
+        surrogate_suffix=data_suffix,
+        next_x_suffix=data_suffix,
+        strict=True,
+    )
+    loaded_paths = apply_nsdf_file_suffixes(
+        StrainDashboardPaths(
+            s3_bucket="scientistcloud",
+            s3_data_key=f"chess-data/data_{data_suffix}.json",
+            s3_surrogate_key=f"chess-data/surrogate_{sur_suffix}.json",
+            s3_next_x_key=f"chess-data/next_x_{nx_suffix}.json",
+        ),
+        data_suffix=data_suffix,
+        surrogate_suffix=sur_suffix,
+        next_x_suffix=nx_suffix,
+        strict=True,
+    )
+    bundle = NSDFLoadedBundle(
+        data=_base_data(),
+        surrogate={"surrogate": [float(i) for i in range(25)]},
+        next_x={"workflow_id": "wf", "data": [[1.0, 2.0]]},
+        messages=[
+            f"Loaded NSDF data JSON from s3://scientistcloud/chess-data/data_{data_suffix}.json",
+            f"Loaded surrogate JSON from s3://scientistcloud/chess-data/surrogate_{sur_suffix}.json",
+            f"Loaded next_x JSON from s3://scientistcloud/chess-data/next_x_{nx_suffix}.json",
+        ],
+        paths=loaded_paths,
+    )
+    errors, warnings = collect_nsdf_triplet_load_issues(paths, bundle)
+    assert not errors
+    assert not warnings
+
+
 def test_collect_triplet_warning_when_archived_surrogate_missing() -> None:
     suffix = "20260608T221354Z_40"
     paths = apply_nsdf_file_suffixes(
@@ -1441,6 +1484,16 @@ def test_s3_skips_stub_surrogate_and_uses_richer_fallback() -> None:
             if Key == "chess-data/next_x.json":
                 return {"Body": _FakeBody([])}
             raise AssertionError(f"unexpected key {Key}")
+
+        def list_objects_v2(self, **kwargs) -> dict:  # noqa: N803
+            contents = []
+            for suffix in self.listed_suffixes:
+                for key in (
+                    f"chess-data/data_{suffix}.json",
+                    f"chess-data/surrogate_{suffix}.json",
+                ):
+                    contents.append({"Key": key})
+            return {"Contents": contents, "IsTruncated": False}
 
     fake_client = _StubThenRichClient()
     fake_client.listed_suffixes = ["20260607T151041Z"]
