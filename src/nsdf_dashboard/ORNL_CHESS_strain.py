@@ -194,6 +194,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (  # noqa: E402
     collect_nsdf_triplet_load_issues,
     discover_nsdf_triplet_index,
     enrich_strain_paths_from_dataset_doc,
+    format_nsdf_path_resolution_hint,
     format_nsdf_workflow_select_label,
     find_strain_json_under_dataset_dir,
     infer_nsdf_grid_size,
@@ -211,6 +212,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (  # noqa: E402
     resolve_nsdf_grid_size,
     resolve_estimate_color_limits,
     scientistcloud_dataset_is_remote_linked,
+    strain_paths_are_loadable,
     surrogate_doc_defines_grid_size,
     validate_nsdf_measurement_doc,
     _select_next_x_entry,
@@ -323,7 +325,9 @@ else:
         if uid.lower().startswith(("http://", "https://", "s3://", "pelican://")):
             return None
         try:
-            found = coll.find_one({"uuid": uid})
+            from utils_bokeh_mongodb import _find_dataset_doc
+
+            found = _find_dataset_doc(coll, uid)
             return found if isinstance(found, dict) else None
         except Exception:
             return None
@@ -1232,7 +1236,16 @@ else:
             next_x_info = validate_nsdf_next_x_doc(bundle.next_x)
         except Exception as e:
             loaded_bundle = None
-            set_status(f"NSDF load failed: {e}", ok=False)
+            base_paths = _resolve_base_paths()
+            hint = format_nsdf_path_resolution_hint(
+                base_paths,
+                _dataset_doc,
+                remote_linked=_remote_linked,
+            )
+            detail = f"NSDF load failed: {e}"
+            if hint.strip():
+                detail = f"{detail}\n\n{hint}"
+            set_status(detail, ok=False)
             figures_column.children = [Div(text="<i>No NSDF data loaded.</i>")]
             return
 
@@ -1727,20 +1740,31 @@ else:
     _sync_color_range_control_state()
     doc.add_root(root)
 
-    if paths.local_data_dir or paths.has_s3_source() or paths.local_json_path or paths.json_url:
+    if strain_paths_are_loadable(paths):
         _defer_figures_work(_initial_dashboard_load, message="Loading latest triplet...")
     else:
         _set_controls_busy(False)
+        hint = format_nsdf_path_resolution_hint(
+            _resolve_base_paths(),
+            _dataset_doc,
+            remote_linked=_remote_linked,
+        )
+        hint_html = (
+            f"<pre style='white-space:pre-wrap;font-size:12px;'>{html.escape(hint)}</pre>"
+            if hint.strip()
+            else ""
+        )
         figures_column.children = [
             Div(
                 text=(
-                    "<p>No NSDF data.json resolved yet. Configure <code>LOCAL_DATA_DIR</code> "
-                    "with local <code>data.json</code>, <code>surrogate.json</code>, and "
-                    "<code>next_x.json</code>, or set portal/S3/env paths.</p>"
+                    "<p>No NSDF data.json resolved yet. For ScientistCloud S3-linked datasets, "
+                    "the portal URL omits JSON credentials when Mongo stores <code>s3_access_key_id</code>; "
+                    "the dashboard reads <code>google_drive_link</code> (or related fields) from Mongo.</p>"
+                    f"{hint_html}"
                 )
             )
         ]
-    if paths.local_data_dir or paths.has_s3_source() or paths.local_json_path or paths.json_url:
+    if strain_paths_are_loadable(paths):
         _refresh_token = register_refresh_callback(on_external_refresh)
 
         def _cleanup_refresh_callback(

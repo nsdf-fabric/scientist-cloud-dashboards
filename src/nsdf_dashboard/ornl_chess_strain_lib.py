@@ -270,6 +270,57 @@ class StrainDashboardPaths:
         return bool((self.s3_bucket or "").strip() and (self.s3_data_key or "").strip())
 
 
+def strain_paths_are_loadable(paths: StrainDashboardPaths) -> bool:
+    """True when ``load_nsdf_json_bundle`` has a concrete data.json source to try."""
+    if paths.has_s3_source():
+        return True
+    if (paths.json_url or "").strip():
+        return True
+    loc = (paths.local_json_path or "").strip()
+    if loc:
+        if _looks_like_http_url(loc):
+            return True
+        if os.path.isfile(loc):
+            return True
+    return _local_data_dir_active(paths)
+
+
+def format_nsdf_path_resolution_hint(
+    paths: StrainDashboardPaths,
+    doc: Optional[Mapping[str, Any]],
+    *,
+    remote_linked: bool = False,
+) -> str:
+    """Short diagnostic text when path resolution did not yield a loadable source."""
+    lines: List[str] = []
+    if remote_linked:
+        lines.append("Remote-linked dataset (server=true): JSON should come from URL args or Mongo.")
+    if not isinstance(doc, Mapping):
+        lines.append("Mongo dataset document not found for this uuid.")
+    else:
+        link = pick_strain_json_link_from_dataset_doc(doc)
+        if link:
+            lines.append(f"Mongo link field: {link[:120]}{'…' if len(link) > 120 else ''}")
+        else:
+            lines.append(
+                "Mongo record has no viewer_url/download_url/google_drive_link/source_path "
+                "ending in .json or starting with s3:// or https://."
+            )
+        if str(doc.get("s3_access_key_id") or "").strip():
+            lines.append("Mongo stores s3_access_key_id (dashboard loads S3 after login without URL secrets).")
+    if paths.has_s3_source():
+        lines.append(f"Resolved S3: s3://{paths.s3_bucket}/{paths.s3_data_key}")
+    elif (paths.json_url or "").strip():
+        lines.append(f"Resolved URL: {paths.json_url[:120]}")
+    elif (paths.local_json_path or "").strip():
+        lines.append(f"Resolved local path: {paths.local_json_path}")
+    elif (paths.local_data_dir or "").strip() and not _local_data_dir_active(paths):
+        lines.append(
+            f"LOCAL_DATA_DIR={paths.local_data_dir!r} is set but LOCAL_FILES_FIRST_FOR_TESTING is off."
+        )
+    return "\n".join(lines)
+
+
 def _copy_s3_fields(src: StrainDashboardPaths, dst: StrainDashboardPaths) -> StrainDashboardPaths:
     dst.local_data_dir = src.local_data_dir
     dst.s3_env_file = src.s3_env_file
