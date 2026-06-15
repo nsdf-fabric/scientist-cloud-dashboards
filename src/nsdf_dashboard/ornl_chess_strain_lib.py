@@ -310,6 +310,14 @@ def format_nsdf_path_resolution_hint(
             lines.append("Mongo stores s3_access_key_id (dashboard loads S3 after login without URL secrets).")
     if paths.has_s3_source():
         lines.append(f"Resolved S3: s3://{paths.s3_bucket}/{paths.s3_data_key}")
+        ep = _normalize_gateway_endpoint_url(paths.s3_endpoint_url or "")
+        if ep:
+            lines.append(f"S3 gateway endpoint: {ep}")
+        else:
+            lines.append(
+                "Warning: s3_endpoint_url is empty — boto3 may target AWS S3 instead of the "
+                "ScientistCloud gateway (portal Inspect S3 uses https://us-east-1.gw...)."
+            )
     elif (paths.json_url or "").strip():
         lines.append(f"Resolved URL: {paths.json_url[:120]}")
     elif (paths.local_json_path or "").strip():
@@ -2484,6 +2492,38 @@ def pick_strain_json_link_from_dataset_doc(doc: Mapping[str, Any]) -> str:
     return ""
 
 
+def _normalize_gateway_endpoint_url(endpoint: str) -> str:
+    """Boto3 needs ``https://host`` only — not ``…/bucket`` or ``…/scientistcloud/…``."""
+    ep = (endpoint or "").strip().rstrip("/")
+    if not ep:
+        return ""
+    if not _looks_like_http_url(ep):
+        return ep
+    from urllib.parse import urlparse
+
+    parts = urlparse(ep)
+    if parts.scheme and parts.netloc:
+        return f"{parts.scheme}://{parts.netloc}".rstrip("/")
+    return ep
+
+
+def _s3_endpoint_from_dataset_doc(doc: Mapping[str, Any]) -> str:
+    """Gateway base URL for boto3 (``s3_endpoint_url`` field or inferred from link URLs)."""
+    ep = _normalize_gateway_endpoint_url(str(doc.get("s3_endpoint_url") or ""))
+    if ep:
+        return ep
+    for field in ("viewer_url", "download_url", "google_drive_link", "source_path"):
+        u = str(doc.get(field) or "").strip()
+        if not _looks_like_http_url(u):
+            continue
+        from urllib.parse import urlparse
+
+        parts = urlparse(u)
+        if parts.scheme and parts.netloc:
+            return f"{parts.scheme}://{parts.netloc}".rstrip("/")
+    return ""
+
+
 def apply_gateway_credentials_to_url(url: str, access_key: str, secret_key: str) -> str:
     """Inject or replace gateway query credentials on an https URL."""
     from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -2558,7 +2598,9 @@ def promote_gateway_json_url_to_s3_paths(paths: StrainDashboardPaths) -> StrainD
         s3_data_key=key,
         s3_surrogate_key=paths.s3_surrogate_key,
         s3_next_x_key=paths.s3_next_x_key,
-        s3_endpoint_url=(cfg.get("endpoint_url") or paths.s3_endpoint_url or "").strip(),
+        s3_endpoint_url=_normalize_gateway_endpoint_url(
+            (cfg.get("endpoint_url") or paths.s3_endpoint_url or "").strip()
+        ),
         s3_region=(cfg.get("region_name") or paths.s3_region or "us-east-1").strip() or "us-east-1",
         version_suffix=paths.version_suffix,
         surrogate_version_suffix=paths.surrogate_version_suffix,
@@ -2745,14 +2787,22 @@ def enrich_strain_paths_from_dataset_doc(
     if link.lower().startswith("s3://"):
         bucket, data_key = parse_s3_uri(link)
         if bucket and data_key:
-            ep = str(doc.get("s3_endpoint_url") or "").strip()
+            ep = _s3_endpoint_from_dataset_doc(doc)
             reg = str(doc.get("s3_region_name") or "us-east-1").strip() or "us-east-1"
+            gateway_url = ""
+            for field in ("viewer_url", "download_url", "google_drive_link"):
+                raw = str(doc.get(field) or "").strip()
+                if _looks_like_http_url(raw):
+                    gateway_url = resolve_strain_json_remote_link_from_dataset(
+                        {**dict(doc), field: raw}
+                    )
+                    break
             return _finalize_strain_paths(
                 _copy_s3_fields(
                     paths,
                     StrainDashboardPaths(
                         local_json_path="",
-                        json_url="",
+                        json_url=gateway_url if _looks_like_http_url(gateway_url) else "",
                         surrogate_json_path=paths.surrogate_json_path,
                         surrogate_json_url=paths.surrogate_json_url,
                         next_x_json_path=paths.next_x_json_path,
@@ -3497,7 +3547,16 @@ def load_nsdf_json_bundle(
 
     load_paths = _prepare_nsdf_load_paths(paths, remote_linked=remote_linked)
     if load_paths.has_s3_source():
-        return load_nsdf_json_bundle_from_s3(load_paths, mongo_s3_auth=mongo_s3_auth)
+        try:
+            return load_nsdf_json_bundle_from_s3(load_paths, mongo_s3_auth=mongo_s3_auth)
+        except FileNotFoundError as exc:
+            jurl = (load_paths.json_url or "").strip()
+            if not jurl or not _looks_like_http_url(jurl):
+                raise
+            _LOG.info(
+                "Direct S3 GetObject failed (%s); retrying gateway HTTPS loader for data.json",
+                exc,
+            )
     data = load_strain_json(load_paths, mongo_s3_auth=mongo_s3_auth)
     surrogate, messages, effective = load_optional_surrogate_json(
         load_paths,
@@ -3850,7 +3909,9 @@ def _s3_env_values(paths: StrainDashboardPaths) -> Dict[str, str]:
         "aws_access_key_id": value("AWS_ACCESS_KEY_ID"),
         "aws_secret_access_key": value("AWS_SECRET_ACCESS_KEY"),
         "aws_session_token": value("AWS_SESSION_TOKEN"),
-        "endpoint_url": paths.s3_endpoint_url or value("S3_ENDPOINT_URL"),
+        "endpoint_url": _normalize_gateway_endpoint_url(
+            paths.s3_endpoint_url or value("S3_ENDPOINT_URL")
+        ),
         "region_name": paths.s3_region or value("S3_REGION", "us-east-1") or "us-east-1",
     }
 
@@ -3878,18 +3939,21 @@ def _make_nsdf_s3_client(
         tok = (mongo_s3_auth.get("aws_session_token") or "").strip()
         if tok:
             cfg["aws_session_token"] = tok
-    if not (cfg["aws_access_key_id"] and cfg["aws_secret_access_key"]):
-        gateway = _parse_gateway_url_with_query_keys((paths.json_url or "").strip())
-        if gateway:
+    gateway = _parse_gateway_url_with_query_keys((paths.json_url or "").strip())
+    if gateway:
+        if not cfg.get("endpoint_url"):
+            cfg["endpoint_url"] = _normalize_gateway_endpoint_url(
+                (gateway.get("endpoint_url") or "").strip()
+            )
+        if not (cfg.get("aws_access_key_id") and cfg.get("aws_secret_access_key")):
             cfg["aws_access_key_id"] = (gateway.get("access_key_id") or "").strip()
             cfg["aws_secret_access_key"] = (gateway.get("secret_access_key") or "").strip()
-            if not cfg["endpoint_url"]:
-                cfg["endpoint_url"] = (gateway.get("endpoint_url") or "").strip()
             if gateway.get("region_name"):
                 cfg["region_name"] = (gateway.get("region_name") or cfg["region_name"]).strip()
             tok = (gateway.get("aws_session_token") or "").strip()
             if tok:
                 cfg["aws_session_token"] = tok
+    cfg["endpoint_url"] = _normalize_gateway_endpoint_url(cfg.get("endpoint_url") or "")
 
     kwargs: Dict[str, Any] = {
         "region_name": cfg["region_name"],
@@ -4064,14 +4128,37 @@ def load_nsdf_json_bundle_from_s3(
                 continue
             raise
     if data is None or not data_key:
+        if not (paths.version_suffix or "").strip():
+            archived_suffixes = list_nsdf_version_suffixes_from_s3(
+                paths, mongo_s3_auth=mongo_s3_auth
+            )
+            prefix = _nsdf_key_prefix((paths.s3_data_key or "").strip() or "data.json")
+            for suffix in archived_suffixes:
+                data_fn, _, _ = nsdf_triplet_basenames(suffix)
+                archived_key = prefix + data_fn
+                if archived_key in data_candidates:
+                    continue
+                try:
+                    data = _load_json_from_s3_key(client, bucket, archived_key)
+                    data_key = archived_key
+                    break
+                except FileNotFoundError as exc:
+                    data_errors.append(str(exc))
+                except Exception as exc:
+                    if _s3_missing_error(exc):
+                        data_errors.append(
+                            _format_s3_get_object_error(exc, bucket=bucket, key=archived_key)
+                        )
+                        continue
+                    raise
+    if data is None or not data_key:
         tried = ", ".join(data_candidates) or "(none)"
         detail = data_errors[-1] if data_errors else "object not found"
         if not (paths.version_suffix or "").strip():
             live_key = (paths.s3_data_key or "").strip() or "data.json"
             detail = (
-                f"Live {live_key} not found on s3://{bucket}/. "
-                f"The dashboard watches the rolling live triplet (data.json, surrogate.json, "
-                f"next_x.json); timestamped backups are loaded only when selected explicitly. "
+                f"Live {live_key} not found on s3://{bucket}/ "
+                f"(no archived data_*.json snapshots listed under that prefix either). "
                 f"{detail}"
             )
         raise FileNotFoundError(
@@ -4079,6 +4166,10 @@ def load_nsdf_json_bundle_from_s3(
         )
     loaded_suffix = parse_nsdf_data_filename(data_key.rsplit("/", 1)[-1]) or ""
     messages = [f"Loaded NSDF data JSON from s3://{bucket}/{data_key}"]
+    if loaded_suffix and not (paths.version_suffix or "").strip():
+        messages.append(
+            f"Live data.json was absent; loaded newest archived snapshot ({loaded_suffix})."
+        )
     aux_paths = paths
     if loaded_suffix:
         aux_paths = apply_nsdf_file_suffixes(

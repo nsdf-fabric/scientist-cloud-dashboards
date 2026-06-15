@@ -56,6 +56,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (
     load_simple_env_file,
     load_json_from_url,
     load_nsdf_json_bundle,
+    load_nsdf_json_bundle_from_s3,
     local_files_first_for_testing,
     make_strain_triplet_figures,
     normalize_nsdf_gateway_data_url,
@@ -1217,6 +1218,60 @@ def test_enrich_ignores_catalog_json_mirror_for_remote_linked(tmp_path) -> None:
     assert paths.local_json_path == ""
     assert paths.has_s3_source()
     assert paths.s3_data_key == "chess-data/data.json"
+
+
+def test_load_s3_falls_back_to_newest_archived_when_live_data_json_missing() -> None:
+    data = {
+        "dataset_x": [[0.0, 0.0], [10.0, 10.0]],
+        "dataset_y": [1.0, 2.0],
+        "bounds": [[0.0, 10.0], [0.0, 10.0]],
+    }
+
+    class FakeClient:
+        def get_object(self, *, Bucket: str, Key: str) -> dict:
+            if Key == "chess-data/data.json":
+                from botocore.exceptions import ClientError
+
+                raise ClientError(
+                    {"Error": {"Code": "NoSuchKey", "Message": "not found"}},
+                    "GetObject",
+                )
+            if Key == "chess-data/data_20260607T180614Z_8.json":
+                return {"Body": _FakeBody(json.dumps(data))}
+            raise AssertionError(f"unexpected key {Key}")
+
+        def list_objects_v2(self, **kwargs: object) -> dict:
+            return {
+                "Contents": [
+                    {"Key": "chess-data/data_20260607T180614Z_8.json"},
+                ],
+                "IsTruncated": False,
+            }
+
+    class _FakeBody:
+        def __init__(self, text: str) -> None:
+            self._text = text
+
+        def read(self) -> bytes:
+            return self._text.encode("utf-8")
+
+    paths = StrainDashboardPaths(
+        s3_bucket="scientistcloud",
+        s3_data_key="chess-data/data.json",
+        s3_endpoint_url="https://us-east-1.gw.example.com",
+    )
+    old_make = lib._make_nsdf_s3_client
+    try:
+        lib._make_nsdf_s3_client = lambda _paths, mongo_s3_auth=None: FakeClient()
+        bundle = load_nsdf_json_bundle_from_s3(
+            paths,
+            mongo_s3_auth={"access_key_id": "AK", "secret_access_key": "SK"},
+        )
+    finally:
+        lib._make_nsdf_s3_client = old_make
+
+    assert bundle.data == data
+    assert any("newest archived snapshot" in m for m in bundle.messages)
 
 
 def test_storage_policy_uses_mongo_gateway_when_only_catalog_in_upload(tmp_path) -> None:

@@ -211,6 +211,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (  # noqa: E402
     resolve_strain_paths_for_session,
     resolve_nsdf_grid_size,
     resolve_estimate_color_limits,
+    _s3_endpoint_from_dataset_doc,
     scientistcloud_dataset_is_remote_linked,
     strain_paths_are_loadable,
     surrogate_doc_defines_grid_size,
@@ -347,9 +348,9 @@ else:
         if not ak or not sk:
             return None
         out: Dict[str, str] = {"access_key_id": ak, "secret_access_key": sk}
-        ep = str(dataset_doc.get("s3_endpoint_url") or "").strip()
+        ep = _s3_endpoint_from_dataset_doc(dataset_doc)
         if ep:
-            out["endpoint_url"] = ep.rstrip("/")
+            out["endpoint_url"] = ep
         reg = str(dataset_doc.get("s3_region_name") or "").strip()
         if reg:
             out["region_name"] = reg
