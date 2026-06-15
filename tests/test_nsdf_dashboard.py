@@ -34,6 +34,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (
     _trend_axis_label_budget,
     collect_nsdf_triplet_load_issues,
     discover_nsdf_triplet_index,
+    load_saved_nsdf_triplet_catalog,
     triplet_index_from_catalog_doc,
     triplet_index_to_catalog_doc,
     discover_nsdf_version_options,
@@ -2207,6 +2208,29 @@ def test_discover_full_scan_writes_catalog_json_locally() -> None:
         assert os.path.isfile(catalog_path)
         second = discover_nsdf_triplet_index(paths, base_dir=tmp, save_dir="")
         assert second.source == "catalog_json"
+
+
+def test_load_saved_catalog_skips_full_scan(monkeypatch) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        scan_calls: list[str] = []
+
+        def _fake_scan(_paths, **kwargs):
+            scan_calls.append("scan")
+            return _build_triplet_index_from_directory(tmp)
+
+        monkeypatch.setattr(lib, "_scan_triplet_index", _fake_scan)
+        paths = StrainDashboardPaths(local_json_path=os.path.join(tmp, "data.json"))
+        assert load_saved_nsdf_triplet_catalog(paths, base_dir=tmp, save_dir="") is None
+        assert scan_calls == []
+
+        with open(os.path.join(tmp, f"data_49.json"), "w", encoding="utf-8") as fh:
+            json.dump({**_base_data(), "workflow_id": "wf"}, fh)
+        discover_nsdf_triplet_index(paths, base_dir=tmp, save_dir="")
+        scan_calls.clear()
+        loaded = load_saved_nsdf_triplet_catalog(paths, base_dir=tmp, save_dir="")
+        assert loaded is not None
+        assert loaded.source == "catalog_json"
+        assert scan_calls == []
 
 
 def test_discover_force_rescan_skips_catalog_json(monkeypatch) -> None:

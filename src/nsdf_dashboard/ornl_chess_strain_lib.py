@@ -2465,6 +2465,35 @@ def discover_nsdf_triplet_index(
     )
 
 
+def load_saved_nsdf_triplet_catalog(
+    paths: StrainDashboardPaths,
+    *,
+    base_dir: str = "",
+    save_dir: str = "",
+    mongo_s3_auth: Optional[Dict[str, str]] = None,
+    remote_linked: bool = False,
+) -> Optional[NSDFTripletIndexDiscoverResult]:
+    """
+    Load an existing ``catalog.json`` only (no prefix scan, no catalog write).
+
+    Used on dashboard startup so the live ``data.json`` triplet can render first;
+    full discovery remains on **Index workflows**.
+    """
+    catalog_index = _try_load_catalog_index(
+        paths,
+        base_dir=base_dir,
+        save_dir=save_dir,
+        mongo_s3_auth=mongo_s3_auth,
+        remote_linked=remote_linked,
+    )
+    if catalog_index is None or not catalog_index.snapshots:
+        return None
+    return NSDFTripletIndexDiscoverResult(
+        index=catalog_index,
+        source="catalog_json",
+    )
+
+
 def _credential_is_placeholder(value: str) -> bool:
     v = (value or "").strip()
     if not v:

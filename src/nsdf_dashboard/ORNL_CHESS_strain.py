@@ -193,6 +193,7 @@ from nsdf_dashboard.ornl_chess_strain_lib import (  # noqa: E402
     build_strain_field_grids,
     collect_nsdf_triplet_load_issues,
     discover_nsdf_triplet_index,
+    load_saved_nsdf_triplet_catalog,
     enrich_strain_paths_from_dataset_doc,
     format_nsdf_path_resolution_hint,
     format_nsdf_workflow_select_label,
@@ -1082,19 +1083,18 @@ else:
         )
 
     def _defer_auto_load_saved_catalog() -> None:
-        """On new sessions, load ``catalog.json`` when present (no full S3 scan)."""
+        """After the live triplet renders, load a saved ``catalog.json`` if present."""
 
         def _run_auto_load_saved_catalog() -> None:
             try:
-                discover_result = discover_nsdf_triplet_index(
+                discover_result = load_saved_nsdf_triplet_catalog(
                     _resolve_base_paths(),
                     base_dir=_bd,
                     save_dir=_sd,
                     mongo_s3_auth=_dataset_s3_auth_override(),
                     remote_linked=_remote_linked,
-                    force_rescan=False,
                 )
-                if discover_result.source != "catalog_json" or not discover_result.index.snapshots:
+                if discover_result is None:
                     return
                 _apply_triplet_catalog_from_discover(
                     discover_result,
